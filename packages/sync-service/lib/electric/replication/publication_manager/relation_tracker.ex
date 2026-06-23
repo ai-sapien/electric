@@ -66,7 +66,22 @@ defmodule Electric.Replication.PublicationManager.RelationTracker do
   def add_shape(stack_id, shape_handle, shape) do
     pub_filter = get_publication_filter_from_shape(shape)
 
-    case GenServer.call(name(stack_id), {:add_shape, shape_handle, pub_filter}) do
+    case GenServer.call(name(stack_id), {:add_shape, shape_handle, pub_filter}, :infinity) do
+      :ok -> :ok
+      {:error, err} -> raise err
+    end
+  end
+
+  @spec register_shapes(stack_id(), [{shape_handle(), Electric.Shapes.Shape.t()}]) :: :ok
+  def register_shapes(_stack_id, []), do: :ok
+
+  def register_shapes(stack_id, shapes) do
+    shapes =
+      Enum.map(shapes, fn {shape_handle, shape} ->
+        {shape_handle, get_publication_filter_from_shape(shape)}
+      end)
+
+    case GenServer.call(name(stack_id), {:register_shapes, shapes}, :infinity) do
       :ok -> :ok
       {:error, err} -> raise err
     end
@@ -200,9 +215,7 @@ defmodule Electric.Replication.PublicationManager.RelationTracker do
 
     # if the relation is already committed AND part of the last made
     # update submission, we can consider it ready
-    relation_ready? =
-      MapSet.member?(state.submitted_relation_filters, oid) and
-        MapSet.member?(state.committed_relation_filters, oid)
+    relation_ready? = relation_ready?(oid, state)
 
     state = add_shape_to_publication_filters(shape_handle, publication_filter, state)
     state = update_publication_if_necessary(state)
@@ -230,6 +243,16 @@ defmodule Electric.Replication.PublicationManager.RelationTracker do
         state = add_waiter(from, shape_handle, publication_filter, state)
         {:noreply, state}
     end
+  end
+
+  def handle_call({:register_shapes, shapes}, _from, state) do
+    state =
+      Enum.reduce(shapes, state, fn {shape_handle, publication_filter}, state ->
+        add_shape_to_publication_filters(shape_handle, publication_filter, state)
+      end)
+      |> update_publication_if_necessary()
+
+    {:reply, :ok, state, state.publication_refresh_period}
   end
 
   def handle_call({:remove_shape, shape_handle}, _from, state) do
@@ -308,7 +331,8 @@ defmodule Electric.Replication.PublicationManager.RelationTracker do
   end
 
   def handle_cast({:configuration_error, {:error, error}}, state) do
-    state = %{reply_to_all_waiters({:error, error}, state) | in_flight_relation_filters: nil}
+    state = reply_to_all_waiters({:error, error}, state)
+    state = %{state | in_flight_relation_filters: nil}
     {:noreply, state, state.publication_refresh_period}
   end
 
@@ -342,6 +366,11 @@ defmodule Electric.Replication.PublicationManager.RelationTracker do
       | submitted_relation_filters: state.prepared_relation_filters,
         in_flight_relation_filters: state.prepared_relation_filters
     }
+  end
+
+  defp relation_ready?(oid, state) do
+    MapSet.member?(state.submitted_relation_filters, oid) and
+      MapSet.member?(state.committed_relation_filters, oid)
   end
 
   @spec expand_oids(MapSet.t(Electric.relation_id()), state()) ::
