@@ -75,9 +75,9 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndex do
   def register_shape(table, shape_handle, %DnfPlan{} = plan) do
     polarities =
       plan.positions
-      |> Enum.filter(fn {_pos, info} -> info.is_subquery end)
+      |> Enum.filter(fn {_pos, info} -> info.subquery? end)
       |> Map.new(fn {_pos, info} ->
-        {info.subquery_ref, if(info.negated, do: :negated, else: :positive)}
+        {info.subquery_ref, if(info.negated?, do: :negated, else: :positive)}
       end)
 
     for {subquery_ref, polarity} <- polarities do
