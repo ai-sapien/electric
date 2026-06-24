@@ -72,6 +72,19 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
     assert Materializer.wait_until_ready(ctx) == :ok
   end
 
+  test "subscribe waits for a materializer that is still initializing" do
+    materializer =
+      spawn(fn ->
+        receive do
+          {:"$gen_call", {caller, reference}, :subscribe} ->
+            Process.sleep(5_100)
+            send(caller, {reference, :ok})
+        end
+      end)
+
+    assert Materializer.subscribe(materializer) == :ok
+  end
+
   test "new changes are materialized correctly",
        %{storage: storage, stack_id: stack_id, shape_handle: shape_handle} = ctx do
     {:ok, _pid} =

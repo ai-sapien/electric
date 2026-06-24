@@ -103,9 +103,9 @@ defmodule Electric.Shapes.Consumer.Materializer do
     end)
   end
 
-  def subscribe(pid) when is_pid(pid), do: GenServer.call(pid, :subscribe)
+  def subscribe(pid) when is_pid(pid), do: GenServer.call(pid, :subscribe, :infinity)
 
-  def subscribe(opts) when is_map(opts), do: GenServer.call(name(opts), :subscribe)
+  def subscribe(opts) when is_map(opts), do: GenServer.call(name(opts), :subscribe, :infinity)
 
   def subscribe(stack_id, shape_handle),
     do: subscribe(%{stack_id: stack_id, shape_handle: shape_handle})
