@@ -252,12 +252,18 @@ defmodule Electric.ShapeCache.ShapeStatus.ShapeDb do
              stack_id,
              :validate_existing_shapes,
              fn %Connection{} = conn ->
-               with {:ok, handles} <- Query.select_invalid(conn) do
-                 Enum.each(handles, fn handle ->
+               with {:ok, snapshot_invalid_handles} <- Query.select_invalid(conn),
+                    {:ok, shapes} <- Query.list_shapes(conn) do
+                 invalid_handles =
+                   shapes
+                   |> invalid_dependency_handles(snapshot_invalid_handles)
+                   |> Enum.sort()
+
+                 Enum.each(invalid_handles, fn handle ->
                    :ok = Query.remove_shape(conn, handle)
                  end)
 
-                 {:ok, handles}
+                 {:ok, invalid_handles}
                end
              end,
              # increase timeout because we may end up doing a lot of work here
@@ -265,6 +271,121 @@ defmodule Electric.ShapeCache.ShapeStatus.ShapeDb do
            ),
          {:ok, count} <- count_shapes(stack_id) do
       {:ok, removed_handles, count}
+    end
+  end
+
+  defp invalid_dependency_handles(shapes, snapshot_invalid_handles) do
+    all_handles = MapSet.new(shapes, &elem(&1, 0))
+    {dependencies, dependents} = dependency_maps(shapes)
+
+    directly_invalid =
+      Enum.reduce(dependencies, MapSet.new(snapshot_invalid_handles), fn
+        {handle, dependency_handles}, invalid_handles ->
+          if MapSet.subset?(dependency_handles, all_handles),
+            do: invalid_handles,
+            else: MapSet.put(invalid_handles, handle)
+      end)
+
+    invalid_handles =
+      directly_invalid
+      |> MapSet.to_list()
+      |> :queue.from_list()
+      |> propagate_invalid_dependencies(dependents, directly_invalid)
+
+    candidate_handles = MapSet.difference(all_handles, invalid_handles)
+
+    resolvable_handles =
+      resolvable_dependency_handles(candidate_handles, dependencies, dependents)
+
+    MapSet.union(invalid_handles, MapSet.difference(candidate_handles, resolvable_handles))
+  end
+
+  defp dependency_maps(shapes) do
+    Enum.reduce(shapes, {%{}, %{}}, fn {handle, shape}, {dependencies, dependents} ->
+      dependency_handles = MapSet.new(shape.shape_dependencies_handles)
+
+      dependents =
+        Enum.reduce(dependency_handles, dependents, fn dependency_handle, dependents ->
+          Map.update(dependents, dependency_handle, [handle], &[handle | &1])
+        end)
+
+      {Map.put(dependencies, handle, dependency_handles), dependents}
+    end)
+  end
+
+  defp propagate_invalid_dependencies(queue, dependents, invalid_handles) do
+    case :queue.out(queue) do
+      {:empty, _queue} ->
+        invalid_handles
+
+      {{:value, invalid_handle}, queue} ->
+        {queue, invalid_handles} =
+          dependents
+          |> Map.get(invalid_handle, [])
+          |> Enum.reduce({queue, invalid_handles}, fn dependent_handle,
+                                                      {queue, invalid_handles} ->
+            if MapSet.member?(invalid_handles, dependent_handle) do
+              {queue, invalid_handles}
+            else
+              {:queue.in(dependent_handle, queue), MapSet.put(invalid_handles, dependent_handle)}
+            end
+          end)
+
+        propagate_invalid_dependencies(queue, dependents, invalid_handles)
+    end
+  end
+
+  defp resolvable_dependency_handles(candidate_handles, dependencies, dependents) do
+    dependency_counts =
+      Map.new(candidate_handles, fn handle ->
+        count =
+          dependencies
+          |> Map.fetch!(handle)
+          |> MapSet.intersection(candidate_handles)
+          |> MapSet.size()
+
+        {handle, count}
+      end)
+
+    queue =
+      dependency_counts
+      |> Enum.flat_map(fn
+        {handle, 0} -> [handle]
+        {_handle, _count} -> []
+      end)
+      |> :queue.from_list()
+
+    resolve_dependency_queue(queue, dependency_counts, dependents, MapSet.new())
+  end
+
+  defp resolve_dependency_queue(queue, dependency_counts, dependents, resolved) do
+    case :queue.out(queue) do
+      {:empty, _queue} ->
+        resolved
+
+      {{:value, handle}, queue} ->
+        {queue, dependency_counts} =
+          dependents
+          |> Map.get(handle, [])
+          |> Enum.reduce({queue, dependency_counts}, fn dependent_handle,
+                                                        {queue, dependency_counts} ->
+            case Map.fetch(dependency_counts, dependent_handle) do
+              {:ok, count} when count > 0 ->
+                next_count = count - 1
+                queue = if next_count == 0, do: :queue.in(dependent_handle, queue), else: queue
+                {queue, Map.put(dependency_counts, dependent_handle, next_count)}
+
+              _ ->
+                {queue, dependency_counts}
+            end
+          end)
+
+        resolve_dependency_queue(
+          queue,
+          dependency_counts,
+          dependents,
+          MapSet.put(resolved, handle)
+        )
     end
   end
 

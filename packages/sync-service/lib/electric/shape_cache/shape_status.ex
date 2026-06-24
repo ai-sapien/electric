@@ -158,9 +158,17 @@ defmodule Electric.ShapeCache.ShapeStatus do
         Enum.all?(shape.shape_dependencies_handles, &MapSet.member?(visited, &1))
       end)
 
-    visited = MapSet.new(appendable, &elem(&1, 0)) |> MapSet.union(visited)
+    if appendable == [] do
+      Logger.error(
+        "Unable to topologically order persisted shapes because dependencies are missing or cyclic",
+        shape_handles: Enum.map(missing_deps, &elem(&1, 0))
+      )
 
-    topological_sort(missing_deps, [appendable | acc], visited)
+      Enum.reverse([missing_deps | acc]) |> List.flatten()
+    else
+      visited = MapSet.new(appendable, &elem(&1, 0)) |> MapSet.union(visited)
+      topological_sort(missing_deps, [appendable | acc], visited)
+    end
   end
 
   def reduce_shapes(stack_id, acc, reducer_fun)

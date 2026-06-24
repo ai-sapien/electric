@@ -300,6 +300,72 @@ defmodule Electric.ShapeCache.ShapeStatus.ShapeDbTest do
            ) == MapSet.new(handles)
   end
 
+  test "validate_existing_shapes/1 removes orphaned dependency graphs", ctx do
+    valid_shape = Shape.new!("items", inspector: @stub_inspector, where: "id = 1")
+    make_valid_shape(ctx, valid_shape, "valid-handle")
+
+    orphaned_shape =
+      Shape.new!("items", inspector: @stub_inspector, where: "id = 2")
+      |> Map.put(:shape_dependencies_handles, ["missing-handle"])
+
+    make_valid_shape(ctx, orphaned_shape, "orphaned-handle")
+
+    dependent_shape =
+      Shape.new!("items", inspector: @stub_inspector, where: "id = 3")
+      |> Map.put(:shape_dependencies_handles, ["orphaned-handle"])
+
+    make_valid_shape(ctx, dependent_shape, "dependent-handle")
+
+    assert {:ok, invalid_handles, 1} = ShapeDb.validate_existing_shapes(ctx.stack_id)
+
+    assert MapSet.new(invalid_handles) ==
+             MapSet.new(["orphaned-handle", "dependent-handle"])
+
+    assert {:ok, [{"valid-handle", ^valid_shape}]} = ShapeDb.list_shapes(ctx.stack_id)
+  end
+
+  test "validate_existing_shapes/1 removes cyclic dependency graphs", ctx do
+    first_shape =
+      Shape.new!("items", inspector: @stub_inspector, where: "id = 1")
+      |> Map.put(:shape_dependencies_handles, ["second-handle"])
+
+    second_shape =
+      Shape.new!("items", inspector: @stub_inspector, where: "id = 2")
+      |> Map.put(:shape_dependencies_handles, ["first-handle"])
+
+    make_valid_shape(ctx, first_shape, "first-handle")
+    make_valid_shape(ctx, second_shape, "second-handle")
+
+    assert {:ok, invalid_handles, 0} = ShapeDb.validate_existing_shapes(ctx.stack_id)
+    assert MapSet.new(invalid_handles) == MapSet.new(["first-handle", "second-handle"])
+    assert {:ok, []} = ShapeDb.list_shapes(ctx.stack_id)
+  end
+
+  test "validate_existing_shapes/1 removes dependents of cyclic dependency graphs", ctx do
+    first_shape =
+      Shape.new!("items", inspector: @stub_inspector, where: "id = 1")
+      |> Map.put(:shape_dependencies_handles, ["second-handle"])
+
+    second_shape =
+      Shape.new!("items", inspector: @stub_inspector, where: "id = 2")
+      |> Map.put(:shape_dependencies_handles, ["first-handle"])
+
+    dependent_shape =
+      Shape.new!("items", inspector: @stub_inspector, where: "id = 3")
+      |> Map.put(:shape_dependencies_handles, ["first-handle"])
+
+    make_valid_shape(ctx, first_shape, "first-handle")
+    make_valid_shape(ctx, second_shape, "second-handle")
+    make_valid_shape(ctx, dependent_shape, "dependent-handle")
+
+    assert {:ok, invalid_handles, 0} = ShapeDb.validate_existing_shapes(ctx.stack_id)
+
+    assert MapSet.new(invalid_handles) ==
+             MapSet.new(["first-handle", "second-handle", "dependent-handle"])
+
+    assert {:ok, []} = ShapeDb.list_shapes(ctx.stack_id)
+  end
+
   test "reset/1", ctx do
     assert {:ok, 0} = ShapeDb.count_shapes(ctx.stack_id)
 

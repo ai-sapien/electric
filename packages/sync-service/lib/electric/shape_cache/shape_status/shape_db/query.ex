@@ -49,7 +49,7 @@ defmodule Electric.ShapeCache.ShapeStatus.ShapeDb.Query do
                    ],
                    # need the handle_lookup query in the write connection to
                    # allow for handle lookup to definitely read all writes
-                   Keyword.take(@read_queries, [:handle_lookup])
+                   Keyword.take(@read_queries, [:handle_lookup, :list_shapes])
                  )
 
   @stmt_names Enum.uniq(Keyword.keys(@read_queries) ++ Keyword.keys(@write_queries))

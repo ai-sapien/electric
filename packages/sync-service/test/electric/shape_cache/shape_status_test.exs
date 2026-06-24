@@ -158,6 +158,18 @@ defmodule Electric.ShapeCache.ShapeStatusTest do
 
       assert [{^inner_handle, _}, {^outer_handle, _}] = ShapeStatus.list_shapes(state)
     end
+
+    test "returns unresolved shapes without recursing indefinitely", ctx do
+      {:ok, state, []} = new_state(ctx)
+
+      orphaned_shape =
+        shape!("orphaned")
+        |> Map.put(:shape_dependencies_handles, ["missing-handle"])
+
+      {:ok, orphaned_handle} = ShapeStatus.add_shape(state, orphaned_shape)
+
+      assert [{^orphaned_handle, ^orphaned_shape}] = ShapeStatus.list_shapes(state)
+    end
   end
 
   describe "least_recently_used/2" do
