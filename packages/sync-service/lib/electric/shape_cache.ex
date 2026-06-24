@@ -408,11 +408,37 @@ defmodule Electric.ShapeCache do
     with {:ok, handles} <-
            Enum.reduce_while(shape_dependencies, {:ok, []}, fn inner_shape, {:ok, handles} ->
              case safe_maybe_create_shape(inner_shape, inner_opts) do
-               {:ok, {handle, _offset}} -> {:cont, {:ok, [handle | handles]}}
-               {:error, _reason} = error -> {:halt, error}
+               {:ok, {handle, _offset}} ->
+                 case ensure_shape_consumer_started(handle, inner_opts) do
+                   {:ok, _pid} -> {:cont, {:ok, [handle | handles]}}
+                   {:error, _reason} = error -> {:halt, error}
+                 end
+
+               {:error, _reason} = error ->
+                 {:halt, error}
              end
            end) do
       {:ok, Enum.reverse(handles)}
+    end
+  end
+
+  defp ensure_shape_consumer_started(shape_handle, %{stack_id: stack_id} = opts) do
+    case Electric.Shapes.ConsumerRegistry.whereis(stack_id, shape_handle) do
+      nil ->
+        case ShapeStatus.fetch_shape_by_handle(stack_id, shape_handle) do
+          {:ok, persisted_shape} ->
+            restore_shape_and_dependencies(
+              shape_handle,
+              persisted_shape,
+              Map.put(opts, :action, :restore)
+            )
+
+          :error ->
+            {:error, :no_shape}
+        end
+
+      pid when is_pid(pid) ->
+        {:ok, pid}
     end
   end
 

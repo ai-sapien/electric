@@ -1315,6 +1315,85 @@ defmodule Electric.ShapeCacheTest do
       assert [{^dep_handle, _}, {^shape_handle, _}] = ShapeCache.list_shapes(ctx.stack_id)
     end
 
+    test "starts a persisted dependency before creating a new outer shape after restart", ctx do
+      {existing_shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(existing_shape_handle, ctx.stack_id)
+
+      assert [{dependency_handle, dependency_shape}, {^existing_shape_handle, _}] =
+               ShapeCache.list_shapes(ctx.stack_id)
+
+      restart_shape_cache(ctx)
+
+      refute Electric.Shapes.ConsumerRegistry.whereis(ctx.stack_id, dependency_handle)
+
+      new_outer_shape =
+        Shape.new!("items",
+          inspector: @stub_inspector,
+          where: "id IN (SELECT id FROM public.other_table) AND value = 'active'"
+        )
+
+      assert [^dependency_shape] = new_outer_shape.shape_dependencies
+
+      {new_shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(new_outer_shape, ctx.stack_id)
+
+      assert new_shape_handle != existing_shape_handle
+      assert :started = ShapeCache.await_snapshot_start(new_shape_handle, ctx.stack_id)
+
+      assert is_pid(Electric.Shapes.ConsumerRegistry.whereis(ctx.stack_id, dependency_handle))
+    end
+
+    test "restores all levels of a persisted nested dependency before creating an outer shape",
+         ctx do
+      nested_shape =
+        Shape.new!("items",
+          inspector: @stub_inspector,
+          where:
+            "id IN (SELECT id FROM public.other_table WHERE id IN (SELECT id FROM public.items WHERE value = 'visible'))"
+        )
+
+      {existing_shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(nested_shape, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(existing_shape_handle, ctx.stack_id)
+
+      assert [
+               {leaf_dependency_handle, _},
+               {middle_dependency_handle, middle_dependency_shape},
+               {^existing_shape_handle, _}
+             ] = ShapeCache.list_shapes(ctx.stack_id)
+
+      assert middle_dependency_shape.shape_dependencies_handles == [leaf_dependency_handle]
+
+      restart_shape_cache(ctx)
+
+      new_outer_shape =
+        Shape.new!("items",
+          inspector: @stub_inspector,
+          where:
+            "id IN (SELECT id FROM public.other_table WHERE id IN (SELECT id FROM public.items WHERE value = 'visible')) AND value = 'active'"
+        )
+
+      assert [requested_middle_dependency] = new_outer_shape.shape_dependencies
+      assert requested_middle_dependency.shape_dependencies_handles == []
+
+      {new_shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(new_outer_shape, ctx.stack_id)
+
+      assert new_shape_handle != existing_shape_handle
+      assert :started = ShapeCache.await_snapshot_start(new_shape_handle, ctx.stack_id)
+
+      assert is_pid(
+               Electric.Shapes.ConsumerRegistry.whereis(ctx.stack_id, leaf_dependency_handle)
+             )
+
+      assert is_pid(
+               Electric.Shapes.ConsumerRegistry.whereis(ctx.stack_id, middle_dependency_handle)
+             )
+    end
+
     test "restarted subquery shape reseeds the subquery index after restart", ctx do
       alias Electric.Shapes.Filter.Indexes.SubqueryIndex
 
