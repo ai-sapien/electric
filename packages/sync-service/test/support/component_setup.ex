@@ -452,47 +452,50 @@ defmodule Support.ComponentSetup do
     replication_connection_opts =
       Keyword.merge(ctx.db_config, List.wrap(ctx[:connection_opt_overrides]))
 
+    stack_supervisor_opts = [
+      stack_id: stack_id,
+      stack_events_registry: stack_events_registry,
+      chunk_bytes_threshold:
+        Map.get(
+          ctx,
+          :chunk_size,
+          Electric.ShapeCache.LogChunker.default_chunk_size_threshold()
+        ),
+      persistent_kv: kv,
+      storage: storage,
+      storage_dir: ctx.tmp_dir,
+      connection_opts: connection_opts,
+      replication_opts:
+        Keyword.merge(
+          [
+            connection_opts: replication_connection_opts,
+            slot_name: "electric_test_slot_#{:erlang.phash2(stack_id)}",
+            publication_name: publication_name,
+            try_creating_publication?: true,
+            slot_temporary?: true
+          ],
+          List.wrap(ctx[:replication_opts_overrides])
+        ),
+      pool_opts: [
+        backoff_type: :stop,
+        max_restarts: 0,
+        pool_size: 2
+      ],
+      tweaks: [
+        registry_partitions: 1,
+        shape_cleaner_opts: shape_cleaner_opts(ctx)
+      ],
+      manual_table_publishing?: Map.get(ctx, :manual_table_publishing?, false),
+      telemetry_opts: [instance_id: "test_instance", version: Electric.version()],
+      feature_flags: Electric.Config.get_env(:feature_flags),
+      shape_db_opts: [
+        storage_dir: ctx.tmp_dir
+      ]
+    ]
+
     stack_supervisor =
       start_supervised!(
-        {Electric.StackSupervisor,
-         stack_id: stack_id,
-         stack_events_registry: stack_events_registry,
-         chunk_bytes_threshold:
-           Map.get(
-             ctx,
-             :chunk_size,
-             Electric.ShapeCache.LogChunker.default_chunk_size_threshold()
-           ),
-         persistent_kv: kv,
-         storage: storage,
-         storage_dir: ctx.tmp_dir,
-         connection_opts: connection_opts,
-         replication_opts:
-           Keyword.merge(
-             [
-               connection_opts: replication_connection_opts,
-               slot_name: "electric_test_slot_#{:erlang.phash2(stack_id)}",
-               publication_name: publication_name,
-               try_creating_publication?: true,
-               slot_temporary?: true
-             ],
-             List.wrap(ctx[:replication_opts_overrides])
-           ),
-         pool_opts: [
-           backoff_type: :stop,
-           max_restarts: 0,
-           pool_size: 2
-         ],
-         tweaks: [
-           registry_partitions: 1,
-           shape_cleaner_opts: shape_cleaner_opts(ctx)
-         ],
-         manual_table_publishing?: Map.get(ctx, :manual_table_publishing?, false),
-         telemetry_opts: [instance_id: "test_instance", version: Electric.version()],
-         feature_flags: Electric.Config.get_env(:feature_flags),
-         shape_db_opts: [
-           storage_dir: ctx.tmp_dir
-         ]},
+        {Electric.StackSupervisor, stack_supervisor_opts},
         restart: :temporary,
         significant: false
       )
@@ -508,6 +511,7 @@ defmodule Support.ComponentSetup do
       shape_cache: {ShapeCache, [stack_id: stack_id]},
       persistent_kv: kv,
       stack_supervisor: stack_supervisor,
+      stack_supervisor_opts: stack_supervisor_opts,
       storage: storage,
       inspector:
         {EtsInspector, stack_id: stack_id, server: EtsInspector.name(stack_id: stack_id)},

@@ -26,6 +26,8 @@ defmodule Electric.Integration.SubqueryDependencyUpdateTest do
   alias Electric.Client
   alias Electric.Client.ShapeDefinition
   alias Electric.Client.Message.ChangeMessage
+  alias Electric.ShapeCache
+  alias Electric.Shapes.ConsumerRegistry
 
   @moduletag :tmp_dir
 
@@ -267,6 +269,129 @@ defmodule Electric.Integration.SubqueryDependencyUpdateTest do
     end
   end
 
+  @message_artifact_where """
+  id IN (
+    SELECT artifact_id FROM message_artifacts WHERE message_id IN (
+      SELECT id FROM messages WHERE chat_id = 'chat-1'
+    )
+  )
+  """
+
+  describe "existing root rows becoming eligible through nested links" do
+    setup [:with_unique_db, :with_message_artifact_tables]
+    setup :with_complete_stack
+    setup :with_electric_client
+
+    @tag replication_opts_overrides: [slot_temporary?: false]
+    test "streams an artifact through a new outer shape that reuses restored dependencies", ctx do
+      persisted_shape = ShapeDefinition.new!("artifacts", where: @message_artifact_where)
+
+      initial_stream = Client.stream(ctx.client, persisted_shape, live: true)
+      {:ok, initial_consumer} = Support.StreamConsumer.start(initial_stream)
+      assert_up_to_date(initial_consumer)
+      Support.StreamConsumer.stop(initial_consumer)
+
+      shapes = ShapeCache.list_shapes(ctx.stack_id)
+
+      {persisted_shape_handle, _shape} =
+        Enum.find(shapes, fn {_handle, shape} ->
+          shape.root_table == {"public", "artifacts"}
+        end)
+
+      dependency_handles =
+        shapes
+        |> Enum.map(&elem(&1, 0))
+        |> Enum.reject(&(&1 == persisted_shape_handle))
+
+      assert length(dependency_handles) == 2
+
+      restart_complete_stack(ctx)
+
+      assert Enum.all?(dependency_handles, fn handle ->
+               is_nil(ConsumerRegistry.whereis(ctx.stack_id, handle))
+             end)
+
+      shape =
+        ShapeDefinition.new!("artifacts",
+          where: "(#{@message_artifact_where}) AND title != 'ignored'"
+        )
+
+      stream = Client.stream(ctx.client, shape, live: true)
+
+      with_consumer stream do
+        assert_up_to_date(consumer)
+
+        assert length(ShapeCache.list_shapes(ctx.stack_id)) == 4
+
+        assert Enum.all?(dependency_handles, fn handle ->
+                 is_pid(ConsumerRegistry.whereis(ctx.stack_id, handle))
+               end)
+
+        Postgrex.query!(
+          ctx.db_conn,
+          "INSERT INTO artifacts (id, title) VALUES ('artifact-1', 'Revenue chart')",
+          []
+        )
+
+        assert_up_to_date(consumer)
+
+        Postgrex.transaction(ctx.db_conn, fn conn ->
+          Postgrex.query!(
+            conn,
+            "INSERT INTO messages (id, chat_id) VALUES ('message-1', 'chat-1')",
+            []
+          )
+
+          Postgrex.query!(
+            conn,
+            "INSERT INTO message_artifacts (message_id, artifact_id) VALUES ('message-1', 'artifact-1')",
+            []
+          )
+        end)
+
+        assert_insert(consumer, %{"id" => "artifact-1", "title" => "Revenue chart"})
+      end
+    end
+
+    @tag replication_opts_overrides: [slot_temporary?: false]
+    test "streams an existing artifact when a later link makes it eligible after restart", ctx do
+      shape = ShapeDefinition.new!("artifacts", where: @message_artifact_where)
+
+      initial_stream = Client.stream(ctx.client, shape, live: true)
+      {:ok, initial_consumer} = Support.StreamConsumer.start(initial_stream)
+      assert_up_to_date(initial_consumer)
+      Support.StreamConsumer.stop(initial_consumer)
+
+      restart_complete_stack(ctx)
+
+      stream = Client.stream(ctx.client, shape, live: true)
+
+      with_consumer stream do
+        assert_up_to_date(consumer)
+
+        Postgrex.query!(
+          ctx.db_conn,
+          "INSERT INTO messages (id, chat_id) VALUES ('message-1', 'chat-1')",
+          []
+        )
+
+        Postgrex.query!(
+          ctx.db_conn,
+          "INSERT INTO artifacts (id, title) VALUES ('artifact-1', 'Revenue chart')",
+          []
+        )
+
+        Postgrex.query!(
+          ctx.db_conn,
+          "INSERT INTO message_artifacts (message_id, artifact_id) VALUES ('message-1', 'artifact-1')",
+          []
+        )
+
+        assert_insert(consumer, %{"id" => "artifact-1", "title" => "Revenue chart"})
+      end
+    end
+  end
+
   # ---- Simple Parent/Child Schema for 1-level subquery tests ----
 
   def with_simple_parent_child_tables(%{db_conn: conn} = _context) do
@@ -296,6 +421,64 @@ defmodule Electric.Integration.SubqueryDependencyUpdateTest do
     )
 
     %{tables: [{"public", "parents"}, {"public", "children"}]}
+  end
+
+  def with_message_artifact_tables(%{db_conn: conn} = _context) do
+    Postgrex.query!(
+      conn,
+      """
+        CREATE TABLE messages (
+          id TEXT PRIMARY KEY,
+          chat_id TEXT NOT NULL
+        )
+      """,
+      []
+    )
+
+    Postgrex.query!(
+      conn,
+      """
+        CREATE TABLE artifacts (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL
+        )
+      """,
+      []
+    )
+
+    Postgrex.query!(
+      conn,
+      """
+        CREATE TABLE message_artifacts (
+          message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+          artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+          PRIMARY KEY (message_id, artifact_id)
+        )
+      """,
+      []
+    )
+
+    %{
+      tables: [
+        {"public", "messages"},
+        {"public", "artifacts"},
+        {"public", "message_artifacts"}
+      ]
+    }
+  end
+
+  defp restart_complete_stack(ctx) do
+    :ok = stop_supervised(Electric.StackSupervisor)
+
+    ref = Electric.StackSupervisor.subscribe_to_stack_events(ctx.stack_id)
+
+    start_supervised!(
+      {Electric.StackSupervisor, ctx.stack_supervisor_opts},
+      restart: :temporary,
+      significant: false
+    )
+
+    assert_receive {:stack_status, ^ref, :ready}, 2_000
   end
 
   # ---- Helpers ----

@@ -1,6 +1,7 @@
 defmodule Electric.Shapes.Api do
   alias Electric.Postgres.Inspector
   alias Electric.Replication.LogOffset
+  alias Electric.ShapeCache
   alias Electric.Shapes
   alias Electric.DbConnectionError
   alias Electric.SnapshotError
@@ -211,7 +212,7 @@ defmodule Electric.Shapes.Api do
   @spec load_shape_info(Request.t()) :: {:ok, Request.t()} | {:error, Response.t()}
   def load_shape_info(%Request{} = request) do
     with {:ok, request} <- do_load_shape_info(request) do
-      {:ok, seek(request)}
+      seek(request)
     end
   end
 
@@ -277,18 +278,25 @@ defmodule Electric.Shapes.Api do
   defp seek(%Request{params: %{offset: :now}} = request) do
     # For "now" offset, return immediately with up-to-date message
     # and the last_offset from the shape
-    request
-    |> determine_global_last_seen_lsn()
-    |> use_last_offset_as_chunk_end()
-    |> set_response_offset_for_now()
+    request =
+      request
+      |> determine_global_last_seen_lsn()
+      |> use_last_offset_as_chunk_end()
+      |> set_response_offset_for_now()
+
+    {:ok, request}
   end
 
   defp seek(%Request{} = request) do
-    request
-    |> listen_for_new_changes()
-    |> determine_global_last_seen_lsn()
-    |> determine_log_chunk_offset()
-    |> determine_up_to_date()
+    with {:ok, request} <- listen_for_new_changes(request) do
+      request =
+        request
+        |> determine_global_last_seen_lsn()
+        |> determine_log_chunk_offset()
+        |> determine_up_to_date()
+
+      {:ok, request}
+    end
   end
 
   defp set_response_offset_for_now(%Request{} = request) do
@@ -430,7 +438,7 @@ defmodule Electric.Shapes.Api do
   end
 
   defp listen_for_new_changes(%Request{params: %{live: false}} = request) do
-    request
+    {:ok, request}
   end
 
   defp listen_for_new_changes(%Request{params: %{live: true}} = request) do
@@ -449,10 +457,40 @@ defmodule Electric.Shapes.Api do
       ref = Electric.StackSupervisor.subscribe_to_shape_events(stack_id, handle)
       Logger.debug("Client #{inspect(self())} is registered for changes to #{handle}")
 
-      %{request | new_changes_pid: self(), new_changes_ref: ref}
+      request = %{request | new_changes_pid: self(), new_changes_ref: ref}
+      activate_shape_for_live_request(request)
     else
-      request
+      {:ok, request}
     end
+  end
+
+  defp activate_shape_for_live_request(%Request{read_only?: true} = request),
+    do: {:ok, request}
+
+  defp activate_shape_for_live_request(
+         %Request{handle: handle, api: %{stack_id: stack_id}} = request
+       ) do
+    case ShapeCache.start_consumer_for_handle(handle, stack_id,
+           otel_ctx: OpenTelemetry.get_current_context()
+         ) do
+      {:ok, _pid} -> {:ok, request}
+      {:error, reason} -> shape_activation_error(request, reason)
+    end
+  catch
+    :exit, reason -> shape_activation_error(request, reason)
+  end
+
+  defp shape_activation_error(request, reason) do
+    Logger.warning("Failed to activate shape for live request",
+      shape_handle: request.handle,
+      reason: inspect(reason)
+    )
+
+    {:error,
+     Response.error(request, "Failed to activate shape, please retry",
+       status: 503,
+       retry_after: 1
+     )}
   end
 
   # Ensure the request process is subscribed to shape events. This is needed

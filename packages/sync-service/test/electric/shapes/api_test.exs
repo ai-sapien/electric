@@ -75,13 +75,27 @@ defmodule Electric.Shapes.ApiTest do
   defp send_cache_headers?(ctx), do: Access.get(ctx, :send_cache_headers?, true)
   defp api_encoder(ctx), do: Access.get(ctx, :api_encoder, Electric.Shapes.Api.Encoder.Term)
 
+  defp with_shape_activation(_ctx) do
+    test_pid = self()
+
+    patch_shape_cache(
+      start_consumer_for_handle: fn shape_handle, stack_id, _opts ->
+        send(test_pid, {:shape_activated, shape_handle, stack_id})
+        {:ok, self()}
+      end
+    )
+
+    :ok
+  end
+
   setup [
     :with_stack_id_from_test,
     :with_registry,
     :with_persistent_kv,
     :with_pure_file_storage,
     :with_status_monitor,
-    :with_shape_cleaner
+    :with_shape_cleaner,
+    :with_shape_activation
   ]
 
   describe "validate/2" do
@@ -758,6 +772,7 @@ defmodule Electric.Shapes.ApiTest do
       )
 
       test_pid = self()
+      stack_id = ctx.stack_id
       next_offset = LogOffset.increment(@test_offset)
 
       patch_storage(for_shape: fn @test_shape_handle, _opts -> @test_opts end)
@@ -793,6 +808,7 @@ defmodule Electric.Shapes.ApiTest do
         end)
 
       ref = Process.monitor(task.pid)
+      assert_receive {:shape_activated, @test_shape_handle, ^stack_id}, @receive_timeout
       assert_receive :got_log_stream, @receive_timeout
 
       # Simulate new changes arriving

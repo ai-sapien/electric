@@ -63,13 +63,22 @@ defmodule Electric.Plug.ServeShapePlugTest do
 
   @moduletag :tmp_dir
 
+  defp with_shape_activation(_ctx) do
+    patch_shape_cache(
+      start_consumer_for_handle: fn _shape_handle, _stack_id, _opts -> {:ok, self()} end
+    )
+
+    :ok
+  end
+
   setup [
     :with_stack_id_from_test,
     :with_registry,
     :with_persistent_kv,
     :with_pure_file_storage,
     :with_status_monitor,
-    :with_shape_cleaner
+    :with_shape_cleaner,
+    :with_shape_activation
   ]
 
   def conn(_ctx, method, params, "?" <> _ = query_string) do
