@@ -28,8 +28,8 @@ jobs:
 
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19.5"
-          otp-version: "28.4"
+          elixir-version: "1.20.2"
+          otp-version: "29.0.2"
 
       - name: Start Postgres test services
         working-directory: packages/sync-service/dev
@@ -68,7 +68,7 @@ jobs:
         shell: bash
         run: |
           short_sha="${GITHUB_SHA:0:12}"
-          echo "version=1.7.3-sapien.${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "version=1.7.7-sapien.${short_sha}" >> "$GITHUB_OUTPUT"
           {
             echo "tags<<EOF"
             echo "${IMAGE}:sapien-${short_sha}"
