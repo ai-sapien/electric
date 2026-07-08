@@ -46,6 +46,23 @@ export {
 // drift from the runtime dispatcher.
 export { isGoalCommandText, parseGoalCommand } from './goal-command'
 export { formatTokenCount } from './token-budget'
+export {
+  CONTEXT_USAGE_BACKGROUND_START,
+  CONTEXT_USAGE_HARD_CEILING,
+  computeContextUsage,
+  computeContextBreakdown,
+  parseContextBreakdown,
+  contextUsageLevel,
+  formatContextUsagePercent,
+} from './token-accountant'
+export type {
+  ContextUsage,
+  ContextUsageInput,
+  ContextUsageLevel,
+  ContextBreakdownKey,
+  ContextBreakdownParts,
+  ContextBreakdownSegment,
+} from './token-accountant'
 export type { GoalCommand } from './goal-command'
 
 export type {

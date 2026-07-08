@@ -1389,6 +1389,156 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
     end
   end
 
+  describe "startup history replay" do
+    # Storage.get_log_stream/3 returns at most one chunk per call (one
+    # snapshot chunk, or one main-log chunk). On startup the Materializer
+    # must iterate chunks until it reaches `subscribed_offset` so it
+    # correctly replays the source shape's full persisted history. If it
+    # reads only the first chunk, post-snapshot updates persisted to the
+    # main log are silently dropped, leaving `value_counts` reflecting only
+    # the snapshot.
+    test "replays main-log entries persisted before subscription", ctx do
+      shape_handle = "history-test-#{System.unique_integer()}"
+
+      storage = Storage.for_shape(shape_handle, ctx.storage)
+      Storage.start_link(storage)
+      writer = Storage.init_writer!(storage, @shape)
+      Storage.mark_snapshot_as_started(storage)
+
+      # Snapshot with one row at value=10
+      Storage.make_new_snapshot!(
+        make_snapshot_data([%Changes.NewRecord{record: %{"id" => "1", "value" => "10"}}]),
+        storage
+      )
+
+      # Main-log entry that updates the row to value=99 — written to disk
+      # before the Materializer subscribes.
+      log_offset = LogOffset.new(100, 0)
+
+      writer =
+        Storage.append_to_log!(
+          [
+            {log_offset, ~s|"public"."test_table"/"1"|, :update,
+             ~s|{"key":"\\"public\\".\\"test_table\\"/\\"1\\"","value":{"id":"1","value":"99"},"headers":{"operation":"update"}}|}
+          ],
+          writer
+        )
+
+      Storage.hibernate(writer)
+
+      ConsumerRegistry.register_consumer(self(), shape_handle, ctx.stack_id)
+
+      {:ok, _pid} =
+        Materializer.start_link(%{
+          stack_id: ctx.stack_id,
+          shape_handle: shape_handle,
+          storage: ctx.storage,
+          columns: ["value"],
+          materialized_type: {:array, :int8}
+        })
+
+      respond_to_call(:await_snapshot_start, :started)
+      # Subscribe at an offset past the persisted UPDATE — the Materializer
+      # must walk the snapshot AND the main log to reach this point.
+      respond_to_call(:subscribe_materializer, {:ok, log_offset})
+
+      mat_ctx = %{stack_id: ctx.stack_id, shape_handle: shape_handle}
+      assert Materializer.wait_until_ready(mat_ctx) == :ok
+
+      # If only snapshot chunk 0 was read, value_counts would contain 10
+      # (the snapshot value) and the persisted UPDATE would be lost. The
+      # iteration fix guarantees the UPDATE is replayed.
+      assert Materializer.get_link_values(mat_ctx) == MapSet.new([99])
+    end
+
+    # When the source shape's persisted main log spans MORE than one chunk,
+    # `Storage.get_log_stream/3` returns the *entire* main-log range in a
+    # single call (chunking only applies to the snapshot). Startup replay must
+    # therefore stop iterating as soon as it steps into the main log:
+    # continuing to advance through chunk boundaries would re-read main-log
+    # entries it has already applied, and re-applying a `NewRecord` for a key
+    # that already exists raises "Key already exists", crashing the
+    # materializer and the dependent shape's consumer. This test guards that
+    # each persisted entry is applied exactly once.
+    @tag with_pure_file_storage_opts: [chunk_bytes_threshold: 10]
+    test "does not re-read main-log entries when the main log spans multiple chunks", ctx do
+      shape_handle = "multichunk-test-#{System.unique_integer()}"
+
+      storage = Storage.for_shape(shape_handle, ctx.storage)
+      Storage.start_link(storage)
+      writer = Storage.init_writer!(storage, @shape)
+      Storage.mark_snapshot_as_started(storage)
+
+      # Snapshot with one row at value=10.
+      Storage.make_new_snapshot!(
+        make_snapshot_data([%Changes.NewRecord{record: %{"id" => "1", "value" => "10"}}]),
+        storage
+      )
+
+      # Two main-log INSERTs persisted before the materializer subscribes.
+      # With a tiny `chunk_bytes_threshold` each lands in its own main-log
+      # chunk, so the main log spans more than one chunk — the condition under
+      # which a second read of the same range would re-apply the insert for
+      # key "3".
+      offset_2 = LogOffset.new(100, 0)
+      offset_3 = LogOffset.new(200, 0)
+
+      writer =
+        Storage.append_to_log!(
+          [
+            {offset_2, ~s|"public"."test_table"/"2"|, :insert,
+             ~s|{"key":"\\"public\\".\\"test_table\\"/\\"2\\"","value":{"id":"2","value":"20"},"headers":{"operation":"insert"}}|}
+          ],
+          writer
+        )
+
+      writer =
+        Storage.append_to_log!(
+          [
+            {offset_3, ~s|"public"."test_table"/"3"|, :insert,
+             ~s|{"key":"\\"public\\".\\"test_table\\"/\\"3\\"","value":{"id":"3","value":"30"},"headers":{"operation":"insert"}}|}
+          ],
+          writer
+        )
+
+      Storage.hibernate(writer)
+
+      # Sanity check: the main log really does span more than one chunk. The
+      # first main-log chunk (the one reached from the end of the snapshot)
+      # must end strictly before the last persisted offset. Without this, a
+      # single read would cover the whole main log and the multi-chunk case
+      # under test wouldn't be exercised.
+      first_main_chunk_end =
+        Storage.get_chunk_end_log_offset(LogOffset.last_before_real_offsets(), storage)
+
+      assert not is_nil(first_main_chunk_end)
+      assert LogOffset.compare(first_main_chunk_end, offset_3) == :lt
+
+      ConsumerRegistry.register_consumer(self(), shape_handle, ctx.stack_id)
+
+      {:ok, _pid} =
+        Materializer.start_link(%{
+          stack_id: ctx.stack_id,
+          shape_handle: shape_handle,
+          storage: ctx.storage,
+          columns: ["value"],
+          materialized_type: {:array, :int8}
+        })
+
+      respond_to_call(:await_snapshot_start, :started)
+      # Subscribe past both persisted INSERTs so startup replay walks the
+      # snapshot and the whole multi-chunk main log.
+      respond_to_call(:subscribe_materializer, {:ok, offset_3})
+
+      mat_ctx = %{stack_id: ctx.stack_id, shape_handle: shape_handle}
+      assert Materializer.wait_until_ready(mat_ctx) == :ok
+
+      # The snapshot value and both persisted INSERTs must each be applied
+      # exactly once.
+      assert Materializer.get_link_values(mat_ctx) == MapSet.new([10, 20, 30])
+    end
+  end
+
   describe "startup race condition handling" do
     # Tests for the race condition where Consumer dies between await_snapshot_start
     # and subscribe_materializer. See concurrency_analysis/MATERIALIZER_RACE_ANALYSIS.md

@@ -467,20 +467,6 @@ defmodule Electric.Integration.SubqueryDependencyUpdateTest do
     }
   end
 
-  defp restart_complete_stack(ctx) do
-    :ok = stop_supervised(Electric.StackSupervisor)
-
-    ref = Electric.StackSupervisor.subscribe_to_stack_events(ctx.stack_id)
-
-    start_supervised!(
-      {Electric.StackSupervisor, ctx.stack_supervisor_opts},
-      restart: :temporary,
-      significant: false
-    )
-
-    assert_receive {:stack_status, ^ref, :ready}, 2_000
-  end
-
   # ---- Helpers ----
 
   defp filter_deletes(messages) do
