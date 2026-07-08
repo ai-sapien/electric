@@ -608,15 +608,20 @@ defmodule Electric.ShapeCache do
          :started <- Shapes.Consumer.await_snapshot_start(opts.stack_id, handle, @call_timeout) do
       {:ok, pid}
     else
+      # start_shape already purged the shape via clean_shape on failure.
       :error ->
         {:error, handle}
 
+      # The consumer is running but never confirmed snapshot start; an
+      # unconfirmed shape must not survive restore, so purge it and let
+      # the client refetch from scratch.
       {:error, reason} ->
         Logger.warning("Failed to initialize restored shape consumer",
           shape_handle: handle,
           reason: inspect(reason)
         )
 
+        clean_shape(handle, opts.stack_id)
         {:error, handle}
     end
   catch
@@ -626,6 +631,7 @@ defmodule Electric.ShapeCache do
         reason: inspect(reason)
       )
 
+      clean_shape(handle, opts.stack_id)
       {:error, handle}
   end
 

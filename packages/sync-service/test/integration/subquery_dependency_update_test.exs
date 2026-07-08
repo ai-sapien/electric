@@ -307,8 +307,11 @@ defmodule Electric.Integration.SubqueryDependencyUpdateTest do
 
       restart_complete_stack(ctx)
 
+      # wait_for_restore eagerly restores subquery shapes and their
+      # dependency consumers at boot, so the dependency tree is already
+      # live by the time the stack reports active.
       assert Enum.all?(dependency_handles, fn handle ->
-               is_nil(ConsumerRegistry.whereis(ctx.stack_id, handle))
+               is_pid(ConsumerRegistry.whereis(ctx.stack_id, handle))
              end)
 
       shape =
