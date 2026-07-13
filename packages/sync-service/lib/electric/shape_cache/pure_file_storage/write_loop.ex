@@ -31,6 +31,11 @@ defmodule Electric.ShapeCache.PureFileStorage.WriteLoop do
     times_flushed: 0,
     chunk_started?: false,
     cached_chunk_boundaries: {LogOffset.last_before_real_offsets(), []},
+    move_transaction_open?: false,
+    root_transaction_open?: false,
+    deferred_chunk_entries: [],
+    deferred_chunk_bytes: 0,
+    deferred_compaction: nil,
     open_files: {:open_files, nil, nil}
 
   defguardp is_chunk_file_open(acc)
@@ -42,6 +47,93 @@ defmodule Electric.ShapeCache.PureFileStorage.WriteLoop do
   def cached_chunk_boundaries(writer_acc(cached_chunk_boundaries: res)), do: res
   def has_flushed_since?(writer_acc(times_flushed: res), previous_ref), do: res != previous_ref
   def times_flushed(writer_acc(times_flushed: res)), do: res
+  def move_transaction_open?(writer_acc(move_transaction_open?: open?)), do: open?
+
+  def transaction_open?(
+        writer_acc(
+          move_transaction_open?: move_transaction_open?,
+          root_transaction_open?: root_transaction_open?
+        )
+      ),
+      do: move_transaction_open? or root_transaction_open?
+
+  def defer_compaction(
+        writer_acc(deferred_compaction: nil) = acc,
+        {%LogOffset{}, suffix, log_file_pos} = compaction
+      )
+      when is_binary(suffix) and is_integer(log_file_pos) and log_file_pos >= 0,
+      do: writer_acc(acc, deferred_compaction: compaction)
+
+  def defer_compaction(writer_acc(), _compaction) do
+    raise Storage.Error, message: "a compaction result is already deferred"
+  end
+
+  def take_deferred_compaction(writer_acc(deferred_compaction: compaction) = acc),
+    do: {compaction, writer_acc(acc, deferred_compaction: nil)}
+
+  @doc """
+  Start a dependency-move transaction after first making all preceding normal
+  transactions durable.
+
+  Appends made while the transaction is open may be physically flushed, but
+  they do not advance the durable transaction boundary until commit.
+  """
+  def begin_move_transaction(writer_acc(move_transaction_open?: true), _state) do
+    raise Storage.Error, message: "dependency-move transaction is already open"
+  end
+
+  def begin_move_transaction(writer_acc(root_transaction_open?: true), _state) do
+    raise Storage.Error,
+      message:
+        "cannot begin a dependency-move transaction while a root transaction fragment is open"
+  end
+
+  def begin_move_transaction(
+        writer_acc(last_seen_offset: offset, last_seen_txn_offset: offset) = acc,
+        state
+      ) do
+    acc
+    |> flush_buffer(state)
+    |> writer_acc(move_transaction_open?: true)
+  end
+
+  def begin_move_transaction(
+        writer_acc(last_seen_offset: last_seen, last_seen_txn_offset: last_seen_txn),
+        _state
+      ) do
+    raise Storage.Error,
+      message:
+        "cannot begin a dependency-move transaction while a root transaction fragment is open " <>
+          "(last seen offset #{inspect(last_seen)}, last complete transaction #{inspect(last_seen_txn)})"
+  end
+
+  @doc """
+  Flush all dependency-move writes and atomically publish their final log
+  boundary together with the supplied dependency source positions.
+  """
+  def commit_move_transaction(
+        move_positions,
+        root_delivery_tx_offset,
+        writer_acc(move_transaction_open?: true) = acc,
+        state
+      )
+      when is_map(move_positions) and is_integer(root_delivery_tx_offset) and
+             root_delivery_tx_offset >= 0 do
+    writer_acc(last_seen_offset: boundary) = acc = flush_buffer(acc, state)
+
+    acc
+    |> commit_staged_chunk_index(
+      boundary,
+      move_positions,
+      root_delivery_tx_offset,
+      state
+    )
+    |> writer_acc(move_transaction_open?: false)
+  end
+
+  def commit_move_transaction(_move_positions, _root_delivery_tx_offset, writer_acc(), _state) do
+    raise Storage.Error, message: "no dependency-move transaction is open"
+  end
 
   def adjust_write_positions(
         writer_acc(write_position: write_position),
@@ -49,6 +141,9 @@ defmodule Electric.ShapeCache.PureFileStorage.WriteLoop do
       ) do
     writer_acc(write_position: write_position + log_file_pos)
   end
+
+  def set_cached_chunk_boundaries(writer_acc() = acc, boundaries),
+    do: writer_acc(acc, cached_chunk_boundaries: boundaries)
 
   @doc """
   Initialize the writer from disk. At the point of recovery, all offsets are assumed to be the same - last txn boundary.
@@ -96,6 +191,48 @@ defmodule Electric.ShapeCache.PureFileStorage.WriteLoop do
   last committed transaction offset, not a mid-transaction offset.
   """
   def append_fragment_to_log!(txn_lines, writer_acc(times_flushed: times_flushed) = acc, state) do
+    acc = begin_root_transaction(acc)
+    append_lines(txn_lines, acc, state, times_flushed)
+  end
+
+  @doc """
+  Append a stream of log lines to the log.
+  """
+  def append_to_log!(
+        txn_lines,
+        writer_acc(move_transaction_open?: true, times_flushed: times_flushed) = acc,
+        state
+      ) do
+    {acc, opts} = append_lines(txn_lines, acc, state, times_flushed)
+    {finalize_txn(acc, state), opts}
+  end
+
+  def append_to_log!(
+        _txn_lines,
+        writer_acc(root_transaction_open?: true),
+        _state
+      ) do
+    raise Storage.Error,
+      message: "cannot append a complete transaction while a root transaction fragment is open"
+  end
+
+  def append_to_log!(txn_lines, writer_acc(times_flushed: times_flushed) = acc, state) do
+    acc = begin_root_transaction(acc)
+    {acc, opts} = append_lines(txn_lines, acc, state, times_flushed)
+    {signal_txn_commit(acc, state), opts}
+  end
+
+  defp begin_root_transaction(writer_acc(move_transaction_open?: true)) do
+    raise Storage.Error,
+      message: "cannot append a root transaction fragment during a dependency-move transaction"
+  end
+
+  defp begin_root_transaction(writer_acc(root_transaction_open?: true) = acc), do: acc
+
+  defp begin_root_transaction(writer_acc() = acc),
+    do: writer_acc(acc, root_transaction_open?: true)
+
+  defp append_lines(txn_lines, acc, state, times_flushed) do
     acc = ensure_json_file_open(acc, state)
 
     txn_lines
@@ -118,14 +255,6 @@ defmodule Electric.ShapeCache.PureFileStorage.WriteLoop do
       writer_acc(buffer_size: 0) = acc -> {acc, cancel_flush_timer: true}
       acc -> {acc, schedule_flush: times_flushed}
     end
-  end
-
-  @doc """
-  Append a stream of log lines to the log.
-  """
-  def append_to_log!(txn_lines, acc, state) do
-    {acc, opts} = append_fragment_to_log!(txn_lines, acc, state)
-    {finalize_txn(acc, state), opts}
   end
 
   ### Working with the buffer
@@ -163,8 +292,8 @@ defmodule Electric.ShapeCache.PureFileStorage.WriteLoop do
          offset
        ) do
     writer_acc(acc, chunk_started?: true)
-    |> ensure_chunk_file_open(state)
-    |> write_to_chunk_file(ChunkIndex.make_half_entry(offset, pos, 0))
+    |> ensure_chunk_file_open(state, :opening)
+    |> write_to_chunk_file(ChunkIndex.make_half_entry(offset, pos, 0), state, :opening)
     |> add_opening_chunk_boundary_to_cache(offset, pos)
     |> update_chunk_boundaries_cache(opts)
   end
@@ -181,20 +310,82 @@ defmodule Electric.ShapeCache.PureFileStorage.WriteLoop do
          writer_state(opts: opts) = state
        ) do
     writer_acc(acc, chunk_started?: false, bytes_in_chunk: 0)
-    |> ensure_chunk_file_open(state)
-    |> write_to_chunk_file(ChunkIndex.make_half_entry(offset, position, 0))
+    |> ensure_chunk_file_open(state, :closing)
+    |> write_to_chunk_file(ChunkIndex.make_half_entry(offset, position, 0), state, :closing)
     |> add_closing_chunk_boundary_to_cache(offset, position)
     |> update_chunk_boundaries_cache(opts)
     |> flush_buffer(state)
   end
 
   defp write_to_chunk_file(
+         writer_acc(move_transaction_open?: true) = acc,
+         entry,
+         state,
+         _boundary_kind
+       ) do
+    defer_chunk_entry(acc, entry, state)
+  end
+
+  defp write_to_chunk_file(
+         writer_acc(root_transaction_open?: true) = acc,
+         entry,
+         state,
+         :closing
+       ) do
+    defer_chunk_entry(acc, entry, state)
+  end
+
+  defp write_to_chunk_file(
+         writer_acc(
+           root_transaction_open?: true,
+           deferred_chunk_entries: [_ | _]
+         ) = acc,
+         entry,
+         state,
+         :opening
+       ) do
+    defer_chunk_entry(acc, entry, state)
+  end
+
+  defp write_to_chunk_file(
          writer_acc(open_files: open_files(chunk_file: chunk_file)) = acc,
-         entry
+         entry,
+         _state,
+         _boundary_kind
        )
        when not is_nil(chunk_file) do
     IO.binwrite(chunk_file, entry)
     acc
+  end
+
+  defp defer_chunk_entry(
+         writer_acc(
+           deferred_chunk_entries: deferred_chunk_entries,
+           deferred_chunk_bytes: deferred_chunk_bytes
+         ) = acc,
+         entry,
+         writer_state(
+           opts: %{
+             max_deferred_chunk_index_bytes: max_deferred_chunk_index_bytes,
+             shape_handle: shape_handle
+           }
+         )
+       ) do
+    attempted_bytes = deferred_chunk_bytes + byte_size(entry)
+
+    if attempted_bytes > max_deferred_chunk_index_bytes do
+      raise Storage.Error,
+        message:
+          "transaction chunk-index staging limit exceeded " <>
+            "(attempted_bytes=#{attempted_bytes}, limit_bytes=#{max_deferred_chunk_index_bytes}, " <>
+            "shape_handle=#{inspect(shape_handle)}); the writer must restart to discard the " <>
+            "uncommitted transaction"
+    end
+
+    writer_acc(acc,
+      deferred_chunk_entries: [entry | deferred_chunk_entries],
+      deferred_chunk_bytes: attempted_bytes
+    )
   end
 
   ### Working with chunk boundaries cache
@@ -234,6 +425,21 @@ defmodule Electric.ShapeCache.PureFileStorage.WriteLoop do
     )
   end
 
+  defp update_chunk_boundaries_cache(
+         writer_acc(move_transaction_open?: true) = acc,
+         _opts
+       ),
+       do: acc
+
+  defp update_chunk_boundaries_cache(
+         writer_acc(
+           root_transaction_open?: true,
+           deferred_chunk_entries: [_ | _]
+         ) = acc,
+         _opts
+       ),
+       do: acc
+
   defp update_chunk_boundaries_cache(writer_acc(cached_chunk_boundaries: cached) = acc, opts) do
     PureFileStorage.update_chunk_boundaries_cache(opts, cached)
     acc
@@ -254,13 +460,42 @@ defmodule Electric.ShapeCache.PureFileStorage.WriteLoop do
     writer_acc(acc, open_files: files)
   end
 
-  defp ensure_chunk_file_open(writer_acc(open_files: open_files(chunk_file: x)) = acc, _state)
+  defp ensure_chunk_file_open(
+         writer_acc(move_transaction_open?: true) = acc,
+         _state,
+         _boundary_kind
+       ),
+       do: acc
+
+  defp ensure_chunk_file_open(
+         writer_acc(root_transaction_open?: true) = acc,
+         _state,
+         :closing
+       ),
+       do: acc
+
+  defp ensure_chunk_file_open(
+         writer_acc(
+           root_transaction_open?: true,
+           deferred_chunk_entries: [_ | _]
+         ) = acc,
+         _state,
+         :opening
+       ),
+       do: acc
+
+  defp ensure_chunk_file_open(
+         writer_acc(open_files: open_files(chunk_file: x)) = acc,
+         _state,
+         _boundary_kind
+       )
        when not is_nil(x),
        do: acc
 
   defp ensure_chunk_file_open(
          writer_acc(open_files: open_files(chunk_file: nil) = open_files) = acc,
-         state
+         state,
+         _boundary_kind
        ) do
     files = open_files(open_files, chunk_file: open_file(state, :chunk_file))
 
@@ -274,6 +509,56 @@ defmodule Electric.ShapeCache.PureFileStorage.WriteLoop do
        ) do
     File.close(chunk_file)
     writer_acc(acc, open_files: open_files(open_files, chunk_file: nil))
+  end
+
+  defp new_chunk_index_intent(_opts, _latest_name, []), do: nil
+
+  defp new_chunk_index_intent(opts, latest_name, deferred_chunk_entries) do
+    bytes = deferred_chunk_entries |> Enum.reverse() |> IO.iodata_to_binary()
+
+    PureFileStorage.new_chunk_index_intent!(opts, latest_name, bytes)
+  end
+
+  defp commit_staged_chunk_index(
+         writer_acc(
+           deferred_chunk_entries: deferred_chunk_entries,
+           cached_chunk_boundaries: chunk_boundaries
+         ) = acc,
+         boundary,
+         move_positions,
+         root_delivery_tx_offset,
+         writer_state(opts: opts, latest_name: latest_name)
+       ) do
+    # Publish only an incomplete opening boundary before the cursor. Existing
+    # incomplete chunks already provide the same addressability, so all of their
+    # deferred entries stay private until after the transaction commit.
+    chunk_index_intent =
+      new_chunk_index_intent(opts, latest_name, deferred_chunk_entries)
+
+    :ok =
+      PureFileStorage.publish_chunk_index_addressability_bridge!(opts, chunk_index_intent)
+
+    PureFileStorage.commit_transaction_state!(
+      opts,
+      boundary,
+      move_positions,
+      root_delivery_tx_offset,
+      chunk_index_intent
+    )
+
+    # Reconciliation appends any absent suffix, verifies already-written bytes,
+    # fsyncs the index, and only then clears the durable intent. Startup runs the
+    # same path after a crash at either side of the cursor commit.
+    :ok = PureFileStorage.reconcile_chunk_index_intent!(opts)
+
+    PureFileStorage.update_chunk_boundaries_cache(opts, chunk_boundaries)
+
+    writer_acc(acc,
+      last_seen_txn_offset: boundary,
+      last_persisted_txn_offset: boundary,
+      deferred_chunk_entries: [],
+      deferred_chunk_bytes: 0
+    )
   end
 
   defdelegate open_file(state, type), to: PureFileStorage
@@ -317,6 +602,7 @@ defmodule Electric.ShapeCache.PureFileStorage.WriteLoop do
           last_seen_offset: last_seen_offset,
           last_seen_txn_offset: last_seen_txn,
           last_persisted_txn_offset: last_persisted_txn,
+          move_transaction_open?: move_transaction_open?,
           times_flushed: times_flushed,
           open_files: open_files(json_file: json_file)
         ) = acc,
@@ -325,8 +611,15 @@ defmodule Electric.ShapeCache.PureFileStorage.WriteLoop do
     IO.binwrite(json_file, buffer)
     :file.datasync(json_file)
 
-    # Tell the parent process that we've flushed up to this point
-    send(self(), {Storage, :flushed, last_seen_offset})
+    # A dependency move's physical writes are not a public durability boundary.
+    # The owning consumer releases its deferred notification only after the
+    # combined log offset + source-position record commits synchronously.
+    if not move_transaction_open? do
+      send(self(), {Storage, :flushed, last_seen_offset})
+    end
+
+    durable_txn_offset =
+      if move_transaction_open?, do: last_persisted_txn, else: last_seen_txn
 
     # Because we've definitely persisted everything up to this point, we can remove all in-memory lines from ETS
     writer_acc(acc,
@@ -334,7 +627,7 @@ defmodule Electric.ShapeCache.PureFileStorage.WriteLoop do
       buffer_size: 0,
       ets_line_buffer: [],
       last_persisted_offset: last_seen_offset,
-      last_persisted_txn_offset: last_seen_txn,
+      last_persisted_txn_offset: durable_txn_offset,
       times_flushed: times_flushed + 1
     )
     |> update_persistance_metadata(state, last_persisted_txn)
@@ -363,6 +656,14 @@ defmodule Electric.ShapeCache.PureFileStorage.WriteLoop do
 
   # This helper function must be called after the last log items of a transaction has been
   # written. It ensures that txn offset is advanced forward in the writer state.
+  defp finalize_txn(writer_acc(move_transaction_open?: true) = acc, state) do
+    # A dependency move is one logical storage transaction even though it is
+    # assembled through several append calls. Keep the public read boundary at
+    # the pre-move transaction and treat these writes like fragments until the
+    # explicit move commit.
+    maybe_store_lines_in_ets(acc, state)
+  end
+
   defp finalize_txn(acc, state) do
     writer_acc(last_seen_offset: offset) = acc
 
@@ -395,6 +696,35 @@ defmodule Electric.ShapeCache.PureFileStorage.WriteLoop do
   to mark the transaction as complete. Should be called after all fragments
   have been written via `append_fragment_to_log!/3`.
   """
+  def signal_txn_commit(
+        writer_acc(
+          root_transaction_open?: true,
+          deferred_chunk_entries: [_ | _]
+        ) = acc,
+        writer_state(opts: opts) = state
+      ) do
+    # The log must be durable before its cursor and completed chunk boundaries
+    # become visible. Keep last_seen_txn_offset at the preceding transaction
+    # while flushing so a crash before the combined commit trims this fragment.
+    writer_acc(last_seen_offset: boundary, last_persisted_offset: boundary) =
+      acc = flush_buffer(acc, state)
+
+    {:ok, move_positions} = PureFileStorage.fetch_move_positions(opts)
+
+    {:ok, root_delivery_tx_offset} =
+      PureFileStorage.fetch_root_delivery_tx_offset(opts)
+
+    acc
+    |> commit_staged_chunk_index(boundary, move_positions, root_delivery_tx_offset, state)
+    |> writer_acc(root_transaction_open?: false)
+  end
+
+  def signal_txn_commit(writer_acc(root_transaction_open?: true) = acc, state) do
+    acc
+    |> writer_acc(root_transaction_open?: false)
+    |> finalize_txn(state)
+  end
+
   def signal_txn_commit(acc, state) do
     finalize_txn(acc, state)
   end

@@ -4,6 +4,7 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
 
   alias Electric.LsnTracker
   alias Electric.Postgres.Lsn
+  alias Electric.Postgres.ReplicationClient
   alias Electric.Replication.PersistentReplicationState
   alias Electric.Replication.ShapeLogCollector
   alias Electric.Replication.Changes.Relation
@@ -45,6 +46,8 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
 
   @shape Shape.new!("test_table", inspector: @inspector)
   @shape_handle "the-shape-handle"
+  @failed_lazy_shape_handle "failed-lazy-shape-handle"
+  @healthy_lazy_shape_handle "healthy-lazy-shape-handle"
 
   @subquery_inspector Support.StubInspector.new(
                         tables: [{1234, {"public", "test_table"}}, {5678, {"public", "parent"}}],
@@ -58,6 +61,11 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
 
   def setup_log_collector(ctx) do
     %{stack_id: stack_id} = ctx
+
+    if initial_lsn = Map.get(ctx, :initial_lsn) do
+      LsnTracker.set_last_processed_lsn(stack_id, Lsn.from_integer(initial_lsn))
+    end
+
     # Start a test Registry
     registry_name = Module.concat(__MODULE__, Registry)
     start_link_supervised!({Registry, keys: :duplicate, name: registry_name})
@@ -409,6 +417,78 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
     end
 
     @describetag restore_shapes: [{@shape_handle, @shape}], inspector: @inspector
+
+    @tag restore_shapes: [
+           {@failed_lazy_shape_handle, @shape},
+           {@healthy_lazy_shape_handle, @shape}
+         ]
+    test "lazy activation failure does not crash the collector or block healthy flushes", ctx do
+      collector_pid = ShapeLogCollector.name(ctx.stack_id) |> GenServer.whereis()
+      assert is_pid(collector_pid)
+
+      test_pid = self()
+      stack_id = ctx.stack_id
+
+      Repatch.patch(
+        Electric.ShapeCache,
+        :start_consumer_for_handle,
+        [force: true, mode: :shared],
+        fn handle, ^stack_id, _opts ->
+          send(test_pid, {:lazy_consumer_start, handle})
+          {:error, :restore_failed}
+        end
+      )
+
+      healthy_consumer =
+        start_link_supervised!(
+          {Support.TransactionConsumer,
+           id: :healthy_lazy,
+           stack_id: ctx.stack_id,
+           parent: self(),
+           shape: @shape,
+           shape_handle: @healthy_lazy_shape_handle,
+           action: :restore},
+          id: {:consumer, :healthy_lazy}
+        )
+
+      register_as_replication_client(ctx.stack_id)
+
+      lsn = Lsn.from_integer(42)
+      log_offset = LogOffset.new(lsn, 0)
+
+      txn =
+        complete_txn_fragment(100, lsn, [
+          %Changes.NewRecord{
+            relation: {"public", "test_table"},
+            record: %{"id" => "2"},
+            log_offset: log_offset
+          }
+        ])
+
+      assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
+
+      assert_receive {:lazy_consumer_start, @failed_lazy_shape_handle}
+      refute_receive {:lazy_consumer_start, @healthy_lazy_shape_handle}
+
+      assert [100] ==
+               Support.TransactionConsumer.assert_consume(
+                 [{:healthy_lazy, healthy_consumer}],
+                 [txn]
+               )
+
+      assert ^collector_pid = GenServer.whereis(ShapeLogCollector.name(ctx.stack_id))
+      assert Process.alive?(collector_pid)
+
+      ShapeLogCollector.notify_flushed(
+        ctx.stack_id,
+        @healthy_lazy_shape_handle,
+        log_offset
+      )
+
+      expected_lsn = Lsn.to_integer(lsn)
+      assert_receive {:flush_boundary_updated, ^expected_lsn}
+    end
+
     test "consumers are started when receiving a transaction that matches their filter", ctx do
       xmin = 100
       lsn = Lsn.from_string("0/10")
@@ -817,11 +897,9 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
       assert_receive {:flush_boundary_updated, 55}, 50
     end
 
+    @tag initial_lsn: 50
     test "correctly broadcasts flush when transaction has already been processed before", ctx do
       register_as_replication_client(ctx.stack_id)
-
-      LsnTracker.set_last_processed_lsn(ctx.stack_id, Lsn.from_integer(50))
-      assert :ok = ShapeLogCollector.mark_as_ready(ctx.stack_id)
 
       lsn = Lsn.from_integer(20)
       log_offset = LogOffset.new(lsn, 0)
@@ -1143,6 +1221,60 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
       relation = %Relation{id: 1234, table: "test_table", schema: "public", columns: []}
 
       assert {:error, :not_ready} = ShapeLogCollector.handle_event(relation, ctx.stack_id)
+    end
+
+    test "starting processing wakes an event that arrived before the transition without opening external readiness",
+         ctx do
+      Registry.register(
+        Electric.ProcessRegistry.registry_name(ctx.stack_id),
+        {ReplicationClient, nil},
+        nil
+      )
+
+      test_pid = self()
+
+      Repatch.patch(StatusMonitor, :mark_shape_log_collector_ready, [mode: :shared], fn _, _ ->
+        send(test_pid, :external_readiness_opened)
+        :ok
+      end)
+
+      Repatch.allow(self(), GenServer.whereis(ShapeLogCollector.name(ctx.stack_id)))
+
+      txn = complete_txn_fragment(100, Lsn.from_integer(1), [])
+      assert {:error, :not_ready} = ShapeLogCollector.handle_event(txn, ctx.stack_id)
+
+      assert :ok = ShapeLogCollector.start_processing(ctx.stack_id)
+
+      assert_receive {ReplicationClient, :shape_log_collector_processing_started, collector_pid}
+      assert collector_pid == GenServer.whereis(ShapeLogCollector.name(ctx.stack_id))
+      refute_receive :external_readiness_opened
+
+      # Processing readiness is level-triggered. Re-announcing it is
+      # intentional so a receiver that restarted or missed a prior delivery
+      # can repair its local state without opening external health.
+      assert :ok = ShapeLogCollector.start_processing(ctx.stack_id)
+      assert_receive {ReplicationClient, :shape_log_collector_processing_started, ^collector_pid}
+      refute_receive :external_readiness_opened
+
+      assert :ok = ShapeLogCollector.mark_as_ready(ctx.stack_id)
+      assert_receive {ReplicationClient, :shape_log_collector_processing_started, ^collector_pid}
+      assert_receive :external_readiness_opened
+    end
+
+    test "marking externally ready does not replace the processing frontier", ctx do
+      initial_lsn = Lsn.from_integer(10)
+      LsnTracker.set_last_processed_lsn(ctx.stack_id, initial_lsn)
+
+      assert :ok = ShapeLogCollector.start_processing(ctx.stack_id)
+
+      collector_pid = GenServer.whereis(ShapeLogCollector.name(ctx.stack_id))
+      initial_offset = :sys.get_state(collector_pid).last_processed_offset
+
+      LsnTracker.set_last_processed_lsn(ctx.stack_id, Lsn.from_integer(20))
+      assert :ok = ShapeLogCollector.mark_as_ready(ctx.stack_id)
+
+      assert :sys.get_state(collector_pid).last_processed_offset == initial_offset
+      assert initial_offset == LogOffset.new(initial_lsn, :infinity)
     end
   end
 
@@ -1476,6 +1608,21 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
 
       expected_lsn = Lsn.to_integer(lsn)
       assert_receive {:global_last_seen_lsn, ^expected_lsn}
+    end
+
+    test "an empty committed marker transaction advances global and flush frontiers", ctx do
+      stack_registry = Electric.StackSupervisor.registry_name(ctx.stack_id)
+      Registry.register(stack_registry, :global_lsn_updates, [])
+      register_as_replication_client(ctx.stack_id)
+
+      lsn = Lsn.from_string("0/20")
+      txn = complete_txn_fragment(101, lsn, [])
+
+      assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
+
+      expected_lsn = Lsn.to_integer(lsn)
+      assert_receive {:global_last_seen_lsn, ^expected_lsn}
+      assert_receive {:flush_boundary_updated, ^expected_lsn}
     end
 
     test "does not broadcast global LSN for non-commit fragments", ctx do

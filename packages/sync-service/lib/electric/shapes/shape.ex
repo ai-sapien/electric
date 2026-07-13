@@ -106,8 +106,9 @@ defmodule Electric.Shapes.Shape do
   for example).
 
   This representation must contain all the information that identifies
-  user-specified properties of the shape. We're omitting storage configuration
-  and other internal state.
+  user-specified properties of the shape. Storage compaction is included because
+  compacted history cannot safely back a dependency materializer that must replay
+  every logical commit; other internal state is omitted.
   """
   @spec comparable(t()) :: comparable()
   def comparable(%__MODULE__{} = shape) do
@@ -115,8 +116,11 @@ defmodule Electric.Shapes.Shape do
      Comparable.comparable(shape.where), shape.selected_columns,
      shape.explicitly_selected_columns,
      Enum.flat_map(shape.flags, fn {k, v} -> if(v, do: [k], else: []) end) |> Enum.sort(),
-     shape.replica, shape.log_mode}
+     shape.replica, shape.log_mode, comparable_storage_compaction(shape.storage)}
   end
+
+  defp comparable_storage_compaction(nil), do: :disabled
+  defp comparable_storage_compaction(%{compaction: compaction}), do: compaction
 
   defguard has_dependencies(shape) when shape.shape_dependencies != []
 
@@ -347,6 +351,11 @@ defmodule Electric.Shapes.Shape do
              |> Map.put(:select, subquery)
              |> Map.put(:autofill_pk_select?, true)
              |> Map.put(:log_mode, :full)
+             # Dependency materializers reconstruct exact historical views for
+             # stale outer cursors. Compaction may discard logical commit
+             # delimiters, so dependencies always own an uncompacted log even
+             # when the requested outer shape opts into compaction.
+             |> Map.put(:storage, %{compaction: :disabled})
              |> new() do
         comparable_shape = comparable(shape_dependency)
 

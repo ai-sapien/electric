@@ -175,6 +175,46 @@ defmodule Electric.Shapes.ConsumerRegistryTest do
   end
 
   describe "publish/2 crashed consumer handling" do
+    test "lazy activation failure is isolated while healthy consumers still receive the event",
+         ctx do
+      %{stack_id: stack_id} = ctx
+      parent = self()
+
+      Repatch.patch(
+        Electric.ShapeCache,
+        :start_consumer_for_handle,
+        [force: true],
+        fn
+          "handle-failed", ^stack_id, _opts ->
+            {:error, :restore_failed}
+
+          handle, ^stack_id, _opts ->
+            {:ok, pid} =
+              TestSubscriber.start_link(stack_id, handle, fn message, state ->
+                send(parent, {:broadcast, handle, message})
+                {:reply, :ok, state}
+              end)
+
+            {:ok, pid}
+        end
+      )
+
+      result =
+        ConsumerRegistry.publish(
+          %{
+            "handle-failed" => {:txn, %{lsn: 1}},
+            "handle-ok" => {:txn, %{lsn: 1}}
+          },
+          ctx.registry_state
+        )
+
+      assert_receive {:broadcast, "handle-ok", {:txn, %{lsn: 1}}}
+      refute Map.has_key?(result, "handle-ok")
+
+      assert {:publish, {:consumer_start_failed, :restore_failed}} ==
+               Map.fetch!(result, "handle-failed")
+    end
+
     test "dead PID in ETS is detected as crashed and returned as undeliverable", ctx do
       %{registry_state: %{table: table}} = ctx
 
@@ -430,6 +470,243 @@ defmodule Electric.Shapes.ConsumerRegistryTest do
     end
   end
 
+  describe "causal drain generation" do
+    test "tracks only admitted work at or before the active target", ctx do
+      target = 100
+      assert {:ok, token} = ConsumerRegistry.activate_causal_drain(ctx.stack_id, target)
+      initial_generation = ConsumerRegistry.causal_generation(ctx.stack_id)
+
+      assert :ok = ConsumerRegistry.mark_causal_work_created(ctx.stack_id, target + 1)
+      assert ConsumerRegistry.causal_generation(ctx.stack_id) == initial_generation
+
+      assert :ok = ConsumerRegistry.mark_causal_work_created(ctx.stack_id, target)
+      assert ConsumerRegistry.causal_generation(ctx.stack_id) == initial_generation + 1
+
+      assert :ok = ConsumerRegistry.deactivate_causal_drain(ctx.stack_id, token)
+      assert :ok = ConsumerRegistry.mark_causal_work_created(ctx.stack_id, target)
+      assert ConsumerRegistry.causal_generation(ctx.stack_id) == initial_generation + 1
+    end
+
+    test "rejects a live owner and lets a successor reclaim a dead owner", ctx do
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          result = ConsumerRegistry.activate_causal_drain(ctx.stack_id, 100)
+          send(parent, {:owner_claimed, self(), result})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:owner_claimed, ^owner, {:ok, old_token}}
+
+      assert {:error, {:causal_drain_already_active, ^owner}} =
+               ConsumerRegistry.activate_causal_drain(ctx.stack_id, 100)
+
+      owner_ref = Process.monitor(owner)
+      Process.exit(owner, :kill)
+      assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}
+
+      assert {:ok, successor_token} =
+               ConsumerRegistry.activate_causal_drain(ctx.stack_id, 200)
+
+      # Cleanup from the previous owner must not erase the replacement epoch.
+      assert :ok = ConsumerRegistry.deactivate_causal_drain(ctx.stack_id, old_token)
+
+      assert {:error, {:causal_drain_already_active, owner_pid}} =
+               ConsumerRegistry.activate_causal_drain(ctx.stack_id, 200)
+
+      assert owner_pid == self()
+      assert :ok = ConsumerRegistry.deactivate_causal_drain(ctx.stack_id, successor_token)
+    end
+
+    test "close retries when admitted work races the sampled generation", ctx do
+      target = 100
+      assert {:ok, token} = ConsumerRegistry.activate_causal_drain(ctx.stack_id, target)
+      sampled_generation = ConsumerRegistry.causal_generation(ctx.stack_id)
+
+      assert :ok = ConsumerRegistry.mark_causal_work_created(ctx.stack_id, target)
+
+      assert :retry =
+               ConsumerRegistry.close_causal_drain(
+                 ctx.stack_id,
+                 target,
+                 sampled_generation,
+                 token
+               )
+
+      stable_generation = ConsumerRegistry.causal_generation(ctx.stack_id)
+
+      assert :ok =
+               ConsumerRegistry.close_causal_drain(
+                 ctx.stack_id,
+                 target,
+                 stable_generation,
+                 token
+               )
+    end
+
+    test "close cannot miss a registration inserted after the final topology sample", ctx do
+      target = 100
+      handle = "late-topology-consumer"
+      parent = self()
+      table = ctx.registry_state.table
+
+      assert {:ok, drain_token} =
+               ConsumerRegistry.activate_causal_drain(ctx.stack_id, target)
+
+      registrar =
+        spawn(fn ->
+          ConsumerRegistry.with_consumer_topology_mutation(ctx.stack_id, fn ->
+            send(parent, {:topology_mutation_started, self()})
+
+            receive do
+              :insert_consumer -> :ok
+            end
+
+            true = :ets.insert_new(table, {handle, self()})
+            send(parent, {:consumer_inserted, self()})
+
+            receive do
+              :finish_topology_mutation -> :ok
+            end
+          end)
+
+          send(parent, {:topology_mutation_finished, self()})
+        end)
+
+      assert_receive {:topology_mutation_started, ^registrar}
+
+      # Model the drain worker's final snapshot/generation sample while a
+      # registration has begun but has not yet changed the consumer table.
+      sampled_snapshot = ConsumerRegistry.consumer_snapshot(ctx.stack_id)
+      sampled_generation = ConsumerRegistry.causal_generation(ctx.stack_id)
+      assert sampled_snapshot == %{}
+
+      send(registrar, :insert_consumer)
+      assert_receive {:consumer_inserted, ^registrar}
+      assert ConsumerRegistry.consumer_snapshot(ctx.stack_id) == %{handle => registrar}
+
+      # The generation cannot advance until the mutation is complete. The
+      # in-flight field itself must therefore prevent the stale sample from
+      # closing the epoch in this exact interleaving.
+      assert ConsumerRegistry.causal_generation(ctx.stack_id) == sampled_generation
+
+      assert :retry =
+               ConsumerRegistry.close_causal_drain(
+                 ctx.stack_id,
+                 target,
+                 sampled_generation,
+                 drain_token
+               )
+
+      send(registrar, :finish_topology_mutation)
+      assert_receive {:topology_mutation_finished, ^registrar}
+
+      stable_generation = ConsumerRegistry.causal_generation(ctx.stack_id)
+      assert stable_generation == sampled_generation + 1
+
+      assert :ok =
+               ConsumerRegistry.close_causal_drain(
+                 ctx.stack_id,
+                 target,
+                 stable_generation,
+                 drain_token
+               )
+    end
+
+    test "a dead topology mutation owner is reaped without allowing a stale close", ctx do
+      target = 100
+      parent = self()
+
+      assert {:ok, drain_token} =
+               ConsumerRegistry.activate_causal_drain(ctx.stack_id, target)
+
+      {mutation_owner, mutation_owner_ref} =
+        spawn_monitor(fn ->
+          ConsumerRegistry.with_consumer_topology_mutation(ctx.stack_id, fn ->
+            send(parent, {:topology_mutation_started, self()})
+            Process.sleep(:infinity)
+          end)
+        end)
+
+      assert_receive {:topology_mutation_started, ^mutation_owner}
+      sampled_generation = ConsumerRegistry.causal_generation(ctx.stack_id)
+
+      Process.exit(mutation_owner, :kill)
+
+      assert_receive {:DOWN, ^mutation_owner_ref, :process, ^mutation_owner, :killed}
+
+      # The owner may have changed the consumer table before dying. Reaping it
+      # is therefore a conservative topology generation change and the caller
+      # must take another fixed-point snapshot before closing.
+      assert :retry =
+               ConsumerRegistry.close_causal_drain(
+                 ctx.stack_id,
+                 target,
+                 sampled_generation,
+                 drain_token
+               )
+
+      reaped_generation = ConsumerRegistry.causal_generation(ctx.stack_id)
+      assert reaped_generation == sampled_generation + 1
+
+      assert :ok =
+               ConsumerRegistry.close_causal_drain(
+                 ctx.stack_id,
+                 target,
+                 reaped_generation,
+                 drain_token
+               )
+    end
+
+    test "topology mutation cleanup survives an exception", ctx do
+      target = 100
+
+      assert {:ok, drain_token} =
+               ConsumerRegistry.activate_causal_drain(ctx.stack_id, target)
+
+      initial_generation = ConsumerRegistry.causal_generation(ctx.stack_id)
+
+      assert_raise RuntimeError, "topology mutation failed", fn ->
+        ConsumerRegistry.with_consumer_topology_mutation(ctx.stack_id, fn ->
+          raise "topology mutation failed"
+        end)
+      end
+
+      cleaned_generation = ConsumerRegistry.causal_generation(ctx.stack_id)
+      assert cleaned_generation == initial_generation + 1
+
+      assert :ok =
+               ConsumerRegistry.close_causal_drain(
+                 ctx.stack_id,
+                 target,
+                 cleaned_generation,
+                 drain_token
+               )
+    end
+
+    test "topology changes advance the active generation without leaking metadata as a consumer",
+         ctx do
+      assert {:ok, token} = ConsumerRegistry.activate_causal_drain(ctx.stack_id, 100)
+      initial_generation = ConsumerRegistry.causal_generation(ctx.stack_id)
+
+      assert ConsumerRegistry.active_consumer_count(ctx.stack_id) == 0
+      assert ConsumerRegistry.consumer_snapshot(ctx.stack_id) == %{}
+
+      :ok = ConsumerRegistry.register_consumer(self(), "topology-consumer", ctx.stack_id)
+      assert ConsumerRegistry.causal_generation(ctx.stack_id) == initial_generation + 1
+      assert ConsumerRegistry.active_consumer_count(ctx.stack_id) == 1
+      assert ConsumerRegistry.consumer_snapshot(ctx.stack_id) == %{"topology-consumer" => self()}
+
+      :ok = ConsumerRegistry.remove_consumer("topology-consumer", ctx.stack_id)
+      assert ConsumerRegistry.causal_generation(ctx.stack_id) == initial_generation + 2
+      assert ConsumerRegistry.active_consumer_count(ctx.stack_id) == 0
+      assert ConsumerRegistry.consumer_snapshot(ctx.stack_id) == %{}
+
+      assert :ok = ConsumerRegistry.deactivate_causal_drain(ctx.stack_id, token)
+    end
+  end
+
   describe "whereis/2" do
     test "returns the registered pid for named processes", ctx do
       handle = "handle-1"
@@ -491,6 +768,12 @@ defmodule Electric.Shapes.ConsumerRegistryTest do
       :ok = ConsumerRegistry.remove_consumer(handle, ctx.registry_state)
       :ok = ConsumerRegistry.remove_consumer(handle, ctx.registry_state)
       assert ConsumerRegistry.active_consumer_count(ctx.stack_id) == 0
+    end
+
+    test "is idempotent when the registry table is already gone", ctx do
+      :ets.delete(ctx.registry_state.table)
+
+      assert :ok = ConsumerRegistry.remove_consumer("handle-1", ctx.registry_state)
     end
   end
 

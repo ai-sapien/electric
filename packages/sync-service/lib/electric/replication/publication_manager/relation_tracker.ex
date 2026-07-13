@@ -567,7 +567,12 @@ defmodule Electric.Replication.PublicationManager.RelationTracker do
     if map_size(oid_to_handles_to_fail) > 0 do
       # schedule removals for any tracked shapes that require generated columns
       handles = oid_to_handles_to_fail |> Map.values() |> List.flatten()
-      ShapeCleaner.remove_shapes_async(state.stack_id, handles)
+
+      ShapeCleaner.remove_shapes_async(
+        state.stack_id,
+        handles,
+        {:error, Electric.SnapshotError.from_error(missing_gen_col_error)}
+      )
     end
 
     %{state | waiters: new_waiters}

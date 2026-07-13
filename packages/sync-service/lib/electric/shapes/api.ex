@@ -551,7 +551,10 @@ defmodule Electric.Shapes.Api do
 
   # For "now" requests, use the last_offset directly as the chunk_end_offset
   defp use_last_offset_as_chunk_end(%Request{} = request) do
-    %{request | chunk_end_offset: request.last_offset}
+    Request.update_response(
+      %{request | chunk_end_offset: request.last_offset},
+      &%{&1 | offset: request.last_offset}
+    )
   end
 
   defp determine_up_to_date(%Request{} = request) do
@@ -1100,11 +1103,14 @@ defmodule Electric.Shapes.Api do
         updated_request =
           %{request | last_offset: latest_log_offset}
           |> determine_global_last_seen_lsn()
-          |> determine_log_chunk_offset()
+          # A dependency move can atomically publish several physical chunks
+          # but emits one notification. SSE is already lazy/backpressured, so
+          # drain exactly through that notified boundary in this stream turn;
+          # stopping at the first chunk would strand the final `last=true`
+          # delimiter until an unrelated later write or reconnect.
+          |> use_last_offset_as_chunk_end()
           |> determine_up_to_date()
 
-        # This is usually but not always the `latest_log_offset`
-        # as per `determine_log_chunk_offset/1`.
         end_offset = updated_request.chunk_end_offset
 
         case Shapes.get_merged_log_stream(

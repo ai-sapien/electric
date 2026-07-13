@@ -11,6 +11,34 @@ defmodule Electric.ShapeCacheTest do
   alias Electric.Shapes
   alias Electric.Shapes.Shape
 
+  defmodule LegacyStorage do
+    @moduledoc false
+
+    @unsupported_callbacks [
+      get_log_replay_safe_cursor: 1,
+      get_log_stream_with_offsets: 3,
+      fetch_root_delivery_tx_offset: 1,
+      begin_move_transaction!: 1,
+      commit_move_transaction!: 3
+    ]
+
+    {:ok, storage_callbacks} =
+      Code.Typespec.fetch_callbacks(Electric.ShapeCache.Storage)
+
+    for {{name, arity}, _typespecs} <- storage_callbacks,
+        {name, arity} not in @unsupported_callbacks do
+      args = Macro.generate_arguments(arity, __MODULE__)
+
+      def unquote(name)(unquote_splicing(args)) do
+        apply(
+          Electric.ShapeCache.PureFileStorage,
+          unquote(name),
+          [unquote_splicing(args)]
+        )
+      end
+    end
+  end
+
   import ExUnit.CaptureLog
   import Support.ComponentSetup
   import Support.DbSetup
@@ -71,6 +99,7 @@ defmodule Electric.ShapeCacheTest do
   setup [
     :with_persistent_kv,
     :with_stack_id_from_test,
+    :with_materializer_replay_coordinator,
     :with_async_deleter,
     :with_pure_file_storage,
     :with_shape_status,
@@ -104,6 +133,28 @@ defmodule Electric.ShapeCacheTest do
       {shape_handle2, @zero_offset} = ShapeCache.get_or_create_shape_handle(@shape, ctx.stack_id)
       assert shape_handle1 == shape_handle2
       wait_shape_init(shape_handle1, ctx)
+    end
+
+    test "legacy storage serves ordinary shapes but rejects subquery shapes before creation",
+         %{storage: {_module, storage_opts}} = ctx do
+      Electric.StackConfig.put(ctx.stack_id, Storage, {LegacyStorage, storage_opts})
+
+      {shape_handle, @zero_offset} =
+        ShapeCache.get_or_create_shape_handle(@shape, ctx.stack_id)
+
+      assert is_binary(shape_handle)
+      wait_shape_init(shape_handle, ctx)
+
+      expected_error =
+        "Storage adapter #{inspect(LegacyStorage)} cannot serve subquery shapes; " <>
+          "missing required callbacks: begin_move_transaction!/1, " <>
+          "commit_move_transaction!/3, fetch_root_delivery_tx_offset/1, " <>
+          "get_log_stream_with_offsets/3"
+
+      assert {:error, %Storage.Error{message: ^expected_error}} =
+               ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      assert :error = ShapeStatus.fetch_handle_by_shape(ctx.stack_id, @shape_with_subquery)
     end
 
     test "should not return the same shape_handle for different shapes despite hash collision",
@@ -505,15 +556,21 @@ defmodule Electric.ShapeCacheTest do
     end
 
     @tag stack_config_seed: [snapshot_timeout_to_first_data: 500]
-    test "crashes when initial snapshot query fails to return data quickly enough", %{
+    test "reports a slow snapshot when initial snapshot fails to return data quickly enough", %{
       shape: shape,
       stack_id: stack_id
     } do
-      alias Electric.Replication.Eval.Parser
-      where_clause = Parser.parse_and_validate_expression!("TRUE", refs: %{})
-      # Insert a fake slow query
-      where_clause = %{where_clause | query: "PG_SLEEP(2)::text ILIKE ''"}
-      shape = %{shape | where: where_clause}
+      Electric.StackConfig.put(stack_id, :create_snapshot_fn, fn task_parent,
+                                                                 _consumer,
+                                                                 _shape_handle,
+                                                                 _shape,
+                                                                 _ctx ->
+        send(task_parent, {:ready_to_stream, self(), System.monotonic_time(:millisecond)})
+
+        receive do
+          :finish_snapshot -> :ok
+        end
+      end)
 
       {shape_handle, _} = ShapeCache.get_or_create_shape_handle(shape, stack_id)
 
@@ -961,7 +1018,7 @@ defmodule Electric.ShapeCacheTest do
       assert_shape_cleanup(shape_handle)
     end
 
-    test "propagates error in snapshot creation to listeners", ctx do
+    test "preserves the typed snapshot error when the snapshotter wins the cleanup race", ctx do
       test_pid = self()
 
       Support.TestUtils.patch_snapshotter(fn parent, shape_handle, _shape, _ ->
@@ -987,6 +1044,46 @@ defmodule Electric.ShapeCacheTest do
       send(pid, {:continue, ref})
 
       assert {:error, %Electric.SnapshotError{message: "expected error"}} = Task.await(task)
+    end
+
+    test "preserves the typed snapshot error when the cleaner wins the snapshotter race", ctx do
+      test_pid = self()
+
+      snapshot_error = %Electric.SnapshotError{
+        message: "expected publication error",
+        type: :publication_missing_generated_columns
+      }
+
+      Support.TestUtils.patch_snapshotter(fn parent, shape_handle, _shape, _ ->
+        ref = make_ref()
+        send(test_pid, {:snapshotter_waiting, ref, self()})
+
+        receive do
+          {:report_snapshot_failure, ^ref} ->
+            GenServer.cast(parent, {:snapshot_failed, shape_handle, snapshot_error})
+        end
+      end)
+
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape, ctx.stack_id)
+      task = Task.async(ShapeCache, :await_snapshot_start, [shape_handle, ctx.stack_id])
+
+      consumer_pid = Electric.Shapes.Consumer.whereis(ctx.stack_id, shape_handle)
+      await_for_consumer_to_have_waiters(consumer_pid)
+
+      assert_receive {:snapshotter_waiting, ref, snapshotter_pid}
+
+      :ok =
+        Electric.ShapeCache.ShapeCleaner.remove_shape_async(
+          ctx.stack_id,
+          shape_handle,
+          {:error, snapshot_error}
+        )
+
+      assert {:error, ^snapshot_error} = Task.await(task)
+
+      # Complete the losing side of the race as well. Casting to the consumer
+      # after typed cleanup has stopped it must not change the observed error.
+      send(snapshotter_pid, {:report_snapshot_failure, ref})
     end
 
     test "should stop awaiting if shape process dies unexpectedly", ctx do
@@ -1125,8 +1222,6 @@ defmodule Electric.ShapeCacheTest do
         GenServer.cast(parent, {:snapshot_started, shape_handle})
       end)
 
-      start_consumer_delay = 1000
-
       test_pid = self()
 
       Repatch.patch(
@@ -1134,21 +1229,28 @@ defmodule Electric.ShapeCacheTest do
         :start_shape_consumer,
         [mode: :shared],
         fn a, b ->
-          send(test_pid, :about_to_start_consumer)
+          send(test_pid, {:about_to_start_consumer, self()})
 
-          Process.sleep(start_consumer_delay)
+          receive do
+            :release_start_consumer -> :ok
+          end
+
           Repatch.real(Electric.Shapes.DynamicConsumerSupervisor.start_shape_consumer(a, b))
         end
       )
 
       activate_mocks_for_descendant_procs(Electric.ShapeCache)
 
-      _creation_task =
+      creation_task =
         Task.async(fn -> ShapeCache.get_or_create_shape_handle(@shape, ctx.stack_id) end)
 
-      {shape_handle, _} =
+      {shape_handle, starter_pid} =
         receive do
-          :about_to_start_consumer -> ShapeCache.get_or_create_shape_handle(@shape, ctx.stack_id)
+          {:about_to_start_consumer, starter_pid} ->
+            {shape_handle, _} =
+              ShapeCache.get_or_create_shape_handle(@shape, ctx.stack_id)
+
+            {shape_handle, starter_pid}
         end
 
       wait_task =
@@ -1158,14 +1260,19 @@ defmodule Electric.ShapeCacheTest do
       refute Task.yield(wait_task, 400)
 
       log =
-        capture_log(fn ->
-          assert {:error,
-                  %Electric.SnapshotError{
-                    message: "Snapshot query took too long to start reading from the database",
-                    type: :slow_snapshot_start,
-                    original_error: nil
-                  }} == Task.await(wait_task)
-        end)
+        try do
+          capture_log(fn ->
+            assert {:error,
+                    %Electric.SnapshotError{
+                      message: "Snapshot query took too long to start reading from the database",
+                      type: :slow_snapshot_start,
+                      original_error: nil
+                    }} == Task.await(wait_task)
+          end)
+        after
+          send(starter_pid, :release_start_consumer)
+          Task.await(creation_task, 5_000)
+        end
 
       assert String.contains?(
                log,
@@ -1314,6 +1421,30 @@ defmodule Electric.ShapeCacheTest do
       restart_shape_cache(ctx)
 
       assert [{^dep_handle, _}, {^shape_handle, _}] = ShapeCache.list_shapes(ctx.stack_id)
+    end
+
+    test "does not reuse a compaction-enabled simple shape as a replay dependency", ctx do
+      [dependency_shape] = @shape_with_subquery.shape_dependencies
+      compacted_dependency = %{dependency_shape | storage: %{compaction: :enabled}}
+
+      {compacted_handle, _} =
+        ShapeCache.get_or_create_shape_handle(compacted_dependency, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(compacted_handle, ctx.stack_id)
+
+      {outer_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(outer_handle, ctx.stack_id)
+      {:ok, outer_shape} = ShapeCache.fetch_shape_by_handle(outer_handle, ctx.stack_id)
+
+      assert [replay_dependency_handle] = outer_shape.shape_dependencies_handles
+      assert replay_dependency_handle != compacted_handle
+
+      {:ok, replay_dependency} =
+        ShapeCache.fetch_shape_by_handle(replay_dependency_handle, ctx.stack_id)
+
+      assert replay_dependency.storage.compaction == :disabled
     end
 
     test "starts a persisted dependency before creating a new outer shape after restart", ctx do
@@ -1561,6 +1692,7 @@ defmodule Electric.ShapeCacheTest do
     test "purges the shape when the eager consumer await fails", ctx do
       %{stack_id: stack_id} = ctx
       test_pid = self()
+      patch_initialization_registration()
 
       {:ok, shape_handle} = ShapeStatus.add_shape(stack_id, @shape_with_subquery)
 
@@ -1590,14 +1722,15 @@ defmodule Electric.ShapeCacheTest do
         fn _stack_id, _handle -> exit(:test_consumer_died) end
       )
 
-      # clean_shape goes through ShapeCleaner.remove_shape; capture the call
-      # to prove the failed shape is purged so a client refetches from scratch.
+      # Restore failures are removed as one synchronous dependency closure so
+      # external readiness cannot open between a failed dependency and its
+      # outer shapes. This graph has only the failed shape in that closure.
       Repatch.patch(
         Electric.ShapeCache.ShapeCleaner,
-        :remove_shape,
+        :remove_shapes,
         [mode: :shared],
-        fn _stack_id, handle ->
-          send(test_pid, {:remove_shape_called, handle})
+        fn _stack_id, handles ->
+          send(test_pid, {:remove_shapes_called, handles})
           :ok
         end
       )
@@ -1606,7 +1739,461 @@ defmodule Electric.ShapeCacheTest do
 
       with_shape_cache(ctx)
 
-      assert_receive {:remove_shape_called, ^shape_handle}, 5_000
+      assert_receive {:remove_shapes_called, [^shape_handle]}, 5_000
+    end
+
+    test "purges a shape without crashing ShapeCache when its consumer dies before registration",
+         ctx do
+      %{stack_id: stack_id} = ctx
+      test_pid = self()
+
+      {:ok, shape_handle} = ShapeStatus.add_shape(stack_id, @shape)
+
+      Repatch.patch(
+        Electric.Shapes.DynamicConsumerSupervisor,
+        :start_shape_consumer,
+        [mode: :shared],
+        fn ^stack_id, %{shape_handle: ^shape_handle} ->
+          consumer_pid =
+            spawn(fn ->
+              receive do
+                {:initialize_shape, _shape, _opts} ->
+                  send(test_pid, {:consumer_died_before_registration, self()})
+                  exit(:test_consumer_died)
+              end
+            end)
+
+          {:ok, consumer_pid}
+        end
+      )
+
+      activate_mocks_for_descendant_procs(Electric.ShapeCache)
+      with_shape_cache(ctx)
+
+      shape_cache_pid = GenServer.whereis(ShapeCache.name(stack_id))
+
+      assert {:error, _reason} = ShapeCache.start_consumer_for_handle(shape_handle, stack_id)
+      assert_receive {:consumer_died_before_registration, _consumer_pid}, 5_000
+      assert Process.alive?(shape_cache_pid)
+      refute ShapeStatus.has_shape_handle?(stack_id, shape_handle)
+    end
+
+    test "opens collector processing before replay await and external readiness afterwards",
+         ctx do
+      %{stack_id: stack_id} = ctx
+      test_pid = self()
+      patch_initialization_registration()
+
+      {:ok, shape_handle} = ShapeStatus.add_shape(stack_id, @shape_with_subquery)
+
+      Repatch.patch(
+        Electric.Shapes.DynamicConsumerSupervisor,
+        :start_materializer,
+        [mode: :shared],
+        fn _stack_id, _config -> {:ok, test_pid} end
+      )
+
+      Repatch.patch(
+        Electric.Shapes.DynamicConsumerSupervisor,
+        :start_shape_consumer,
+        [mode: :shared],
+        fn _stack_id, _config -> {:ok, test_pid} end
+      )
+
+      Repatch.patch(
+        Electric.Shapes.Consumer,
+        :await_snapshot_start,
+        [mode: :shared],
+        fn _stack_id, handle ->
+          caller = self()
+          send(test_pid, {:restore_await_started, handle, caller})
+
+          receive do
+            {:release_restore_await, ^handle} -> :started
+          end
+        end
+      )
+
+      Repatch.patch(ShapeLogCollector, :start_processing, [mode: :shared], fn ^stack_id ->
+        send(test_pid, :collector_processing_started)
+        :ok
+      end)
+
+      Repatch.patch(ShapeLogCollector, :mark_as_ready, [mode: :shared], fn ^stack_id ->
+        send(test_pid, :external_readiness_opened)
+        :ok
+      end)
+
+      activate_mocks_for_descendant_procs(Electric.ShapeCache)
+
+      with_shape_cache(ctx)
+
+      assert_receive :collector_processing_started, 5_000
+      assert_receive {:restore_await_started, ^shape_handle, await_pid}, 5_000
+      refute_receive :external_readiness_opened
+
+      send(await_pid, {:release_restore_await, shape_handle})
+      assert_receive :external_readiness_opened, 5_000
+    end
+
+    test "starts collector processing only after every restored consumer registers initialization",
+         ctx do
+      %{stack_id: stack_id} = ctx
+      test_pid = self()
+
+      dependency_handle = "restore-registration-dependency"
+      outer_handle = "restore-registration-outer"
+      [dependency_shape] = @shape_with_subquery.shape_dependencies
+      dependency_shape = %{dependency_shape | shape_dependencies_handles: []}
+
+      outer_shape = %{
+        @shape_with_subquery
+        | shape_dependencies_handles: [dependency_handle]
+      }
+
+      Repatch.patch(ShapeStatus, :list_shapes, [mode: :shared], fn ^stack_id ->
+        [{dependency_handle, dependency_shape}, {outer_handle, outer_shape}]
+      end)
+
+      Repatch.patch(ShapeStatus, :fetch_shape_by_handle, [mode: :shared], fn
+        ^stack_id, ^dependency_handle -> {:ok, dependency_shape}
+        ^stack_id, ^outer_handle -> {:ok, outer_shape}
+      end)
+
+      Repatch.patch(ShapeStatus, :update_last_read_time_to_now, [mode: :shared], fn
+        ^stack_id, _handle -> :ok
+      end)
+
+      Repatch.patch(
+        Electric.Shapes.DynamicConsumerSupervisor,
+        :start_materializer,
+        [mode: :shared],
+        fn _stack_id, _config -> {:ok, test_pid} end
+      )
+
+      Repatch.patch(
+        Electric.Shapes.DynamicConsumerSupervisor,
+        :start_shape_consumer,
+        [mode: :shared],
+        fn ^stack_id, %{shape_handle: handle} ->
+          consumer_pid =
+            spawn_link(fn -> delayed_initialization_consumer(test_pid, handle) end)
+
+          {:ok, consumer_pid}
+        end
+      )
+
+      Repatch.patch(
+        Electric.Shapes.Consumer,
+        :await_snapshot_start,
+        [mode: :shared],
+        fn ^stack_id, _handle -> :started end
+      )
+
+      Repatch.patch(ShapeLogCollector, :start_processing, [mode: :shared], fn ^stack_id ->
+        send(test_pid, :collector_processing_started)
+        :ok
+      end)
+
+      Repatch.patch(ShapeLogCollector, :mark_as_ready, [mode: :shared], fn ^stack_id -> :ok end)
+
+      activate_mocks_for_descendant_procs(Electric.ShapeCache)
+
+      with_shape_cache(ctx)
+
+      assert_receive {:consumer_initialization_received, ^dependency_handle, dependency_pid},
+                     5_000
+
+      refute_receive :collector_processing_started
+      send(dependency_pid, :complete_initialization)
+
+      assert_receive {:consumer_initialization_received, ^outer_handle, outer_pid}, 5_000
+      refute_receive :collector_processing_started
+      send(outer_pid, :complete_initialization)
+
+      assert_receive :collector_processing_started, 5_000
+    end
+
+    test "keeps lazy consumer starts responsive while restored subqueries await replay", ctx do
+      %{stack_id: stack_id} = ctx
+      test_pid = self()
+      patch_initialization_registration()
+
+      {:ok, _subquery_handle} = ShapeStatus.add_shape(stack_id, @shape_with_subquery)
+      {:ok, simple_handle} = ShapeStatus.add_shape(stack_id, @shape)
+
+      Repatch.patch(
+        Electric.Shapes.DynamicConsumerSupervisor,
+        :start_materializer,
+        [mode: :shared],
+        fn _stack_id, _config -> {:ok, test_pid} end
+      )
+
+      Repatch.patch(
+        Electric.Shapes.DynamicConsumerSupervisor,
+        :start_shape_consumer,
+        [mode: :shared],
+        fn _stack_id, _config -> {:ok, test_pid} end
+      )
+
+      await_snapshot = fn handle ->
+        if handle == simple_handle do
+          :started
+        else
+          caller = self()
+          send(test_pid, {:restore_await_started, caller})
+
+          receive do
+            :release_restore_await -> :started
+          end
+        end
+      end
+
+      Repatch.patch(
+        Electric.Shapes.Consumer,
+        :await_snapshot_start,
+        [mode: :shared],
+        fn _stack_id, handle -> await_snapshot.(handle) end
+      )
+
+      Repatch.patch(
+        Electric.Shapes.Consumer,
+        :await_snapshot_start,
+        [mode: :shared],
+        fn _stack_id, handle, _timeout -> await_snapshot.(handle) end
+      )
+
+      Repatch.patch(ShapeLogCollector, :start_processing, [mode: :shared], fn ^stack_id ->
+        send(test_pid, :collector_processing_started)
+        :ok
+      end)
+
+      Repatch.patch(ShapeLogCollector, :mark_as_ready, [mode: :shared], fn ^stack_id -> :ok end)
+
+      activate_mocks_for_descendant_procs(Electric.ShapeCache)
+
+      with_shape_cache(ctx)
+
+      assert_receive :collector_processing_started, 5_000
+      assert_receive {:restore_await_started, await_pid}, 5_000
+
+      assert {:ok, ^test_pid} =
+               GenServer.call(
+                 ShapeCache.name(stack_id),
+                 {:start_consumer_for_handle, simple_handle, nil},
+                 1_000
+               )
+
+      send(await_pid, :release_restore_await)
+    end
+
+    test "keeps already-started descendants in the restore barrier and purges the root when a later descendant fails",
+         ctx do
+      %{stack_id: stack_id} = ctx
+      test_pid = self()
+      patch_initialization_registration()
+
+      root_shape =
+        Shape.new!("items",
+          inspector: @stub_inspector,
+          where:
+            "id IN (SELECT id FROM public.other_table WHERE id IN (SELECT id FROM public.items WHERE value = 'visible'))"
+        )
+
+      [middle_shape] = root_shape.shape_dependencies
+      [leaf_shape] = middle_shape.shape_dependencies
+
+      leaf_handle = "restore-leaf"
+      middle_handle = "restore-middle"
+      root_handle = "restore-root"
+
+      leaf_shape = %{leaf_shape | shape_dependencies_handles: []}
+      middle_shape = %{middle_shape | shape_dependencies_handles: [leaf_handle]}
+      root_shape = %{root_shape | shape_dependencies_handles: [middle_handle]}
+
+      Repatch.patch(ShapeStatus, :list_shapes, [mode: :shared], fn ^stack_id ->
+        [{root_handle, root_shape}]
+      end)
+
+      Repatch.patch(ShapeStatus, :fetch_shape_by_handle, [mode: :shared], fn
+        ^stack_id, ^leaf_handle -> {:ok, leaf_shape}
+        ^stack_id, ^middle_handle -> {:ok, middle_shape}
+        ^stack_id, ^root_handle -> {:ok, root_shape}
+      end)
+
+      Repatch.patch(ShapeStatus, :update_last_read_time_to_now, [mode: :shared], fn
+        ^stack_id, _handle -> :ok
+      end)
+
+      Repatch.patch(
+        Electric.Shapes.DynamicConsumerSupervisor,
+        :start_materializer,
+        [mode: :shared],
+        fn _stack_id, _config -> {:ok, test_pid} end
+      )
+
+      Repatch.patch(
+        Electric.Shapes.DynamicConsumerSupervisor,
+        :start_shape_consumer,
+        [mode: :shared],
+        fn ^stack_id, %{shape_handle: handle} ->
+          send(test_pid, {:consumer_start_attempted, handle})
+
+          case handle do
+            ^leaf_handle -> {:ok, test_pid}
+            ^middle_handle -> {:error, :test_descendant_start_failure}
+            ^root_handle -> flunk("root consumer must not start after descendant failure")
+          end
+        end
+      )
+
+      Repatch.patch(
+        Electric.Shapes.Consumer,
+        :await_snapshot_start,
+        [mode: :shared],
+        fn ^stack_id, handle ->
+          send(test_pid, {:restore_consumer_awaited, handle})
+          :started
+        end
+      )
+
+      Repatch.patch(
+        Electric.ShapeCache.ShapeCleaner,
+        :remove_shape,
+        [mode: :shared],
+        fn ^stack_id, handle ->
+          send(test_pid, {:remove_shape_called, handle})
+          :ok
+        end
+      )
+
+      Repatch.patch(ShapeLogCollector, :start_processing, [mode: :shared], fn ^stack_id ->
+        send(test_pid, :collector_processing_started)
+        :ok
+      end)
+
+      Repatch.patch(ShapeLogCollector, :mark_as_ready, [mode: :shared], fn ^stack_id ->
+        send(test_pid, :external_readiness_opened)
+        :ok
+      end)
+
+      activate_mocks_for_descendant_procs(Electric.ShapeCache)
+
+      with_shape_cache(ctx)
+
+      assert_receive {:consumer_start_attempted, ^leaf_handle}, 5_000
+      assert_receive {:consumer_start_attempted, ^middle_handle}, 5_000
+      assert_receive {:remove_shape_called, ^middle_handle}, 5_000
+      assert_receive {:remove_shape_called, ^root_handle}, 5_000
+      assert_receive :collector_processing_started, 5_000
+      assert_receive {:restore_consumer_awaited, ^leaf_handle}, 5_000
+      assert_receive :external_readiness_opened, 5_000
+      refute_receive {:consumer_start_attempted, ^root_handle}
+    end
+
+    test "purges every restored transitive dependent before readiness when a leaf await fails",
+         ctx do
+      %{stack_id: stack_id} = ctx
+      test_pid = self()
+      patch_initialization_registration()
+
+      root_shape =
+        Shape.new!("items",
+          inspector: @stub_inspector,
+          where:
+            "id IN (SELECT id FROM public.other_table WHERE id IN (SELECT id FROM public.items WHERE value = 'visible'))"
+        )
+
+      [middle_shape] = root_shape.shape_dependencies
+      [leaf_shape] = middle_shape.shape_dependencies
+
+      leaf_handle = "await-failure-leaf"
+      middle_handle = "await-failure-middle"
+      root_handle = "await-failure-root"
+
+      leaf_shape = %{leaf_shape | shape_dependencies_handles: []}
+      middle_shape = %{middle_shape | shape_dependencies_handles: [leaf_handle]}
+      root_shape = %{root_shape | shape_dependencies_handles: [middle_handle]}
+
+      Repatch.patch(ShapeStatus, :list_shapes, [mode: :shared], fn ^stack_id ->
+        [
+          {leaf_handle, leaf_shape},
+          {middle_handle, middle_shape},
+          {root_handle, root_shape}
+        ]
+      end)
+
+      Repatch.patch(ShapeStatus, :fetch_shape_by_handle, [mode: :shared], fn
+        ^stack_id, ^leaf_handle -> {:ok, leaf_shape}
+        ^stack_id, ^middle_handle -> {:ok, middle_shape}
+        ^stack_id, ^root_handle -> {:ok, root_shape}
+      end)
+
+      Repatch.patch(ShapeStatus, :update_last_read_time_to_now, [mode: :shared], fn
+        ^stack_id, _handle -> :ok
+      end)
+
+      Repatch.patch(
+        Electric.Shapes.DynamicConsumerSupervisor,
+        :start_materializer,
+        [mode: :shared],
+        fn _stack_id, _config -> {:ok, test_pid} end
+      )
+
+      Repatch.patch(
+        Electric.Shapes.DynamicConsumerSupervisor,
+        :start_shape_consumer,
+        [mode: :shared],
+        fn ^stack_id, _config -> {:ok, test_pid} end
+      )
+
+      Repatch.patch(
+        Electric.Shapes.Consumer,
+        :await_snapshot_start,
+        [mode: :shared],
+        fn
+          ^stack_id, ^leaf_handle -> {:error, :leaf_restore_failed}
+          ^stack_id, _handle -> :started
+        end
+      )
+
+      Repatch.patch(
+        Electric.ShapeCache.ShapeCleaner,
+        :remove_shape,
+        [mode: :shared],
+        fn ^stack_id, handle ->
+          send(test_pid, {:single_restore_shape_removed, handle})
+          :ok
+        end
+      )
+
+      Repatch.patch(
+        Electric.ShapeCache.ShapeCleaner,
+        :remove_shapes,
+        [mode: :shared],
+        fn ^stack_id, handles ->
+          send(test_pid, {:restore_failure_closure_removed, handles})
+          :ok
+        end
+      )
+
+      Repatch.patch(ShapeLogCollector, :start_processing, [mode: :shared], fn ^stack_id ->
+        :ok
+      end)
+
+      Repatch.patch(ShapeLogCollector, :mark_as_ready, [mode: :shared], fn ^stack_id ->
+        send(test_pid, :external_readiness_opened)
+        :ok
+      end)
+
+      activate_mocks_for_descendant_procs(Electric.ShapeCache)
+
+      with_shape_cache(ctx)
+
+      assert_receive {:restore_failure_closure_removed, removed_handles}, 5_000
+      assert removed_handles == [root_handle, middle_handle, leaf_handle]
+      assert_receive :external_readiness_opened, 5_000
+      refute_receive {:single_restore_shape_removed, _handle}
     end
   end
 
@@ -1671,6 +2258,36 @@ defmodule Electric.ShapeCacheTest do
                GenServer.whereis(Electric.Shapes.Consumer.Materializer.name(stack_id, dep_handle))
              )
     end
+  end
+
+  defp delayed_initialization_consumer(test_pid, handle) do
+    receive do
+      {:initialize_shape, _shape, _opts} ->
+        if is_nil(handle) do
+          send(test_pid, {:consumer_initialization_received, self()})
+        else
+          send(test_pid, {:consumer_initialization_received, handle, self()})
+        end
+    end
+
+    receive do
+      :complete_initialization -> :ok
+    end
+
+    receive do
+      {:"$gen_call", from, :await_initialization_registered} ->
+        GenServer.reply(from, :ok)
+        delayed_initialization_consumer(test_pid, handle)
+    end
+  end
+
+  defp patch_initialization_registration do
+    Repatch.patch(
+      Electric.Shapes.Consumer,
+      :await_initialization_registered,
+      [mode: :shared],
+      fn _consumer_pid, _timeout -> :ok end
+    )
   end
 
   defp stream_to_list(stream, sort_col \\ "value") do

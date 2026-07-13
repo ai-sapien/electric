@@ -11,6 +11,7 @@ defmodule Electric.ShapeCleanerTest do
   alias Electric.ShapeCache.ShapeCleaner
   alias Electric.Replication.LogOffset
   alias Electric.ShapeCache.PureFileStorage
+  alias Electric.Shapes.Consumer.Materializer
 
   @stub_inspector Support.StubInspector.new(
                     tables: [{1, {"public", "items"}}],
@@ -120,6 +121,9 @@ defmodule Electric.ShapeCleanerTest do
         {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape, ctx.stack_id)
         assert :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
 
+        link_values_table = Materializer.init_link_values_table(ctx.stack_id)
+        true = :ets.insert(link_values_table, {shape_handle, MapSet.new(["retained"])})
+
         consumer_ref =
           Electric.Shapes.Consumer.whereis(ctx.stack_id, shape_handle)
           |> Process.monitor()
@@ -159,6 +163,7 @@ defmodule Electric.ShapeCleanerTest do
         :ok = @cleanup_fn.(ctx.stack_id, shape_handle)
 
         assert_shape_cleanup(shape_handle)
+        assert [] == :ets.lookup(link_values_table, shape_handle)
 
         assert_receive {:DOWN, ^consumer_ref, :process, _pid, {:shutdown, :cleanup}}
 
@@ -185,6 +190,9 @@ defmodule Electric.ShapeCleanerTest do
       test "remove_shape swallows error if no shape to clean up", ctx do
         shape_handle = "foo"
 
+        link_values_table = Materializer.init_link_values_table(ctx.stack_id)
+        true = :ets.insert(link_values_table, {shape_handle, MapSet.new(["orphaned"])})
+
         Support.TestUtils.patch_snapshotter(fn parent,
                                                shape_handle,
                                                _shape,
@@ -198,6 +206,8 @@ defmodule Electric.ShapeCleanerTest do
 
         {:ok, _} =
           with_log(fn -> ShapeCleaner.remove_shape(ctx.stack_id, shape_handle) end)
+
+        assert [] == :ets.lookup(link_values_table, shape_handle)
       end
     end
   end

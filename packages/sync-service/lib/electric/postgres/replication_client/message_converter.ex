@@ -12,7 +12,6 @@ defmodule Electric.Postgres.ReplicationClient.MessageConverter do
   a TransactionFragment.
   """
 
-  require Logger
   alias Electric.Replication.LogOffset
   alias Electric.Postgres.Lsn
   alias Electric.Postgres.LogicalReplication.Messages, as: LR
@@ -70,7 +69,7 @@ defmodule Electric.Postgres.ReplicationClient.MessageConverter do
           | {:error, {:replica_not_full, String.t()}}
           | {:error, {:exceeded_max_tx_size, String.t()}}
   def convert(%LR.Message{} = msg, state) do
-    Logger.notice("Got a message from PG via logical replication: #{inspect(msg)}")
+    _ = msg
     {:buffering, state}
   end
 

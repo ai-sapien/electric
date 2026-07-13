@@ -218,6 +218,11 @@ defmodule Electric.Connection.Manager do
     GenServer.cast(manager, :replication_client_ready_to_stream)
   end
 
+  def replication_client_caught_up(manager, replication_client_pid)
+      when is_pid(replication_client_pid) do
+    GenServer.cast(manager, {:replication_client_caught_up, replication_client_pid})
+  end
+
   def replication_client_streamed_first_message(manager) do
     GenServer.cast(manager, :replication_client_streamed_first_message)
   end
@@ -814,11 +819,6 @@ defmodule Electric.Connection.Manager do
           current_step: {:start_replication_client, :configuring_connection}
         } = state
       ) do
-    Electric.StatusMonitor.mark_replication_client_ready(
-      state.stack_id,
-      state.replication_client_pid
-    )
-
     state = %{
       state
       | replication_configuration_blocked_by_pending_transaction: false,
@@ -826,6 +826,22 @@ defmodule Electric.Connection.Manager do
     }
 
     {:noreply, state, {:continue, :start_snapshot_pool}}
+  end
+
+  def handle_cast(
+        {:replication_client_caught_up, replication_client_pid},
+        %State{replication_client_pid: replication_client_pid} = state
+      ) do
+    Electric.StatusMonitor.mark_replication_client_ready(
+      state.stack_id,
+      replication_client_pid
+    )
+
+    {:noreply, state}
+  end
+
+  def handle_cast({:replication_client_caught_up, _stale_pid}, state) do
+    {:noreply, state}
   end
 
   # Admin pool ready → proceed to starting the replication client

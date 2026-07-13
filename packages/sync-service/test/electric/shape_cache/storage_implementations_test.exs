@@ -10,11 +10,18 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
   alias Electric.Replication.Changes
   alias Electric.ShapeCache.InMemoryStorage
   alias Electric.Utils
+  alias Support.TestStorage
 
   import Support.ComponentSetup
   import Support.TestUtils
 
   defmodule StorageWithoutOffsetStream do
+  end
+
+  defmodule StorageWithoutReplayCursor do
+    alias Electric.Replication.LogOffset
+
+    def fetch_latest_offset(:shape_opts), do: {:ok, LogOffset.new(42, 7)}
   end
 
   @moduletag :tmp_dir
@@ -53,6 +60,11 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
   setup [:with_stack_id_from_test, :with_async_deleter]
 
   test "offset-preserving reads fail clearly for adapters without the optional capability" do
+    refute Storage.supports_offset_preserving_log_stream?({
+             StorageWithoutOffsetStream,
+             :shape_opts
+           })
+
     assert_raise Storage.Error,
                  "Storage adapter #{inspect(StorageWithoutOffsetStream)} does not support offset-preserving log streams",
                  fn ->
@@ -62,6 +74,11 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
                      {StorageWithoutOffsetStream, :shape_opts}
                    )
                  end
+  end
+
+  test "replay-safe cursors fail closed for legacy adapters without the optional callback" do
+    assert Storage.get_log_replay_safe_cursor({StorageWithoutReplayCursor, :shape_opts}) ==
+             LogOffset.new(42, 7)
   end
 
   for module <- [InMemoryStorage, PureFileStorage] do
@@ -144,6 +161,7 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
 
       test "returns an empty map on startup", %{storage: opts} do
         assert Storage.fetch_move_positions(opts) == {:ok, %{}}
+        assert Storage.fetch_root_delivery_tx_offset(opts) == {:ok, nil}
       end
 
       test "round-trips a per-dependency positions map", %{storage: opts} do
@@ -154,6 +172,7 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
 
         assert :ok = Storage.set_move_positions!(positions, opts)
         assert Storage.fetch_move_positions(opts) == {:ok, positions}
+        assert Storage.fetch_root_delivery_tx_offset(opts) == {:ok, 0}
       end
 
       test "overwrites previously persisted positions", %{storage: opts} do
@@ -163,6 +182,146 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
         assert :ok = Storage.set_move_positions!(updated, opts)
 
         assert Storage.fetch_move_positions(opts) == {:ok, updated}
+      end
+
+      test "commits move positions through the writer transaction API", %{
+        storage: opts,
+        writer: writer
+      } do
+        positions = %{"dep-a" => LogOffset.new(12, 3)}
+        root_delivery_tx_offset = 12
+
+        assert Storage.supports_move_transactions?(writer)
+
+        writer = Storage.begin_move_transaction!(writer)
+
+        _writer =
+          Storage.commit_move_transaction!(positions, root_delivery_tx_offset, writer)
+
+        assert Storage.fetch_move_positions(opts) == {:ok, positions}
+
+        assert Storage.fetch_root_delivery_tx_offset(opts) ==
+                 {:ok, root_delivery_tx_offset}
+      end
+
+      test "rejects a root-frontier regression before publishing staged move state", %{
+        storage: opts,
+        writer: writer
+      } do
+        Storage.mark_snapshot_as_started(opts)
+        Storage.make_new_snapshot!([], opts)
+
+        committed_positions = %{"dep-a" => LogOffset.new(12, 0)}
+        writer = Storage.begin_move_transaction!(writer)
+
+        writer =
+          Storage.commit_move_transaction!(committed_positions, 12, writer)
+
+        {:ok, committed_boundary} = Storage.fetch_latest_offset(opts)
+        staged_offset = LogOffset.new(13, 0)
+        writer = Storage.begin_move_transaction!(writer)
+
+        writer =
+          Storage.append_to_log!(
+            [{staged_offset, "staged", :insert, ~S|{"value":"staged"}|}],
+            writer
+          )
+
+        assert_raise Storage.Error,
+                     ~r/cannot regress root-delivery frontier from 12 to 11/,
+                     fn ->
+                       Storage.commit_move_transaction!(
+                         %{"dep-a" => LogOffset.new(13, 0)},
+                         11,
+                         writer
+                       )
+                     end
+
+        assert Storage.fetch_latest_offset(opts) == {:ok, committed_boundary}
+        assert Storage.fetch_move_positions(opts) == {:ok, committed_positions}
+        assert Storage.fetch_root_delivery_tx_offset(opts) == {:ok, 12}
+
+        assert [] ==
+                 Storage.get_log_stream_with_offsets(committed_boundary, staged_offset, opts)
+                 |> Enum.to_list()
+
+        Storage.terminate(writer)
+      end
+
+      @tag chunk_size: 1
+      test "keeps move rows and cursor hidden until atomic commit", %{
+        storage: opts,
+        writer: writer
+      } do
+        move_offset = LogOffset.new(12, 0)
+        positions = %{"dep-a" => LogOffset.new(22, 0)}
+        root_delivery_tx_offset = 22
+        row = {move_offset, "row-1", :insert, ~S|{"value":"move"}|}
+
+        Storage.mark_snapshot_as_started(opts)
+        Storage.make_new_snapshot!([], opts)
+        {:ok, initial_offset} = Storage.fetch_latest_offset(opts)
+
+        writer = Storage.begin_move_transaction!(writer)
+        writer = Storage.append_to_log!([row], writer)
+
+        assert Storage.fetch_latest_offset(opts) == {:ok, initial_offset}
+        assert Storage.fetch_root_delivery_tx_offset(opts) == {:ok, nil}
+
+        assert [] ==
+                 Storage.get_log_stream_with_offsets(initial_offset, move_offset, opts)
+                 |> Enum.to_list()
+
+        _writer =
+          Storage.commit_move_transaction!(positions, root_delivery_tx_offset, writer)
+
+        assert Storage.fetch_latest_offset(opts) == {:ok, move_offset}
+        assert Storage.fetch_move_positions(opts) == {:ok, positions}
+
+        assert Storage.fetch_root_delivery_tx_offset(opts) ==
+                 {:ok, root_delivery_tx_offset}
+
+        assert [{^move_offset, ~S|{"value":"move"}|}] =
+                 Storage.get_log_stream_with_offsets(initial_offset, move_offset, opts)
+                 |> Enum.to_list()
+      end
+
+      test "preserves move transaction support through TestStorage", %{
+        storage: opts,
+        writer: writer
+      } do
+        positions = %{"dep-a" => LogOffset.new(13, 0)}
+        root_delivery_tx_offset = 13
+
+        writer = {TestStorage, {self(), @shape_handle, :test_data, writer}}
+
+        assert Storage.supports_move_transactions?(writer)
+
+        writer = Storage.begin_move_transaction!(writer)
+        assert_receive {TestStorage, :begin_move_transaction!, @shape_handle}
+
+        _writer =
+          Storage.commit_move_transaction!(positions, root_delivery_tx_offset, writer)
+
+        assert_receive {TestStorage, :commit_move_transaction!, @shape_handle, ^positions,
+                        ^root_delivery_tx_offset}
+
+        assert Storage.fetch_move_positions(opts) == {:ok, positions}
+
+        assert Storage.fetch_root_delivery_tx_offset(opts) ==
+                 {:ok, root_delivery_tx_offset}
+      end
+    end
+
+    describe "#{module_name}.get_log_replay_safe_cursor/1" do
+      setup :start_storage
+
+      test "new storage is replayable from before all log history", %{storage: storage} do
+        assert Storage.get_log_replay_safe_cursor(storage) == LogOffset.before_all()
+
+        wrapped = {TestStorage, {self(), @shape_handle, :test_data, storage}}
+        assert Storage.get_log_replay_safe_cursor(wrapped) == LogOffset.before_all()
+        assert_receive {TestStorage, :get_log_replay_safe_cursor, @shape_handle}
       end
     end
 
@@ -1530,6 +1689,158 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
 
         assert Storage.get_total_disk_usage(storage_base) > 0
       end
+    end
+  end
+
+  describe "InMemoryStorage abandoned move promotion recovery" do
+    setup context do
+      start_storage(Map.put(context, :mod, InMemoryStorage))
+    end
+
+    test "does not bless pre-existing legacy positions with a root frontier", %{
+      storage: {InMemoryStorage, shape_opts} = storage
+    } do
+      legacy_positions = %{"dep-a" => LogOffset.new(5, 0)}
+      :ets.insert(shape_opts.snapshot_table, {:move_positions, legacy_positions})
+
+      assert :ok = Storage.set_move_positions!(legacy_positions, storage)
+      assert Storage.fetch_move_positions(storage) == {:ok, legacy_positions}
+      assert Storage.fetch_root_delivery_tx_offset(storage) == {:ok, nil}
+    end
+
+    test "a new writer trims a partially promoted move before later appends expose it", %{
+      storage: {InMemoryStorage, shape_opts} = storage,
+      writer: writer
+    } do
+      Storage.mark_snapshot_as_started(storage)
+      Storage.make_new_snapshot!([], storage)
+
+      old_positions = %{"dep-a" => LogOffset.new(5, 0)}
+      old_root_delivery_tx_offset = 5
+
+      writer = Storage.begin_move_transaction!(writer)
+
+      _abandoned_writer =
+        Storage.commit_move_transaction!(
+          old_positions,
+          old_root_delivery_tx_offset,
+          writer
+        )
+
+      {:ok, published_offset} = Storage.fetch_latest_offset(storage)
+
+      abandoned_offset = LogOffset.new(12, 0)
+      abandoned_key = {:offset, LogOffset.to_tuple(abandoned_offset)}
+
+      # Simulate a writer being killed between one promotion batch and the
+      # atomic latest-offset/dependency/root-cursor publication.
+      :ets.insert(shape_opts.log_table, {abandoned_key, ~S|{"value":"abandoned"}|})
+
+      :ets.insert(
+        shape_opts.chunk_checkpoint_table,
+        {LogOffset.to_tuple(abandoned_offset), :checkpoint}
+      )
+
+      assert [] ==
+               Storage.get_log_stream_with_offsets(
+                 published_offset,
+                 abandoned_offset,
+                 storage
+               )
+               |> Enum.to_list()
+
+      writer = Storage.init_writer!(storage, @shape)
+
+      committed_offset = LogOffset.new(20, 0)
+
+      writer =
+        Storage.append_to_log!(
+          [{committed_offset, "committed", :insert, ~S|{"value":"committed"}|}],
+          writer
+        )
+
+      assert [{^committed_offset, ~S|{"value":"committed"}|}] =
+               Storage.get_log_stream_with_offsets(
+                 published_offset,
+                 committed_offset,
+                 storage
+               )
+               |> Enum.to_list()
+
+      assert [] == :ets.lookup(shape_opts.log_table, abandoned_key)
+
+      assert [] ==
+               :ets.lookup(
+                 shape_opts.chunk_checkpoint_table,
+                 LogOffset.to_tuple(abandoned_offset)
+               )
+
+      assert {:ok, ^old_positions} = Storage.fetch_move_positions(storage)
+
+      assert {:ok, ^old_root_delivery_tx_offset} =
+               Storage.fetch_root_delivery_tx_offset(storage)
+
+      Storage.terminate(writer)
+    end
+
+    test "promotes moves larger than one bounded batch without retaining staging rows", %{
+      storage: {InMemoryStorage, shape_opts} = storage,
+      writer: writer
+    } do
+      Storage.mark_snapshot_as_started(storage)
+      Storage.make_new_snapshot!([], storage)
+      {:ok, initial_offset} = Storage.fetch_latest_offset(storage)
+
+      rows =
+        Enum.flat_map(0..1_200, fn op_offset ->
+          offset = LogOffset.new(12, op_offset)
+          row = {offset, "row-#{op_offset}", :insert, Jason.encode!(%{value: op_offset})}
+
+          if op_offset in [499, 999], do: [row, {:chunk_boundary, offset}], else: [row]
+        end)
+
+      writer = Storage.begin_move_transaction!(writer)
+      writer = Storage.append_to_log!(rows, writer)
+
+      assert [] ==
+               Storage.get_log_stream_with_offsets(
+                 initial_offset,
+                 LogOffset.new(12, 1_200),
+                 storage
+               )
+               |> Enum.to_list()
+
+      assert nil == Storage.get_chunk_end_log_offset(initial_offset, storage)
+
+      root_delivery_tx_offset = 30
+
+      writer =
+        Storage.commit_move_transaction!(
+          %{"dep-a" => LogOffset.new(30, 0)},
+          root_delivery_tx_offset,
+          writer
+        )
+
+      assert LogOffset.new(12, 499) ==
+               Storage.get_chunk_end_log_offset(initial_offset, storage)
+
+      assert 1_201 ==
+               Storage.get_log_stream_with_offsets(
+                 initial_offset,
+                 LogOffset.new(12, 1_200),
+                 storage
+               )
+               |> Enum.count()
+
+      assert [] ==
+               :ets.select(shape_opts.log_table, [
+                 {{{:move_offset, :_, :_}, :_}, [], [true]}
+               ])
+
+      assert Storage.fetch_root_delivery_tx_offset(storage) ==
+               {:ok, root_delivery_tx_offset}
+
+      Storage.terminate(writer)
     end
   end
 

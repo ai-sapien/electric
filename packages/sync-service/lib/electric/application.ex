@@ -157,7 +157,20 @@ defmodule Electric.Application do
         conn_max_requests: get_env(opts, :conn_max_requests),
         handler_fullsweep_after: get_env(opts, :handler_fullsweep_after),
         process_spawn_opts: get_env(opts, :process_spawn_opts),
-        consumer_gc_heap_threshold: get_env(opts, :consumer_gc_heap_threshold)
+        consumer_gc_heap_threshold: get_env(opts, :consumer_gc_heap_threshold),
+        materializer_replay_memory_limit_bytes:
+          get_env(opts, :materializer_replay_memory_limit_bytes),
+        materializer_replay_max_pending: get_env(opts, :materializer_replay_max_pending),
+        materializer_replay_idle_timeout_ms: get_env(opts, :materializer_replay_idle_timeout_ms),
+        materializer_live_max_subscribers: get_env(opts, :materializer_live_max_subscribers),
+        materializer_live_backlog_memory_limit_bytes:
+          get_env(opts, :materializer_live_backlog_memory_limit_bytes),
+        materializer_causal_call_timeout_ms: get_env(opts, :materializer_causal_call_timeout_ms),
+        causal_drain_max_concurrency: get_env(opts, :causal_drain_max_concurrency),
+        causal_drain_timeout_ms: get_env(opts, :causal_drain_timeout_ms),
+        subquery_buffer_max_transactions: get_env(opts, :subquery_buffer_max_transactions),
+        subquery_deferred_event_memory_limit_bytes:
+          get_env(opts, :subquery_deferred_event_memory_limit_bytes)
       ],
       manual_table_publishing?: get_env(opts, :manual_table_publishing?),
       shape_db_opts: [

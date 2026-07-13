@@ -351,6 +351,28 @@ defmodule Support.ComponentSetup do
     %{consumer_registry: pid}
   end
 
+  def with_materializer_replay_coordinator(ctx) do
+    pid =
+      start_supervised!(
+        {Electric.Shapes.Consumer.Materializer.ReplayCoordinator,
+         stack_id: ctx.stack_id,
+         max_pending:
+           Map.get(
+             ctx,
+             :materializer_replay_max_pending,
+             Electric.Config.default(:materializer_replay_max_pending)
+           ),
+         idle_timeout_ms:
+           Map.get(
+             ctx,
+             :materializer_replay_idle_timeout_ms,
+             Electric.Config.default(:materializer_replay_idle_timeout_ms)
+           )}
+      )
+
+    %{materializer_replay_coordinator: pid}
+  end
+
   def with_shape_log_collector(ctx) do
     name = :"shape_log_collector_#{ctx.stack_id}"
 
@@ -437,7 +459,9 @@ defmodule Support.ComponentSetup do
     }
 
     storage =
-      {PureFileStorage, stack_id: stack_id, storage_dir: ctx.tmp_dir}
+      {PureFileStorage,
+       [stack_id: stack_id, storage_dir: ctx.tmp_dir] ++
+         Map.get(ctx, :with_pure_file_storage_opts, [])}
 
     stack_events_registry = Electric.stack_events_registry()
 
@@ -488,7 +512,10 @@ defmodule Support.ComponentSetup do
     # shape metadata are fully online. Polling clients hitting the server in
     # that window can see spurious 409s. Wait for the StatusMonitor's
     # :active level which requires all readiness conditions to be met.
-    :ok = Electric.StatusMonitor.wait_until_active(ctx.stack_id, timeout: 5000)
+    restart_timeout_ms = Map.get(ctx, :stack_restart_timeout_ms, 5_000)
+
+    :ok =
+      Electric.StatusMonitor.wait_until_active(ctx.stack_id, timeout: restart_timeout_ms)
 
     %{stack_supervisor: stack_supervisor}
   end
@@ -536,7 +563,7 @@ defmodule Support.ComponentSetup do
       pool_opts: [
         backoff_type: :stop,
         max_restarts: 0,
-        pool_size: 2
+        pool_size: Map.get(ctx, :db_pool_size, 2)
       ],
       tweaks: [
         registry_partitions: 1,

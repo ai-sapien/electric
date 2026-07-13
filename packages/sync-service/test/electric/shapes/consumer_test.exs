@@ -4,6 +4,7 @@ defmodule Electric.Shapes.ConsumerTest do
 
   alias Electric.LsnTracker
   alias Electric.Postgres.Lsn
+  alias Electric.Postgres.ReplicationClient
   alias Electric.Replication.Changes.Relation
   alias Electric.Replication.Changes
   alias Electric.Replication.LogOffset
@@ -13,6 +14,8 @@ defmodule Electric.Shapes.ConsumerTest do
   alias Electric.Shapes
   alias Electric.Shapes.Shape
   alias Electric.Shapes.Consumer
+  alias Electric.Shapes.Consumer.Materializer
+  alias Electric.Shapes.ConsumerRegistry
 
   alias Support.StubInspector
 
@@ -66,6 +69,30 @@ defmodule Electric.Shapes.ConsumerTest do
                          inspector: @base_inspector,
                          where: "id IN (SELECT id FROM public.other_table)"
                        )
+
+  @shape_with_subquery_or_value Shape.new!("public.test_table",
+                                  inspector: @base_inspector,
+                                  where:
+                                    "id IN (SELECT id FROM public.other_table) OR value = 'causal-root'"
+                                )
+
+  @shape_with_two_subqueries Shape.new!("public.test_table",
+                               inspector: @base_inspector,
+                               where:
+                                 ~S|id IN (SELECT id FROM public.other_table) AND id IN (SELECT id FROM public."something else")|
+                             )
+
+  @shape_with_two_subqueries_reversed Shape.new!("public.test_table",
+                                        inspector: @base_inspector,
+                                        where:
+                                          ~S|id IN (SELECT id FROM public."something else") AND id IN (SELECT id FROM public.other_table)|
+                                      )
+
+  @shape_with_nested_subquery Shape.new!("public.test_table",
+                                inspector: @base_inspector,
+                                where:
+                                  ~S|id IN (SELECT id FROM public.other_table WHERE id IN (SELECT id FROM public."something else" WHERE value = 'visible'))|
+                              )
 
   @shape_position %{
     @shape_handle1 => %{
@@ -139,6 +166,114 @@ defmodule Electric.Shapes.ConsumerTest do
           flunk("poll_until/2 timed out waiting for condition")
         end
     end
+  end
+
+  defp assert_two_dependency_restore_replay(shape, expected_dependency_relations, ctx) do
+    {shape_handle, _} = ShapeCache.get_or_create_shape_handle(shape, ctx.stack_id)
+    :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+    {:ok, persisted_shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+
+    dependencies =
+      Enum.map(persisted_shape.shape_dependencies_handles, fn dependency_handle ->
+        {:ok, dependency_shape} =
+          Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, dependency_handle)
+
+        {dependency_handle, dependency_shape.root_table}
+      end)
+
+    assert Enum.map(dependencies, &elem(&1, 1)) == expected_dependency_relations
+
+    shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+    {:ok, baseline_positions} = Storage.fetch_move_positions(shape_storage)
+
+    assert Map.keys(baseline_positions) |> MapSet.new() ==
+             dependencies |> Enum.map(&elem(&1, 0)) |> MapSet.new()
+
+    consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+    consumer_ref = Process.monitor(consumer_pid)
+    assert :ok = Consumer.stop(consumer_pid, :shutdown)
+    assert_receive {:DOWN, ^consumer_ref, :process, ^consumer_pid, :shutdown}, @receive_timeout
+    :ok = Electric.Shapes.ConsumerRegistry.remove_consumer(shape_handle, ctx.stack_id)
+
+    assert Support.TestUtils.wait_until(
+             fn -> is_nil(Consumer.whereis(ctx.stack_id, shape_handle)) end,
+             @receive_timeout
+           )
+
+    lsn = Lsn.from_integer(910)
+
+    changes =
+      dependencies
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {{_dependency_handle, relation}, index} ->
+        row = %{"id" => Integer.to_string(index + 1), "value" => "temporary"}
+        first_offset = index * 4
+
+        [
+          %Changes.NewRecord{
+            relation: relation,
+            record: row,
+            log_offset: LogOffset.new(lsn, first_offset)
+          },
+          %Changes.DeletedRecord{
+            relation: relation,
+            old_record: row,
+            log_offset: LogOffset.new(lsn, first_offset + 2)
+          }
+        ]
+      end)
+
+    assert :ok =
+             ShapeLogCollector.handle_event(
+               complete_txn_fragment(910, lsn, changes),
+               ctx.stack_id
+             )
+
+    dependency_materializers =
+      Map.new(dependencies, fn {dependency_handle, _relation} ->
+        materializer_pid = Materializer.whereis(ctx.stack_id, dependency_handle)
+        assert is_pid(materializer_pid)
+        {dependency_handle, materializer_pid}
+      end)
+
+    assert :advanced =
+             poll_until(@receive_timeout * 10, fn ->
+               positions =
+                 Map.new(dependency_materializers, fn {dependency_handle, materializer_pid} ->
+                   {dependency_handle, :sys.get_state(materializer_pid).durable_offset}
+                 end)
+
+               advanced? =
+                 Enum.all?(positions, fn {dependency_handle, position} ->
+                   LogOffset.compare(position, Map.fetch!(baseline_positions, dependency_handle)) ==
+                     :gt
+                 end)
+
+               if advanced?, do: {:ok, :advanced}, else: :retry
+             end)
+
+    restore_task =
+      Task.async(fn -> ShapeCache.start_consumer_for_handle(shape_handle, ctx.stack_id) end)
+
+    assert {:error, _reason} = Task.await(restore_task, @receive_timeout * 5)
+
+    assert :purged =
+             poll_until(@receive_timeout * 5, fn ->
+               if not Electric.ShapeCache.ShapeStatus.has_shape_handle?(
+                    ctx.stack_id,
+                    shape_handle
+                  ) and
+                    is_nil(Consumer.whereis(ctx.stack_id, shape_handle)) do
+                 {:ok, :purged}
+               else
+                 :retry
+               end
+             end)
+
+    {fresh_handle, _offset} = ShapeCache.get_or_create_shape_handle(shape, ctx.stack_id)
+    refute fresh_handle == shape_handle
+    assert :started = ShapeCache.await_snapshot_start(fresh_handle, ctx.stack_id)
   end
 
   describe "event handling" do
@@ -595,6 +730,7 @@ defmodule Electric.Shapes.ConsumerTest do
 
   describe "transaction handling with real storage" do
     @describetag :tmp_dir
+    @describetag with_pure_file_storage_opts: [flush_period: 1]
 
     setup do
       %{inspector: @base_inspector, pool: nil}
@@ -607,6 +743,7 @@ defmodule Electric.Shapes.ConsumerTest do
       :with_lsn_tracker,
       :with_log_chunking,
       :with_persistent_kv,
+      :with_materializer_replay_coordinator,
       :with_async_deleter,
       :with_shape_cleaner,
       :with_shape_log_collector,
@@ -847,8 +984,7 @@ defmodule Electric.Shapes.ConsumerTest do
                {Storage, :append_fragment_to_log!,
                 [
                   [
-                    {_, ~s'"public"."test_table"/"1"', :insert, _},
-                    {_, ~s'"public"."test_table"/"2"', :insert, _}
+                    {_, ~s'"public"."test_table"/"1"', :insert, _}
                   ],
                   _
                 ]}
@@ -863,9 +999,9 @@ defmodule Electric.Shapes.ConsumerTest do
 
       assert [
                {Storage, :append_fragment_to_log!,
-                [[{_, ~s'"public"."test_table"/"3"', :insert, _}], _]},
+                [[{_, ~s'"public"."test_table"/"2"', :insert, _}], _]},
                {Storage, :append_fragment_to_log!,
-                [[{_, ~s'"public"."test_table"/"4"', :insert, _}], _]}
+                [[{_, ~s'"public"."test_table"/"3"', :insert, _}], _]}
              ] = Support.Trace.collect_traced_calls()
 
       # Repeat and observe idempotency
@@ -877,7 +1013,13 @@ defmodule Electric.Shapes.ConsumerTest do
 
       assert [
                {Storage, :append_fragment_to_log!,
-                [[{_, ~s'"public"."test_table"/"5"', :insert, _}], _]},
+                [
+                  [
+                    {_, ~s'"public"."test_table"/"4"', :insert, _},
+                    {_, ~s'"public"."test_table"/"5"', :insert, _}
+                  ],
+                  _
+                ]},
                {Storage, :signal_txn_commit!, [^xid, _]}
              ] = Support.Trace.collect_traced_calls()
 
@@ -975,6 +1117,84 @@ defmodule Electric.Shapes.ConsumerTest do
 
       assert ops ==
                get_log_items_from_storage(LogOffset.last_before_real_offsets(), shape_storage)
+    end
+
+    @tag allow_subqueries: false
+    test "skips replayed trailing fragments after the final shape-visible change", ctx do
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      ref = Shapes.Consumer.register_for_changes(ctx.stack_id, shape_handle)
+
+      xid = 11
+      lsn = Lsn.from_integer(10)
+
+      [begin_fragment, commit_fragment] =
+        txn_fragments(xid, lsn, [
+          %{
+            has_begin?: true,
+            changes: [
+              %Changes.NewRecord{
+                relation: {"public", "test_table"},
+                record: %{"id" => "1"},
+                log_offset: LogOffset.new(lsn, 0)
+              }
+            ]
+          },
+          %{
+            has_commit?: true,
+            changes: [
+              %Changes.NewRecord{
+                relation: {"public", "other_table"},
+                record: %{"id" => "2"},
+                log_offset: LogOffset.new(lsn, 2)
+              }
+            ]
+          }
+        ])
+
+      consumer_pid = Shapes.Consumer.whereis(ctx.stack_id, shape_handle)
+      shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+
+      Enum.each([begin_fragment, commit_fragment], fn fragment ->
+        assert :ok = ShapeLogCollector.handle_event(fragment, ctx.stack_id)
+      end)
+
+      shape_offset = LogOffset.new(lsn, 0)
+      assert_receive {^ref, :new_changes, ^shape_offset}
+      assert {:ok, ^shape_offset} = Storage.fetch_latest_offset(shape_storage)
+
+      assert [stored_op] =
+               get_log_items_from_storage(
+                 LogOffset.last_before_real_offsets(),
+                 shape_storage
+               )
+
+      # A fresh collector can replay the complete PostgreSQL transaction. The
+      # persisted shape cursor points at its final matching row, not at the
+      # later filtered commit fragment, so both fragments must still be treated
+      # as one already-applied transaction.
+      enable_storage_tracer_for(consumer_pid)
+
+      Enum.each([begin_fragment, commit_fragment], fn fragment ->
+        assert :ok =
+                 GenServer.call(
+                   consumer_pid,
+                   {:handle_event, fragment,
+                    Electric.Telemetry.OpenTelemetry.get_current_context()},
+                   :infinity
+                 )
+      end)
+
+      assert Process.alive?(consumer_pid)
+      assert [] == Support.Trace.collect_traced_calls()
+      refute_receive {^ref, :new_changes, _}
+
+      assert [stored_op] ==
+               get_log_items_from_storage(
+                 LogOffset.last_before_real_offsets(),
+                 shape_storage
+               )
     end
 
     @tag pg_snapshot: {10, 13, [10, 12]},
@@ -1249,29 +1469,23 @@ defmodule Electric.Shapes.ConsumerTest do
       assert [
                # 1st txn
                {Storage, :append_fragment_to_log!,
+                [[{_, ~s'"public"."test_table"/"1"', :insert, _}] = log_items1, _]},
+               {Storage, :append_fragment_to_log!,
+                [[{_, ~s'"public"."test_table"/"2"', :insert, _}] = log_items2, _]},
+               {Storage, :append_fragment_to_log!,
                 [
                   [
-                    {_, ~s'"public"."test_table"/"1"', :insert, _},
-                    {_, ~s'"public"."test_table"/"2"', :insert, _}
-                  ] = log_items1,
+                    {_, ~s'"public"."test_table"/"3"', :insert, _},
+                    {_, ~s'"public"."test_table"/"4"', :insert, _}
+                  ] = log_items3,
                   _
                 ]},
-               {Storage, :append_fragment_to_log!,
-                [[{_, ~s'"public"."test_table"/"3"', :insert, _}] = log_items2, _]},
-               {Storage, :append_fragment_to_log!,
-                [[{_, ~s'"public"."test_table"/"4"', :insert, _}] = log_items3, _]},
                {Storage, :signal_txn_commit!, [^xid1, _]},
                # 2nd txn, incomplete
                {Storage, :append_fragment_to_log!,
-                [
-                  [
-                    {_, ~s'"public"."test_table"/"5"', :insert, _},
-                    {_, ~s'"public"."test_table"/"1"', :update, _}
-                  ] = log_items_txn2_1,
-                  _
-                ]},
+                [[{_, ~s'"public"."test_table"/"5"', :insert, _}] = log_items_txn2_1, _]},
                {Storage, :append_fragment_to_log!,
-                [[{_, ~s'"public"."test_table"/"3"', :update, _}] = log_items_txn2_2, _]}
+                [[{_, ~s'"public"."test_table"/"1"', :update, _}] = log_items_txn2_2, _]}
              ] = Support.Trace.collect_traced_calls()
 
       traced_log_items =
@@ -1301,9 +1515,15 @@ defmodule Electric.Shapes.ConsumerTest do
 
       assert [
                {Storage, :append_fragment_to_log!,
-                [[{_, ~s'"public"."test_table"/"6"', :insert, _}] = log_items_txn2_3, _]},
+                [[{_, ~s'"public"."test_table"/"3"', :update, _}] = log_items_txn2_3, _]},
                {Storage, :append_fragment_to_log!,
-                [[{_, ~s'"public"."test_table"/"2"', :delete, _}] = log_items_txn2_4, _]},
+                [
+                  [
+                    {_, ~s'"public"."test_table"/"6"', :insert, _},
+                    {_, ~s'"public"."test_table"/"2"', :delete, _}
+                  ] = log_items_txn2_4,
+                  _
+                ]},
                {Storage, :signal_txn_commit!, [^xid2, _]}
              ] = Support.Trace.collect_traced_calls()
 
@@ -1443,9 +1663,13 @@ defmodule Electric.Shapes.ConsumerTest do
                {Storage, :append_fragment_to_log!,
                 [[{^txn2_offset1, ~s'"public"."test_table"/"10"', :insert, _}], _]},
                {Storage, :append_fragment_to_log!,
-                [[{^txn2_offset2, ~s'"public"."test_table"/"11"', :insert, _}], _]},
-               {Storage, :append_fragment_to_log!,
-                [[{^txn2_offset3, ~s'"public"."test_table"/"12"', :insert, _}], _]},
+                [
+                  [
+                    {^txn2_offset2, ~s'"public"."test_table"/"11"', :insert, _},
+                    {^txn2_offset3, ~s'"public"."test_table"/"12"', :insert, _}
+                  ],
+                  _
+                ]},
                {Storage, :signal_txn_commit!, [10, _]}
              ] = Support.Trace.collect_traced_calls()
 
@@ -1953,12 +2177,9 @@ defmodule Electric.Shapes.ConsumerTest do
         ])
 
       expected_log_items = [
-        [
-          {LogOffset.new(lsn, 0), ~s'"public"."test_table"/"1"', :insert},
-          {LogOffset.new(lsn, 2), ~s'"public"."test_table"/"2"', :insert}
-        ],
-        [{LogOffset.new(lsn, 4), ~s'"public"."test_table"/"3"', :insert}],
-        [{LogOffset.new(lsn, 6), ~s'"public"."test_table"/"4"', :insert}]
+        [{LogOffset.new(lsn, 0), ~s'"public"."test_table"/"1"', :insert}],
+        [{LogOffset.new(lsn, 2), ~s'"public"."test_table"/"2"', :insert}],
+        [{LogOffset.new(lsn, 4), ~s'"public"."test_table"/"3"', :insert}]
       ]
 
       consumer_pid = Shapes.Consumer.whereis(ctx.stack_id, shape_handle)
@@ -2006,7 +2227,13 @@ defmodule Electric.Shapes.ConsumerTest do
 
       assert [
                {Storage, :append_fragment_to_log!,
-                [[{^last_log_offset, ~s'"public"."test_table"/"5"', :insert, _json}], _]},
+                [
+                  [
+                    {_, ~s'"public"."test_table"/"4"', :insert, _},
+                    {^last_log_offset, ~s'"public"."test_table"/"5"', :insert, _json}
+                  ],
+                  _
+                ]},
                {Storage, :signal_txn_commit!, [^xid, _]}
              ] = Support.Trace.collect_traced_calls()
 
@@ -2044,6 +2271,7 @@ defmodule Electric.Shapes.ConsumerTest do
       {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, stack_id)
 
       :started = ShapeCache.await_snapshot_start(shape_handle, stack_id)
+      shape_storage = Storage.for_shape(shape_handle, ctx.storage)
 
       ref = Shapes.Consumer.register_for_changes(stack_id, shape_handle)
 
@@ -2119,11 +2347,27 @@ defmodule Electric.Shapes.ConsumerTest do
       assert :ok = ShapeLogCollector.handle_event(commit_fragment, ctx.stack_id)
       assert_receive {^ref, :new_changes, _}, @receive_timeout
 
+      # The commit fragment had no shape-visible row. Fragment streaming keeps
+      # one relevant change pending, so the real final row can carry `last=true`
+      # without manufacturing a public no-op event or losing replay boundaries.
+      assert %{
+               "key" => ~s'"public"."test_table"/"3"',
+               "headers" => %{
+                 "operation" => "insert",
+                 "last" => true
+               }
+             } =
+               LogOffset.last_before_real_offsets()
+               |> get_log_items_from_storage(shape_storage)
+               |> List.last()
+
       # The deferred flush notification is sent after the commit. The exact
       # offset depends on alignment with txn_offset_mapping, so we only
       # verify that notify_flushed was called for this shape.
-      assert [{ShapeLogCollector, :notify_flushed, [^stack_id, ^shape_handle, _offset]}] =
-               Support.Trace.collect_traced_calls()
+      assert Enum.any?(Support.Trace.collect_traced_calls(), fn
+               {ShapeLogCollector, :notify_flushed, [^stack_id, ^shape_handle, _offset]} -> true
+               _ -> false
+             end)
 
       # Flush boundary advances.
       tx_offset = commit_fragment.last_log_offset.tx_offset
@@ -2232,6 +2476,75 @@ defmodule Electric.Shapes.ConsumerTest do
       # Flush boundary advances correctly.
       tx_offset = commit_fragment.last_log_offset.tx_offset
       assert_receive {:flush_boundary_updated, ^tx_offset}, @receive_timeout
+    end
+
+    @tag with_pure_file_storage_opts: [flush_period: 10_000]
+    test "coalesced storage flush carries a later no-op transaction boundary", %{
+      stack_id: stack_id
+    } do
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape3, stack_id)
+      :started = ShapeCache.await_snapshot_start(shape_handle, stack_id)
+      register_as_replication_client(stack_id)
+
+      consumer_pid = Shapes.Consumer.whereis(stack_id, shape_handle)
+
+      Support.Trace.trace_shape_log_collector_calls(
+        pid: consumer_pid,
+        functions: [:notify_flushed]
+      )
+
+      write_lsn = Lsn.from_integer(10)
+      written_offset = LogOffset.new(write_lsn, 0)
+
+      assert :ok =
+               ShapeLogCollector.handle_event(
+                 complete_txn_fragment(11, write_lsn, [
+                   %Changes.NewRecord{
+                     relation: {"public", "test_table"},
+                     record: %{"id" => "1"},
+                     log_offset: written_offset
+                   }
+                 ]),
+                 stack_id
+               )
+
+      no_op_lsn = Lsn.from_integer(20)
+
+      no_op_txn =
+        complete_txn_fragment(12, no_op_lsn, [
+          %Changes.NewRecord{
+            relation: {"public", "test_table"},
+            record: %{"id" => "2"},
+            log_offset: LogOffset.new(no_op_lsn, 0)
+          }
+        ])
+
+      assert :ok =
+               GenServer.call(
+                 consumer_pid,
+                 {:handle_event, no_op_txn,
+                  Electric.Telemetry.OpenTelemetry.get_current_context()},
+                 :infinity
+               )
+
+      no_op_boundary = no_op_txn.last_log_offset
+
+      assert :sys.get_state(consumer_pid).txn_offset_mapping == [
+               {written_offset, no_op_boundary}
+             ]
+
+      assert [] == Support.Trace.collect_traced_calls()
+
+      # A physical flush may include bytes beyond the mapped shape write (for
+      # example, a later generated control entry). It still covers every
+      # transaction boundary relabelled onto the earlier write.
+      coalesced_physical_flush = LogOffset.new(write_lsn, 2)
+      send(consumer_pid, {Storage, :flushed, coalesced_physical_flush})
+      assert :sys.get_state(consumer_pid).txn_offset_mapping == []
+
+      assert [
+               {ShapeLogCollector, :notify_flushed, [^stack_id, ^shape_handle, ^no_op_boundary]}
+             ] = Support.Trace.collect_traced_calls()
     end
 
     @tag allow_subqueries: false, with_pure_file_storage_opts: [flush_period: 1]
@@ -2383,7 +2696,7 @@ defmodule Electric.Shapes.ConsumerTest do
         ctx.stack_id
       )
 
-      assert_receive {:query_requested, ^consumer_pid}
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
 
       # Snapshot here is intentionally before the update to make sure the update is considered shadowing
       send(consumer_pid, {:pg_snapshot_known, {90, 95, []}})
@@ -2431,6 +2744,19 @@ defmodule Electric.Shapes.ConsumerTest do
       assert_receive {^ref, :new_changes, _offset}, @receive_timeout
 
       # Check storage for operations
+      assert :updated =
+               poll_until(@receive_timeout, fn ->
+                 items =
+                   get_log_items_from_storage(
+                     LogOffset.last_before_real_offsets(),
+                     shape_storage
+                   )
+
+                 if Enum.any?(items, &match?(%{"headers" => %{"operation" => "update"}}, &1)),
+                   do: {:ok, :updated},
+                   else: :retry
+               end)
+
       assert [
                %{"headers" => %{"event" => "move-in"}},
                %{
@@ -2449,6 +2775,9 @@ defmodule Electric.Shapes.ConsumerTest do
                %{
                  "headers" => %{"operation" => "update", "txids" => [100]},
                  "key" => ~s'"public"."test_table"/"1"'
+               },
+               %{
+                 "headers" => %{"event" => "move-out", "last" => true}
                }
              ] = get_log_items_from_storage(LogOffset.last_before_real_offsets(), shape_storage)
     end
@@ -2487,7 +2816,7 @@ defmodule Electric.Shapes.ConsumerTest do
         ctx.stack_id
       )
 
-      assert_receive {:query_requested, ^consumer_pid}
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
 
       send(consumer_pid, {:pg_snapshot_known, {100, 300, []}})
 
@@ -2532,8 +2861,729 @@ defmodule Electric.Shapes.ConsumerTest do
                    "xmax" => "300",
                    "xip_list" => []
                  }
+               },
+               %{
+                 "headers" => %{"event" => "move-out", "last" => true}
                }
              ] = get_log_items_from_storage(LogOffset.last_before_real_offsets(), shape_storage)
+    end
+
+    test "fragmented root begin cannot advance the durable frontier before commit", ctx do
+      parent = self()
+
+      Repatch.patch(
+        Electric.Shapes.Consumer.Effects,
+        :query_move_in_async,
+        [mode: :shared],
+        fn _task_sup, _consumer_state, _buffering_state, consumer_pid ->
+          send(parent, {:query_requested, consumer_pid})
+          :ok
+        end
+      )
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery_or_value, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 50)
+
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{
+           move_in: [{1, "1"}],
+           move_out: [],
+           txids: [50],
+           lsn: LogOffset.new(50, 0)
+         }}
+      )
+
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+
+      root_change = %Changes.NewRecord{
+        relation: {"public", "test_table"},
+        record: %{"id" => "2", "value" => "causal-root"},
+        key: ~s'"public"."test_table"/"2"',
+        log_offset: LogOffset.new(100, 0)
+      }
+
+      [root_begin, root_commit] =
+        txn_fragments(100, Lsn.from_integer(100), [
+          %{changes: [root_change], has_begin?: true, has_commit?: false},
+          %{changes: [], has_begin?: false, has_commit?: true}
+        ])
+
+      root_commit = %{root_commit | last_log_offset: LogOffset.new(100, 1)}
+
+      assert :ok = ShapeLogCollector.handle_event(root_begin, ctx.stack_id)
+
+      assert :fragment_pending =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if not is_nil(state.pending_txn),
+                   do: {:ok, :fragment_pending},
+                   else: :retry
+               end)
+
+      # The move-in snapshot finishes after PostgreSQL committed tx100, while
+      # this Consumer has only received its BEGIN fragment. Neither the in-memory
+      # nor durable root frontier may claim tx100 was evaluated until the
+      # matching COMMIT fragment reaches the handler.
+      send(consumer_pid, {:pg_snapshot_known, {90, 200, []}})
+
+      send_stored_move_in_complete(
+        consumer_pid,
+        shape_storage,
+        [
+          [
+            ~s'"public"."test_table"/"1"',
+            [],
+            Jason.encode!(%{
+              "key" => ~s'"public"."test_table"/"1"',
+              "value" => %{"id" => "1", "value" => "dependency-row"},
+              "headers" => %{
+                "operation" => "insert",
+                "relation" => ["public", "test_table"]
+              }
+            })
+          ]
+        ],
+        Lsn.from_integer(100)
+      )
+
+      # Both messages above were sent by this test process, so this synchronous
+      # call is handled only after the Consumer has observed query completion.
+      before_commit = :sys.get_state(consumer_pid)
+
+      assert before_commit.move_transaction_open?
+      assert before_commit.pending_txn != nil
+      assert before_commit.last_processed_replication_tx_offset < 100
+
+      assert {:ok, durable_before_commit} =
+               Storage.fetch_root_delivery_tx_offset(shape_storage)
+
+      assert durable_before_commit < 100
+
+      waiter = Task.async(fn -> Consumer.await_causal_frontier(consumer_pid, 100) end)
+      assert Task.yield(waiter, 100) == nil
+
+      assert :ok = ShapeLogCollector.handle_event(root_commit, ctx.stack_id)
+      assert :ok = Task.await(waiter, @receive_timeout)
+
+      assert :transaction_complete =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if is_nil(state.pending_txn) and
+                      state.last_processed_replication_tx_offset == 100 do
+                   {:ok, :transaction_complete}
+                 else
+                   :retry
+                 end
+               end)
+    end
+
+    test "move-in applies its global frontier only after every deferred root reaches the handler",
+         ctx do
+      parent = self()
+
+      Repatch.patch(
+        Electric.Shapes.Consumer.Effects,
+        :query_move_in_async,
+        [mode: :shared],
+        fn _task_sup, _consumer_state, _buffering_state, consumer_pid ->
+          send(parent, {:query_requested, consumer_pid})
+          :ok
+        end
+      )
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      ref = Shapes.Consumer.register_for_changes(ctx.stack_id, shape_handle)
+      shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+
+      # Seed row 1 through the dependency so the client-visible shape already
+      # contains the logical row before the second move-in starts.
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{
+           move_in: [{1, "1"}],
+           move_out: [],
+           txids: [40],
+           lsn: LogOffset.new(40, 0)
+         }}
+      )
+
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+      send(consumer_pid, {:pg_snapshot_known, {1, 40, []}})
+
+      send_stored_move_in_complete(
+        consumer_pid,
+        shape_storage,
+        [
+          [
+            ~s'"public"."test_table"/"1"',
+            [],
+            Jason.encode!(%{
+              "key" => ~s'"public"."test_table"/"1"',
+              "value" => %{"id" => "1", "value" => "before"},
+              "headers" => %{
+                "operation" => "insert",
+                "relation" => ["public", "test_table"]
+              }
+            })
+          ]
+        ],
+        Lsn.from_integer(40)
+      )
+
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 40)
+      assert_receive {^ref, :new_changes, _offset}, @receive_timeout
+
+      # A dependency transaction starts a move-in query for id=2. Its snapshot
+      # includes the later root PK update, but replication for that update is
+      # queued behind the open move transaction.
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{
+           move_in: [{2, "2"}],
+           move_out: [],
+           txids: [50],
+           lsn: LogOffset.new(50, 0)
+         }}
+      )
+
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+      send(consumer_pid, {:pg_snapshot_known, {90, 200, []}})
+
+      send_stored_move_in_complete(
+        consumer_pid,
+        shape_storage,
+        [
+          [
+            ~s'"public"."test_table"/"2"',
+            [],
+            Jason.encode!(%{
+              "key" => ~s'"public"."test_table"/"2"',
+              "value" => %{"id" => "2", "value" => "after"},
+              "headers" => %{
+                "operation" => "insert",
+                "relation" => ["public", "test_table"]
+              }
+            })
+          ]
+        ],
+        Lsn.from_integer(100)
+      )
+
+      # A second dependency transaction committed before the root transaction,
+      # so it sorts ahead of that root in the normal deferred-work scheduler.
+      # It must not let the later global frontier splice the active snapshot
+      # before the root transaction has been classified against that snapshot.
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{
+           move_in: [],
+           move_out: [],
+           txids: [75],
+           lsn: LogOffset.new(75, 0)
+         }}
+      )
+
+      assert :dependency_deferred =
+               poll_until(@receive_timeout, fn ->
+                 if :sys.get_state(consumer_pid).deferred_materializer_move_count == 1,
+                   do: {:ok, :dependency_deferred},
+                   else: :retry
+               end)
+
+      update =
+        Changes.UpdatedRecord.new(%{
+          relation: {"public", "test_table"},
+          old_record: %{"id" => "1", "value" => "before"},
+          record: %{"id" => "2", "value" => "after"},
+          old_key: ~s'"public"."test_table"/"1"',
+          key: ~s'"public"."test_table"/"2"',
+          log_offset: LogOffset.new(100, 0)
+        })
+
+      [root_begin, root_commit] =
+        txn_fragments(100, Lsn.from_integer(100), [
+          %{changes: [update], has_begin?: true, has_commit?: false},
+          %{changes: [], has_begin?: false, has_commit?: true}
+        ])
+
+      root_commit = %{root_commit | last_log_offset: LogOffset.new(100, 1)}
+
+      assert :ok = ShapeLogCollector.handle_event(root_begin, ctx.stack_id)
+
+      assert :root_pending =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if state.deferred_replication_event_count > 0 or not is_nil(state.pending_txn),
+                   do: {:ok, :root_pending},
+                   else: :retry
+               end)
+
+      waiter = Task.async(fn -> Consumer.await_causal_frontier(consumer_pid, 100) end)
+      assert Task.yield(waiter, 100) == nil
+
+      assert :ok = ShapeLogCollector.handle_event(root_commit, ctx.stack_id)
+
+      final_state =
+        poll_until(@receive_timeout, fn ->
+          state = :sys.get_state(consumer_pid)
+
+          if state.last_seen_global_lsn >= 100,
+            do: {:ok, state},
+            else: :retry
+        end)
+
+      assert final_state.last_observed_global_lsn >= 100
+      assert final_state.last_seen_global_lsn >= 100
+      assert :ok = Task.await(waiter, @receive_timeout)
+
+      assert_receive {^ref, :new_changes, _offset}, @receive_timeout
+
+      assert :ordered =
+               poll_until(@receive_timeout, fn ->
+                 operations =
+                   get_log_items_from_storage(
+                     LogOffset.last_before_real_offsets(),
+                     shape_storage
+                   )
+                   |> Enum.flat_map(fn
+                     %{
+                       "key" => key,
+                       "headers" => %{"operation" => operation}
+                     }
+                     when key in [
+                            ~s'"public"."test_table"/"1"',
+                            ~s'"public"."test_table"/"2"'
+                          ] ->
+                       [{key, operation}]
+
+                     _ ->
+                       []
+                   end)
+
+                 if operations == [
+                      {~s'"public"."test_table"/"1"', "insert"},
+                      {~s'"public"."test_table"/"1"', "delete"},
+                      {~s'"public"."test_table"/"2"', "insert"}
+                    ],
+                    do: {:ok, :ordered},
+                    else: :retry
+               end)
+    end
+
+    test "active snapshot reconciles a deferred root before the next view-changing dependency",
+         ctx do
+      parent = self()
+
+      Repatch.patch(
+        Electric.Shapes.Consumer.Effects,
+        :query_move_in_async,
+        [mode: :shared],
+        fn _task_sup, _consumer_state, _buffering_state, consumer_pid ->
+          send(parent, {:query_requested, consumer_pid})
+          :ok
+        end
+      )
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+
+      # Establish an existing row before opening the move whose query snapshot
+      # includes a later root transaction.
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{
+           move_in: [{1, "1"}],
+           move_out: [],
+           txids: [40],
+           lsn: LogOffset.new(40, 0)
+         }}
+      )
+
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+      send(consumer_pid, {:pg_snapshot_known, {1, 40, []}})
+
+      send_stored_move_in_complete(
+        consumer_pid,
+        shape_storage,
+        [
+          [
+            ~s'"public"."test_table"/"1"',
+            [],
+            Jason.encode!(%{
+              "key" => ~s'"public"."test_table"/"1"',
+              "value" => %{"id" => "1", "value" => "before"},
+              "headers" => %{
+                "operation" => "insert",
+                "relation" => ["public", "test_table"]
+              }
+            })
+          ]
+        ],
+        Lsn.from_integer(40)
+      )
+
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 40)
+
+      assert :seed_committed =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if state.last_seen_global_lsn >= 40 and not state.move_transaction_open?,
+                   do: {:ok, :seed_committed},
+                   else: :retry
+               end)
+
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{
+           move_in: [{2, "2"}],
+           move_out: [],
+           txids: [50],
+           lsn: LogOffset.new(50, 0)
+         }}
+      )
+
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+      send(consumer_pid, {:pg_snapshot_known, {90, 200, []}})
+
+      send_stored_move_in_complete(
+        consumer_pid,
+        shape_storage,
+        [
+          [
+            ~s'"public"."test_table"/"2"',
+            [],
+            Jason.encode!(%{
+              "key" => ~s'"public"."test_table"/"2"',
+              "value" => %{"id" => "2", "value" => "after"},
+              "headers" => %{
+                "operation" => "insert",
+                "relation" => ["public", "test_table"]
+              }
+            })
+          ]
+        ],
+        Lsn.from_integer(100)
+      )
+
+      # This resolved batch is ordered before root tx 100 and changes the
+      # dependency view, so root tx 100 cannot safely overtake it into the
+      # active move-in handler.
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{
+           move_in: [{3, "3"}],
+           move_out: [],
+           txids: [75],
+           lsn: LogOffset.new(75, 0)
+         }}
+      )
+
+      assert :dependency_deferred =
+               poll_until(@receive_timeout, fn ->
+                 if :sys.get_state(consumer_pid).deferred_materializer_move_count == 1,
+                   do: {:ok, :dependency_deferred},
+                   else: :retry
+               end)
+
+      update =
+        Changes.UpdatedRecord.new(%{
+          relation: {"public", "test_table"},
+          old_record: %{"id" => "1", "value" => "before"},
+          record: %{"id" => "2", "value" => "after"},
+          old_key: ~s'"public"."test_table"/"1"',
+          key: ~s'"public"."test_table"/"2"',
+          log_offset: LogOffset.new(100, 0)
+        })
+
+      [root_begin, root_commit] =
+        txn_fragments(100, Lsn.from_integer(100), [
+          %{changes: [update], has_begin?: true, has_commit?: false},
+          %{changes: [], has_begin?: false, has_commit?: true}
+        ])
+
+      root_commit = %{root_commit | last_log_offset: LogOffset.new(100, 1)}
+
+      assert :ok = ShapeLogCollector.handle_event(root_begin, ctx.stack_id)
+
+      assert :root_pending =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if state.deferred_replication_event_count > 0 or not is_nil(state.pending_txn),
+                   do: {:ok, :root_pending},
+                   else: :retry
+               end)
+
+      consumer_ref = Process.monitor(consumer_pid)
+      assert :ok = ShapeLogCollector.handle_event(root_commit, ctx.stack_id)
+
+      # The active move must absorb root100 so its snapshot can reconcile the
+      # visible transaction. Only after that atomic batch commits may dep75
+      # start its own query against the converged database state.
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+      refute_receive {:DOWN, ^consumer_ref, :process, ^consumer_pid, _reason}, 100
+
+      send(consumer_pid, {:pg_snapshot_known, {90, 200, []}})
+
+      send_stored_move_in_complete(
+        consumer_pid,
+        shape_storage,
+        [
+          [
+            ~s'"public"."test_table"/"3"',
+            [],
+            Jason.encode!(%{
+              "key" => ~s'"public"."test_table"/"3"',
+              "value" => %{"id" => "3", "value" => "after-dependency"},
+              "headers" => %{
+                "operation" => "insert",
+                "relation" => ["public", "test_table"]
+              }
+            })
+          ]
+        ],
+        Lsn.from_integer(100)
+      )
+
+      assert :committed =
+               poll_until(@receive_timeout, fn ->
+                 with {:ok, positions} <- Storage.fetch_move_positions(shape_storage),
+                      %LogOffset{tx_offset: 75} <- Map.get(positions, dep_handle),
+                      {:ok, 100} <- Storage.fetch_root_delivery_tx_offset(shape_storage),
+                      %{move_transaction_open?: false} <- :sys.get_state(consumer_pid) do
+                   {:ok, :committed}
+                 else
+                   _ -> :retry
+                 end
+               end)
+
+      assert Process.alive?(consumer_pid)
+      Process.demonitor(consumer_ref, [:flush])
+    end
+
+    test "nonvisible root behind an earlier dependency progresses without a pre-broadcast frontier",
+         ctx do
+      parent = self()
+
+      Repatch.patch(
+        Electric.Shapes.Consumer.Effects,
+        :query_move_in_async,
+        [mode: :shared],
+        fn _task_sup, _consumer_state, _buffering_state, consumer_pid ->
+          send(parent, {:query_requested, consumer_pid})
+          :ok
+        end
+      )
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+
+      # Seed row 1 so the later PK update is routed to this outer shape.
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{
+           move_in: [{1, "1"}],
+           move_out: [],
+           txids: [40],
+           lsn: LogOffset.new(40, 0)
+         }}
+      )
+
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+      send(consumer_pid, {:pg_snapshot_known, {1, 40, []}})
+
+      send_stored_move_in_complete(
+        consumer_pid,
+        shape_storage,
+        [
+          [
+            ~s'"public"."test_table"/"1"',
+            [],
+            Jason.encode!(%{
+              "key" => ~s'"public"."test_table"/"1"',
+              "value" => %{"id" => "1", "value" => "before"},
+              "headers" => %{
+                "operation" => "insert",
+                "relation" => ["public", "test_table"]
+              }
+            })
+          ]
+        ],
+        Lsn.from_integer(40)
+      )
+
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 40)
+
+      assert :seed_committed =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if state.last_seen_global_lsn >= 40 and not state.move_transaction_open?,
+                   do: {:ok, :seed_committed},
+                   else: :retry
+               end)
+
+      # dep50 opens a move-in whose snapshot still sees root tx100 in progress.
+      # Its query is complete, but causal tx50 remains unproven until the later
+      # root reaches this Consumer.
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{
+           move_in: [{2, "2"}],
+           move_out: [],
+           txids: [50],
+           lsn: LogOffset.new(50, 0)
+         }}
+      )
+
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+      send(consumer_pid, {:pg_snapshot_known, {90, 200, [100]}})
+      send_stored_move_in_complete(consumer_pid, shape_storage, [], Lsn.from_integer(100))
+
+      assert :dep50_waiting =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if state.move_transaction_open? and state.last_seen_global_lsn < 100,
+                   do: {:ok, :dep50_waiting},
+                   else: :retry
+               end)
+
+      # dep75 is view-changing and precedes root100, so root100 must not
+      # overtake it. It remains queued behind the active dep50 move.
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{
+           move_in: [{3, "3"}],
+           move_out: [],
+           txids: [75],
+           lsn: LogOffset.new(75, 0)
+         }}
+      )
+
+      assert :dependency_deferred =
+               poll_until(@receive_timeout, fn ->
+                 if :sys.get_state(consumer_pid).deferred_materializer_move_count == 1,
+                   do: {:ok, :dependency_deferred},
+                   else: :retry
+               end)
+
+      update =
+        Changes.UpdatedRecord.new(%{
+          relation: {"public", "test_table"},
+          old_record: %{"id" => "1", "value" => "before"},
+          record: %{"id" => "2", "value" => "after"},
+          old_key: ~s'"public"."test_table"/"1"',
+          key: ~s'"public"."test_table"/"2"',
+          log_offset: LogOffset.new(100, 0)
+        })
+
+      [root_begin, root_commit] =
+        txn_fragments(100, Lsn.from_integer(100), [
+          %{changes: [update], has_begin?: true, has_commit?: false},
+          %{changes: [], has_begin?: false, has_commit?: true}
+        ])
+
+      root_commit = %{root_commit | last_log_offset: LogOffset.new(100, 1)}
+
+      # There is intentionally no LsnTracker.broadcast_last_seen_lsn(..., 100)
+      # before these fragments. The queued root itself must prove dep50 and
+      # dep75 without exposing tx100 as applied before it is evaluated.
+      assert :sys.get_state(consumer_pid).last_seen_global_lsn < 100
+      assert :ok = ShapeLogCollector.handle_event(root_begin, ctx.stack_id)
+      assert :ok = ShapeLogCollector.handle_event(root_commit, ctx.stack_id)
+
+      # The scheduler must finish dep50, then start dep75 before evaluating the
+      # nonvisible root. A deadlock leaves this query request absent.
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+
+      send(consumer_pid, {:pg_snapshot_known, {90, 200, []}})
+
+      send_stored_move_in_complete(
+        consumer_pid,
+        shape_storage,
+        [
+          [
+            ~s'"public"."test_table"/"3"',
+            [],
+            Jason.encode!(%{
+              "key" => ~s'"public"."test_table"/"3"',
+              "value" => %{"id" => "3", "value" => "dependency-row"},
+              "headers" => %{
+                "operation" => "insert",
+                "relation" => ["public", "test_table"]
+              }
+            })
+          ]
+        ],
+        Lsn.from_integer(100)
+      )
+
+      assert :drained =
+               poll_until(@receive_timeout, fn ->
+                 with {:ok, positions} <- Storage.fetch_move_positions(shape_storage),
+                      %LogOffset{tx_offset: 75} <- Map.get(positions, dep_handle),
+                      {:ok, 100} <- Storage.fetch_root_delivery_tx_offset(shape_storage),
+                      %{
+                        move_transaction_open?: false,
+                        deferred_materializer_move_count: 0,
+                        deferred_replication_event_count: 0,
+                        pending_txn: nil
+                      } <- :sys.get_state(consumer_pid) do
+                   {:ok, :drained}
+                 else
+                   _ -> :retry
+                 end
+               end)
     end
 
     test "consumer replays the latest broadcast when subscribing for a move-in", ctx do
@@ -2573,7 +3623,7 @@ defmodule Electric.Shapes.ConsumerTest do
          }}
       )
 
-      assert_receive {:query_requested, ^consumer_pid}
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
 
       send(consumer_pid, {:pg_snapshot_known, {100, 300, []}})
 
@@ -2619,6 +3669,2124 @@ defmodule Electric.Shapes.ConsumerTest do
              ] = get_log_items_from_storage(LogOffset.last_before_real_offsets(), shape_storage)
     end
 
+    @tag with_pure_file_storage_opts: [flush_period: 10_000]
+    test "materializer subscription flushes and replays a pre-existing volatile tail exactly once",
+         ctx do
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      register_as_replication_client(ctx.stack_id)
+
+      row_offset = LogOffset.new(Lsn.from_integer(700), 0)
+
+      txn =
+        complete_txn_fragment(700, Lsn.from_integer(700), [
+          %Changes.NewRecord{
+            relation: {"public", "test_table"},
+            record: %{"id" => "1", "value" => "pre-subscription"},
+            log_offset: row_offset
+          }
+        ])
+
+      assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
+
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      pre_subscription = :sys.get_state(consumer_pid)
+      assert pre_subscription.latest_offset == row_offset
+      assert LogOffset.compare(pre_subscription.durable_offset, row_offset) == :lt
+
+      {:ok, materializer_pid} =
+        Materializer.start_link(%{
+          stack_id: ctx.stack_id,
+          shape_handle: shape_handle,
+          columns: ["id"],
+          materialized_type: {:array, :int8}
+        })
+
+      assert :ok =
+               Materializer.wait_until_ready(%{
+                 stack_id: ctx.stack_id,
+                 shape_handle: shape_handle
+               })
+
+      assert {:ok, seed_values, ^row_offset} = Materializer.subscribe(materializer_pid)
+      assert seed_values == MapSet.new([1])
+
+      post_subscription = :sys.get_state(consumer_pid)
+      assert post_subscription.durable_offset == row_offset
+      assert post_subscription.materializer_subscribed?
+      refute_received {:materializer_changes, ^shape_handle, _payload}
+    end
+
+    @tag allow_subqueries: false, with_pure_file_storage_opts: [flush_period: 10_000]
+    test "materializer subscription waits for a fragmented transaction and replays it once",
+         ctx do
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      register_as_replication_client(ctx.stack_id)
+
+      lsn = Lsn.from_integer(701)
+      row_offset = LogOffset.new(lsn, 0)
+
+      begin_fragment =
+        txn_fragment(
+          701,
+          lsn,
+          [
+            %Changes.NewRecord{
+              relation: {"public", "test_table"},
+              record: %{"id" => "1", "value" => "fragmented"},
+              log_offset: row_offset
+            }
+          ],
+          has_begin?: true
+        )
+
+      commit_fragment =
+        txn_fragment(
+          701,
+          lsn,
+          [
+            %Changes.NewRecord{
+              relation: {"public", "other_table"},
+              record: %{"id" => "unrelated"},
+              log_offset: LogOffset.new(lsn, 2)
+            }
+          ],
+          has_commit?: true
+        )
+
+      assert :ok = ShapeLogCollector.handle_event(begin_fragment, ctx.stack_id)
+
+      {:ok, materializer_pid} =
+        Materializer.start_link(%{
+          stack_id: ctx.stack_id,
+          shape_handle: shape_handle,
+          columns: ["id"],
+          materialized_type: {:array, :int8}
+        })
+
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+
+      assert :subscription_waiting =
+               poll_until(@receive_timeout, fn ->
+                 case :sys.get_state(consumer_pid).pending_materializer_subscription do
+                   nil -> :retry
+                   _from -> {:ok, :subscription_waiting}
+                 end
+               end)
+
+      # The public subscription call uses an infinite timeout because a real
+      # fragmented transaction or nested move query can legitimately exceed
+      # GenServer.call's five-second default.
+      Process.sleep(5_100)
+      assert Process.alive?(materializer_pid)
+
+      # The Consumer returned from the pending subscribe call without replying,
+      # so it remains able to accept and commit the final replication fragment.
+      assert :ok = ShapeLogCollector.handle_event(commit_fragment, ctx.stack_id)
+
+      materializer = %{stack_id: ctx.stack_id, shape_handle: shape_handle}
+      assert :ok = Materializer.wait_until_ready(materializer)
+      assert {:ok, seed_values, ^row_offset} = Materializer.subscribe(materializer_pid)
+      assert seed_values == MapSet.new([1])
+      refute_received {:materializer_changes, ^shape_handle, _payload}
+    end
+
+    test "cursor-only dependency move commits do not manufacture a log boundary",
+         ctx do
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+
+      # The test snapshotter signals `snapshot_started` before its asynchronous
+      # snapshot writer publishes `last_snapshot_chunk`. Capture the baseline
+      # only after that storage boundary is visible so snapshot completion
+      # cannot be mistaken for a cursor-only move boundary.
+      pre_snapshot_boundary = LogOffset.last_before_real_offsets()
+
+      start_boundary =
+        poll_until(@receive_timeout, fn ->
+          case Storage.fetch_latest_offset(shape_storage) do
+            {:ok, ^pre_snapshot_boundary} ->
+              :retry
+
+            {:ok, boundary} ->
+              {:ok, boundary}
+
+            _ ->
+              :retry
+          end
+        end)
+
+      move_lsn = LogOffset.new(776, 0)
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, move_lsn.tx_offset)
+
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{move_in: [], move_out: [], txids: [], lsn: move_lsn}}
+      )
+
+      assert :frontier_observed =
+               poll_until(@receive_timeout, fn ->
+                 if :sys.get_state(consumer_pid).last_seen_global_lsn >= move_lsn.tx_offset,
+                   do: {:ok, :frontier_observed},
+                   else: :retry
+               end)
+
+      assert :committed =
+               poll_until(@receive_timeout, fn ->
+                 with {:ok, positions} <- Storage.fetch_move_positions(shape_storage),
+                      ^move_lsn <- Map.get(positions, dep_handle) do
+                   {:ok, :committed}
+                 else
+                   _ -> :retry
+                 end
+               end)
+
+      {:ok, boundary} = Storage.fetch_latest_offset(shape_storage)
+      assert boundary == start_boundary
+
+      assert [] =
+               Storage.get_log_stream_with_offsets(start_boundary, boundary, shape_storage)
+               |> Enum.to_list()
+    end
+
+    test "later root proves a cursor-only move without overtaking an earlier dependency",
+         ctx do
+      parent = self()
+
+      Repatch.patch(
+        Electric.Shapes.Consumer.Effects,
+        :query_move_in_async,
+        [mode: :shared],
+        fn _task_sup, _consumer_state, _buffering_state, consumer_pid ->
+          send(parent, {:query_requested, consumer_pid})
+          :ok
+        end
+      )
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery_or_value, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      changes_ref = Shapes.Consumer.register_for_changes(ctx.stack_id, shape_handle)
+      shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+
+      tx50 = LogOffset.new(50, 0)
+
+      assert :ok =
+               Consumer.deliver_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 %{move_in: [], move_out: [], txids: [50], lsn: tx50},
+                 @receive_timeout
+               )
+
+      assert :cursor_waiting_for_root =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if state.move_transaction_open? and state.pending_move_causal_origin == tx50 and
+                      match?(
+                        %Electric.Shapes.Consumer.EventHandler.Subqueries.Steady{},
+                        state.event_handler
+                      ) do
+                   {:ok, :cursor_waiting_for_root}
+                 else
+                   :retry
+                 end
+               end)
+
+      tx75 = LogOffset.new(75, 0)
+
+      assert :ok =
+               Consumer.deliver_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 %{move_in: [{75, "75"}], move_out: [], txids: [75], lsn: tx75},
+                 @receive_timeout
+               )
+
+      assert :sys.get_state(consumer_pid).deferred_materializer_move_count == 1
+
+      root100 =
+        complete_txn_fragment(100, Lsn.from_integer(100), [
+          %Changes.NewRecord{
+            relation: {"public", "test_table"},
+            record: %{"id" => "100", "value" => "causal-root"},
+            key: ~s'"public"."test_table"/"100"',
+            log_offset: LogOffset.new(100, 0)
+          }
+        ])
+
+      assert :ok =
+               GenServer.call(
+                 consumer_pid,
+                 {:handle_event, root100, Electric.Telemetry.OpenTelemetry.get_current_context()},
+                 :infinity
+               )
+
+      # Root 100 proves that cursor-only tx50 is a durable prefix. Dependency
+      # tx75 must become active before root 100 leaves the Consumer queue. Once
+      # active, tx75's Buffering handler may safely hold the root until its
+      # snapshot is known.
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+
+      state = :sys.get_state(consumer_pid)
+      assert state.pending_move_causal_origin == tx75
+
+      assert %Electric.Shapes.Consumer.EventHandler.Subqueries.Buffering{
+               active_move: %{
+                 values: [{75, "75"}],
+                 buffered_txn_count: 1,
+                 buffered_txns: [%Changes.Transaction{xid: 100}]
+               }
+             } = state.event_handler
+
+      assert {:ok, 50} = Storage.fetch_root_delivery_tx_offset(shape_storage)
+      assert {:ok, positions} = Storage.fetch_move_positions(shape_storage)
+      assert Map.fetch!(positions, dep_handle) == tx50
+      refute_receive {^changes_ref, :new_changes, _offset}, 100
+    end
+
+    test "malformed deferred root xid fails closed instead of parking behind a dependency",
+         ctx do
+      parent = self()
+
+      Repatch.patch(
+        Electric.Shapes.Consumer.Effects,
+        :query_move_in_async,
+        [mode: :shared],
+        fn _task_sup, _consumer_state, _buffering_state, consumer_pid ->
+          send(parent, {:query_requested, consumer_pid})
+          :ok
+        end
+      )
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{
+           move_in: [{1, "1"}],
+           move_out: [],
+           txids: [50],
+           lsn: LogOffset.new(50, 0)
+         }}
+      )
+
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+      send(consumer_pid, {:pg_snapshot_known, {90, 200, []}})
+
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{
+           move_in: [{2, "2"}],
+           move_out: [],
+           txids: [75],
+           lsn: LogOffset.new(75, 0)
+         }}
+      )
+
+      assert :scheduler_ready =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 case state do
+                   %{
+                     deferred_materializer_move_count: 1,
+                     event_handler: %Electric.Shapes.Consumer.EventHandler.Subqueries.Buffering{
+                       active_move: %{snapshot: {90, 200, []}, boundary_txn_count: nil}
+                     }
+                   } ->
+                     {:ok, :scheduler_ready}
+
+                   _ ->
+                     :retry
+                 end
+               end)
+
+      malformed_root = complete_txn_fragment(nil, Lsn.from_integer(100), [])
+      consumer_ref = Process.monitor(consumer_pid)
+
+      assert :ok =
+               GenServer.call(
+                 consumer_pid,
+                 {:handle_event, malformed_root,
+                  Electric.Telemetry.OpenTelemetry.get_current_context()},
+                 :infinity
+               )
+
+      assert_receive {:DOWN, ^consumer_ref, :process, ^consumer_pid, {:shutdown, :cleanup}},
+                     @receive_timeout
+    end
+
+    test "dependency replay seeds are released after new and restored handler initialization",
+         ctx do
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      assert_seed_released = fn consumer_pid ->
+        state = :sys.get_state(consumer_pid)
+
+        assert state.dep_seed_views == %{}
+        assert %{views: views} = state.event_handler
+        assert map_size(views) == 1
+      end
+
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      assert_seed_released.(consumer_pid)
+
+      old_ref = Process.monitor(consumer_pid)
+      assert :ok = Consumer.stop(consumer_pid, :shutdown)
+      assert_receive {:DOWN, ^old_ref, :process, ^consumer_pid, :shutdown}, @receive_timeout
+      :ok = Electric.Shapes.ConsumerRegistry.remove_consumer(shape_handle, ctx.stack_id)
+
+      assert Support.TestUtils.wait_until(
+               fn -> is_nil(Consumer.whereis(ctx.stack_id, shape_handle)) end,
+               @receive_timeout
+             )
+
+      assert {:ok, restored_pid} =
+               ShapeCache.start_consumer_for_handle(shape_handle, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      assert_seed_released.(restored_pid)
+    end
+
+    test "restore with two stale dependencies fails closed to a fresh shape", ctx do
+      assert_two_dependency_restore_replay(
+        @shape_with_two_subqueries,
+        [{"public", "other_table"}, {"public", "something else"}],
+        ctx
+      )
+    end
+
+    test "restore with two stale dependencies fails closed in the opposite dependency order",
+         ctx do
+      assert_two_dependency_restore_replay(
+        @shape_with_two_subqueries_reversed,
+        [{"public", "something else"}, {"public", "other_table"}],
+        ctx
+      )
+    end
+
+    test "replay A100 and A150 both precede live B200", ctx do
+      assert_replay_sequence_precedes_live(
+        @shape_with_two_subqueries,
+        [LogOffset.new(100, 0), LogOffset.new(150, 0)],
+        LogOffset.new(200, 0),
+        ctx
+      )
+    end
+
+    test "replay A100 and A150 precede live B200 in the opposite dependency order", ctx do
+      assert_replay_sequence_precedes_live(
+        @shape_with_two_subqueries_reversed,
+        [LogOffset.new(100, 0), LogOffset.new(150, 0)],
+        LogOffset.new(200, 0),
+        ctx
+      )
+    end
+
+    test "live B200 precedes replay A300 after replay lookahead discovers its offset", ctx do
+      assert_replay_sequence_follows_live(
+        @shape_with_two_subqueries,
+        LogOffset.new(300, 0),
+        LogOffset.new(200, 0),
+        ctx
+      )
+    end
+
+    test "pending A100 lookahead blocks B200 until the coordinator wakes it", ctx do
+      assert_pending_replay_order(
+        @shape_with_two_subqueries,
+        LogOffset.new(100, 0),
+        LogOffset.new(200, 0),
+        :replay_first,
+        ctx
+      )
+    end
+
+    test "pending A300 lookahead blocks discovery then runs after B200", ctx do
+      assert_pending_replay_order(
+        @shape_with_two_subqueries_reversed,
+        LogOffset.new(300, 0),
+        LogOffset.new(200, 0),
+        :live_first,
+        ctx
+      )
+    end
+
+    test "unknown-offset replication fails closed ahead of an unresolved dependency reservation",
+         ctx do
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      offset = LogOffset.new(75, 0)
+      token = Materializer.new_causal_token(offset)
+
+      assert :ok =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 token,
+                 offset,
+                 100
+               )
+
+      assert %{deferred_materializer_move_count: 1} = :sys.get_state(consumer_pid)
+
+      Electric.StackConfig.put(ctx.stack_id, :inspector, @base_inspector)
+
+      relation = %Relation{
+        id: shape.root_table_id,
+        schema: elem(shape.root_table, 0),
+        table: elem(shape.root_table, 1),
+        columns: []
+      }
+
+      consumer_ref = Process.monitor(consumer_pid)
+
+      assert :ok =
+               GenServer.call(
+                 consumer_pid,
+                 {:handle_event, relation,
+                  Electric.Telemetry.OpenTelemetry.get_current_context()},
+                 :infinity
+               )
+
+      assert_receive {:DOWN, ^consumer_ref, :process, ^consumer_pid, {:shutdown, :cleanup}},
+                     @receive_timeout
+    end
+
+    test "reserved dependency batches wait for the earliest offset when payloads arrive reversed",
+         ctx do
+      parent = self()
+
+      Repatch.patch(
+        Electric.Shapes.Consumer.Effects,
+        :query_move_in_async,
+        [mode: :shared],
+        fn _task_sup, _consumer_state, _buffering_state, consumer_pid ->
+          send(parent, {:query_requested, consumer_pid})
+          :ok
+        end
+      )
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_two_subqueries, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [first_dep, second_dep] = Enum.sort(shape.shape_dependencies_handles)
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      first_offset = LogOffset.new(800, 0)
+      second_offset = LogOffset.new(900, 0)
+      first_token = Materializer.new_causal_token(first_offset)
+      second_token = Materializer.new_causal_token(second_offset)
+
+      assert :ok =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 first_dep,
+                 first_token,
+                 first_offset,
+                 100_000
+               )
+
+      assert :ok =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 second_dep,
+                 second_token,
+                 second_offset,
+                 100_000
+               )
+
+      # Both source transactions have crossed the collector's post-layer
+      # frontier; this test is about reservation ordering, not frontier gating.
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 900)
+
+      # The later payload is durable first. It fills its reserved slot but must
+      # not start a move-in while the earlier dependency batch is outstanding.
+      send(
+        consumer_pid,
+        {:materializer_changes, second_dep,
+         %{
+           move_in: [{2, "2"}],
+           move_out: [],
+           txids: [900],
+           lsn: second_offset,
+           causal_token: second_token
+         }}
+      )
+
+      state = :sys.get_state(consumer_pid)
+      assert state.deferred_materializer_move_count == 2
+      assert state.pending_move_lsns == %{}
+      refute_received {:query_requested, ^consumer_pid}
+
+      send(
+        consumer_pid,
+        {:materializer_changes, first_dep,
+         %{
+           move_in: [{1, "1"}],
+           move_out: [],
+           txids: [800],
+           lsn: first_offset,
+           causal_token: first_token
+         }}
+      )
+
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+
+      state = :sys.get_state(consumer_pid)
+      assert state.pending_move_lsns == %{first_dep => first_offset}
+      assert state.deferred_materializer_move_count == 1
+
+      assert {:value,
+              {{:reserved_materializer_batch, ^second_dep, ^second_offset, ^second_token,
+                _downstream_token, {:materializer_changes, ^second_dep, _payload}}, _bytes}} =
+               :queue.peek(state.deferred_materializer_moves)
+    end
+
+    test "same-transaction local dependency batches precede transitively forwarded batches",
+         ctx do
+      Repatch.patch(Materializer, :forward_causal_begin, [mode: :shared], fn _, _, _ -> :ok end)
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+
+      :sys.replace_state(consumer_pid, fn state ->
+        %{state | materializer_subscribed?: true}
+      end)
+
+      earlier_forwarded_offset = LogOffset.new(801, 8)
+      forwarded_offset = LogOffset.new(802, 2)
+      local_offset = LogOffset.new(802, 4)
+      deeply_forwarded_offset = LogOffset.new(802, 0)
+      later_local_offset = LogOffset.new(803, 0)
+      earlier_forwarded_token = Materializer.new_causal_token(earlier_forwarded_offset, 2)
+      forwarded_token = Materializer.new_causal_token(forwarded_offset, 1)
+      local_token = Materializer.new_causal_token(local_offset)
+      deeply_forwarded_token = Materializer.new_causal_token(deeply_forwarded_offset, 2)
+      later_local_token = Materializer.new_causal_token(later_local_offset)
+
+      # Recursive reservation reaches the outer Consumer before this layer has
+      # necessarily processed and materialized its own root transaction.
+      assert :ok =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 forwarded_token,
+                 forwarded_offset,
+                 100_000
+               )
+
+      assert :ok =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 local_token,
+                 local_offset,
+                 100_000
+               )
+
+      assert :ok =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 later_local_token,
+                 later_local_offset,
+                 100_000
+               )
+
+      assert :ok =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 deeply_forwarded_token,
+                 deeply_forwarded_offset,
+                 100_000
+               )
+
+      assert :ok =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 earlier_forwarded_token,
+                 earlier_forwarded_offset,
+                 100_000
+               )
+
+      assert [
+               {{:reserved_materializer_batch, ^dep_handle, ^earlier_forwarded_offset,
+                 ^earlier_forwarded_token, earlier_downstream, nil}, _earlier_bytes},
+               {{:reserved_materializer_batch, ^dep_handle, ^local_offset, ^local_token,
+                 local_downstream, nil}, _local_bytes},
+               {{:reserved_materializer_batch, ^dep_handle, ^forwarded_offset, ^forwarded_token,
+                 forwarded_downstream, nil}, _forwarded_bytes},
+               {{:reserved_materializer_batch, ^dep_handle, ^deeply_forwarded_offset,
+                 ^deeply_forwarded_token, deeply_forwarded_downstream, nil}, _deep_bytes},
+               {{:reserved_materializer_batch, ^dep_handle, ^later_local_offset,
+                 ^later_local_token, _later_downstream, nil}, _later_bytes}
+             ] =
+               consumer_pid
+               |> :sys.get_state()
+               |> Map.fetch!(:deferred_materializer_moves)
+               |> :queue.to_list()
+
+      assert Materializer.causal_token_depth(earlier_downstream) == 3
+      assert Materializer.causal_token_depth(local_downstream) == 1
+      assert Materializer.causal_token_depth(forwarded_downstream) == 2
+      assert Materializer.causal_token_depth(deeply_forwarded_downstream) == 3
+    end
+
+    test "mixed deferred dependency entries use handle before entry type at equal offsets", ctx do
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_two_subqueries, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [lower_handle, higher_handle] = Enum.sort(shape.shape_dependencies_handles)
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      offset = LogOffset.new(804, 0)
+      token = Materializer.new_causal_token(offset)
+
+      assert :ok =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 lower_handle,
+                 token,
+                 offset,
+                 100_000
+               )
+
+      send(
+        consumer_pid,
+        {:materializer_changes, higher_handle,
+         %{move_in: [], move_out: [], txids: [804], lsn: offset}}
+      )
+
+      assert [
+               {{:reserved_materializer_batch, ^lower_handle, ^offset, ^token, _downstream_token,
+                 nil}, _reserved_bytes},
+               {{:materializer_changes, ^higher_handle, %{lsn: ^offset}}, _live_bytes}
+             ] =
+               consumer_pid
+               |> :sys.get_state()
+               |> Map.fetch!(:deferred_materializer_moves)
+               |> :queue.to_list()
+    end
+
+    test "oversized deferred dependency moves invalidate instead of accumulating in memory",
+         ctx do
+      Electric.StackConfig.put(ctx.stack_id, :subquery_deferred_event_memory_limit_bytes, 1)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+
+      incomplete =
+        txn_fragment(
+          700,
+          Lsn.from_integer(700),
+          [
+            %Changes.NewRecord{
+              relation: {"public", "test_table"},
+              record: %{"id" => "700"},
+              log_offset: LogOffset.new(700, 0)
+            }
+          ],
+          has_begin?: true
+        )
+
+      assert :ok =
+               GenServer.call(
+                 consumer_pid,
+                 {:handle_event, incomplete,
+                  Electric.Telemetry.OpenTelemetry.get_current_context()}
+               )
+
+      assert %Consumer.PendingTxn{} = :sys.get_state(consumer_pid).pending_txn
+
+      ref = Process.monitor(consumer_pid)
+
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{
+           move_in: [{String.duplicate("x", 1_024), MapSet.new()}],
+           move_out: [],
+           txids: [],
+           lsn: LogOffset.new(701, 0)
+         }}
+      )
+
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :cleanup}},
+                     @receive_timeout
+    end
+
+    test "rejects a causal reservation before propagating it when the local buffer is full",
+         ctx do
+      parent = self()
+
+      Repatch.patch(Materializer, :forward_causal_begin, [mode: :shared], fn _materializer,
+                                                                             _token ->
+        send(parent, :causal_reservation_propagated)
+        :ok
+      end)
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+
+      :sys.replace_state(consumer_pid, fn state ->
+        %{state | materializer_subscribed?: true}
+      end)
+
+      Electric.StackConfig.put(ctx.stack_id, :subquery_deferred_event_memory_limit_bytes, 1)
+
+      offset = LogOffset.new(703, 0)
+      token = Materializer.new_causal_token(offset)
+      ref = Process.monitor(consumer_pid)
+
+      assert {:error, :memory_limit} =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 token,
+                 offset,
+                 100
+               )
+
+      refute_received :causal_reservation_propagated
+
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, _reason},
+                     @receive_timeout
+    end
+
+    test "an unknown causal prepare invalidates the detached outer shape", ctx do
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      offset = LogOffset.new(704, 0)
+      token = Materializer.new_causal_token(offset)
+      ref = Process.monitor(consumer_pid)
+
+      assert {:error, :unknown_reservation} =
+               Consumer.prepare_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 token,
+                 100,
+                 @receive_timeout
+               )
+
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :cleanup}},
+                     @receive_timeout
+    end
+
+    test "resolved causal work waits for the collector transaction frontier", ctx do
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      offset = LogOffset.new(705, 0)
+      token = Materializer.new_causal_token(offset)
+
+      assert :ok =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 token,
+                 offset,
+                 100
+               )
+
+      subscriber = self()
+
+      subscription =
+        Task.async(fn ->
+          Consumer.subscribe_materializer(ctx.stack_id, shape_handle, subscriber)
+        end)
+
+      assert Task.yield(subscription, 100) == nil
+      assert :sys.get_state(consumer_pid).pending_materializer_subscription != nil
+
+      assert :ok =
+               Consumer.deliver_materializer_causal_end(
+                 consumer_pid,
+                 dep_handle,
+                 token,
+                 @receive_timeout
+               )
+
+      # Resolving the dependency payload is not itself permission to apply it.
+      # The dependency layer runs before this Consumer's root layer, so causal
+      # work at tx 705 must stay parked until the collector proves every layer
+      # for that transaction has been published.
+      assert Task.yield(subscription, 100) == nil
+      assert :sys.get_state(consumer_pid).deferred_materializer_move_count == 1
+
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 704)
+      assert Task.yield(subscription, 100) == nil
+      assert :sys.get_state(consumer_pid).deferred_materializer_move_count == 1
+
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 705)
+      assert {:ok, %LogOffset{}} = Task.await(subscription, @receive_timeout)
+      assert :sys.get_state(consumer_pid).deferred_materializer_move_count == 0
+    end
+
+    test "causal frontier waiters drain only work at or before their cutoff", ctx do
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      cutoff_offset = LogOffset.new(705, 0)
+      later_offset = LogOffset.new(706, 0)
+      cutoff_token = Materializer.new_causal_token(cutoff_offset)
+      later_token = Materializer.new_causal_token(later_offset)
+      assert {:ok, epoch_token} = ConsumerRegistry.activate_causal_drain(ctx.stack_id, 705)
+      initial_generation = ConsumerRegistry.causal_generation(ctx.stack_id)
+
+      assert :ok =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 cutoff_token,
+                 cutoff_offset,
+                 100
+               )
+
+      assert ConsumerRegistry.causal_generation(ctx.stack_id) == initial_generation + 1
+
+      assert :ok =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 later_token,
+                 later_offset,
+                 100
+               )
+
+      assert ConsumerRegistry.causal_generation(ctx.stack_id) == initial_generation + 1
+      assert :ok = ConsumerRegistry.deactivate_causal_drain(ctx.stack_id, epoch_token)
+
+      waiter = Task.async(fn -> Consumer.await_causal_frontier(consumer_pid, 705) end)
+
+      assert Task.yield(waiter, 100) == nil
+      assert :ok = Consumer.await_causal_frontier(consumer_pid, 704)
+
+      assert :ok =
+               Consumer.deliver_materializer_causal_end(
+                 consumer_pid,
+                 dep_handle,
+                 cutoff_token,
+                 @receive_timeout
+               )
+
+      assert Task.yield(waiter, 100) == nil
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 705)
+      assert :ok = Task.await(waiter, @receive_timeout)
+
+      # The unresolved later reservation remains queued and must not starve a
+      # waiter whose startup cut ended at the previous transaction.
+      assert :sys.get_state(consumer_pid).deferred_materializer_move_count == 1
+
+      # The coordinator is deliberately independent of the ReplicationClient
+      # process. Prove its owner monitor tears down the blocking worker and the
+      # Consumer's caller monitor removes the otherwise-bare GenServer waiter.
+      manager = spawn(fn -> receive do: (:stop -> :ok) end)
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          state =
+            ReplicationClient.State.new(
+              stack_id: ctx.stack_id,
+              connection_manager: manager,
+              handle_event: nil,
+              publication_name: "",
+              try_creating_publication?: false,
+              slot_name: ""
+            )
+
+          state = %{
+            state
+            | startup_wal_flush_lsn: 706,
+              received_wal: 706,
+              last_processed_causal_marker_lsn: 706
+          }
+
+          {:noreply, [_status_update], draining_state} =
+            ReplicationClient.handle_info({:flush_boundary_updated, 706}, state)
+
+          send(parent, {:causal_catch_up_owner, self(), draining_state.causal_catch_up_task})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      assert_receive {:causal_catch_up_owner, ^owner, {task_pid, _task_ref, 706}},
+                     @receive_timeout
+
+      assert :waiter_registered =
+               poll_until(@receive_timeout, fn ->
+                 if :sys.get_state(consumer_pid).causal_drain_waiters == [],
+                   do: :retry,
+                   else: {:ok, :waiter_registered}
+               end)
+
+      task_monitor = Process.monitor(task_pid)
+      owner_monitor = Process.monitor(owner)
+      Process.exit(owner, :kill)
+      assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :killed}, @receive_timeout
+      assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, _reason}, @receive_timeout
+
+      assert :waiter_removed =
+               poll_until(@receive_timeout, fn ->
+                 if :sys.get_state(consumer_pid).causal_drain_waiters == [],
+                   do: {:ok, :waiter_removed},
+                   else: :retry
+               end)
+
+      send(manager, :stop)
+    end
+
+    test "active move newer than cutoff compares its causal origin instead of local cursor",
+         ctx do
+      parent = self()
+
+      Repatch.patch(
+        Electric.Shapes.Consumer.Effects,
+        :query_move_in_async,
+        [mode: :shared],
+        fn _task_sup, _consumer_state, _buffering_state, consumer_pid ->
+          send(parent, {:query_requested, consumer_pid})
+          :ok
+        end
+      )
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      local_cursor = LogOffset.new(100, 2)
+      causal_origin = LogOffset.new(900, 4)
+
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{
+           move_in: [{1, "1"}],
+           move_out: [],
+           txids: [900],
+           lsn: local_cursor,
+           causal_origin: causal_origin,
+           causal_depth: 2
+         }}
+      )
+
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+
+      assert :move_open =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if state.move_transaction_open? and
+                      Map.get(state.pending_move_lsns, dep_handle) == local_cursor and
+                      state.pending_move_causal_origin == causal_origin do
+                   {:ok, :move_open}
+                 else
+                   :retry
+                 end
+               end)
+
+      waiter = Task.async(fn -> Consumer.await_causal_frontier(consumer_pid, 100) end)
+      assert {:ok, :ok} = Task.yield(waiter, 100)
+    end
+
+    test "active move at cutoff blocks by causal origin despite a newer local cursor", ctx do
+      parent = self()
+
+      Repatch.patch(
+        Electric.Shapes.Consumer.Effects,
+        :query_move_in_async,
+        [mode: :shared],
+        fn _task_sup, _consumer_state, _buffering_state, consumer_pid ->
+          send(parent, {:query_requested, consumer_pid})
+          :ok
+        end
+      )
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+      local_cursor = LogOffset.new(900, 4)
+      causal_origin = LogOffset.new(100, 2)
+
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{
+           move_in: [{1, "1"}],
+           move_out: [],
+           txids: [100],
+           lsn: local_cursor,
+           causal_origin: causal_origin,
+           causal_depth: 2
+         }}
+      )
+
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 100)
+
+      assert :move_open_at_frontier =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if state.move_transaction_open? and state.last_seen_global_lsn >= 100 and
+                      Map.get(state.pending_move_lsns, dep_handle) == local_cursor and
+                      state.pending_move_causal_origin == causal_origin do
+                   {:ok, :move_open_at_frontier}
+                 else
+                   :retry
+                 end
+               end)
+
+      waiter = Task.async(fn -> Consumer.await_causal_frontier(consumer_pid, 100) end)
+      assert Task.yield(waiter, 100) == nil
+
+      send(consumer_pid, {:pg_snapshot_known, {100, 101, []}})
+      send_stored_move_in_complete(consumer_pid, shape_storage, [], Lsn.from_integer(100))
+
+      assert :ok = Task.await(waiter, @receive_timeout)
+    end
+
+    test "same-transaction root replication runs before resolved causal work", ctx do
+      parent = self()
+
+      Repatch.patch(Materializer, :forward_causal_begin, [mode: :shared], fn _, _, _ -> :ok end)
+
+      Repatch.patch(Materializer, :forward_causal_end, [mode: :shared], fn _, _, _ ->
+        send(parent, {:causal_end_forwarding, self()})
+
+        receive do
+          :release_causal_end -> :ok
+        after
+          @receive_timeout * 5 -> raise "timed out waiting to release causal end"
+        end
+      end)
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery_or_value, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      changes_ref = Shapes.Consumer.register_for_changes(ctx.stack_id, shape_handle)
+
+      :sys.replace_state(consumer_pid, fn state ->
+        %{state | materializer_subscribed?: true}
+      end)
+
+      offset = LogOffset.new(706, 2)
+      token = Materializer.new_causal_token(offset)
+
+      assert :ok =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 token,
+                 offset,
+                 100
+               )
+
+      assert :ok =
+               Consumer.deliver_materializer_causal_end(
+                 consumer_pid,
+                 dep_handle,
+                 token,
+                 @receive_timeout
+               )
+
+      assert :sys.get_state(consumer_pid).deferred_materializer_move_count == 1
+
+      root_txn =
+        complete_txn_fragment(706, Lsn.from_integer(706), [
+          %Changes.NewRecord{
+            relation: {"public", "test_table"},
+            record: %{"id" => "706", "value" => "causal-root"},
+            key: ~s'"public"."test_table"/"706"',
+            log_offset: LogOffset.new(706, 0)
+          }
+        ])
+
+      assert :ok =
+               GenServer.call(
+                 consumer_pid,
+                 {:handle_event, root_txn,
+                  Electric.Telemetry.OpenTelemetry.get_current_context()},
+                 :infinity
+               )
+
+      # Both messages come from the Consumer. Their order proves that the root
+      # transaction committed before the same-transaction causal continuation.
+      assert_receive {^changes_ref, :new_changes, _offset}, @receive_timeout
+      assert_receive {:causal_end_forwarding, ^consumer_pid}, @receive_timeout
+      send(consumer_pid, :release_causal_end)
+
+      assert :drained =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if state.deferred_materializer_move_count == 0 and
+                      state.deferred_replication_event_count == 0 do
+                   {:ok, :drained}
+                 else
+                   :retry
+                 end
+               end)
+
+      state = :sys.get_state(consumer_pid)
+      assert state.last_processed_replication_tx_offset == 706
+      assert state.last_seen_global_lsn < 706
+    end
+
+    test "a queued later root transaction proves the earlier causal frontier", ctx do
+      parent = self()
+
+      Repatch.patch(Materializer, :forward_causal_begin, [mode: :shared], fn _, _, _ -> :ok end)
+
+      Repatch.patch(Materializer, :forward_causal_end, [mode: :shared], fn _, _, _ ->
+        send(parent, {:causal_end_forwarding, self()})
+
+        receive do
+          :release_causal_end -> :ok
+        after
+          @receive_timeout * 5 -> raise "timed out waiting to release causal end"
+        end
+      end)
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery_or_value, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      changes_ref = Shapes.Consumer.register_for_changes(ctx.stack_id, shape_handle)
+
+      :sys.replace_state(consumer_pid, fn state ->
+        %{state | materializer_subscribed?: true}
+      end)
+
+      causal_offset = LogOffset.new(707, 2)
+      token = Materializer.new_causal_token(causal_offset)
+
+      assert :ok =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 token,
+                 causal_offset,
+                 100
+               )
+
+      assert :ok =
+               Consumer.deliver_materializer_causal_end(
+                 consumer_pid,
+                 dep_handle,
+                 token,
+                 @receive_timeout
+               )
+
+      later_root_txn =
+        complete_txn_fragment(708, Lsn.from_integer(708), [
+          %Changes.NewRecord{
+            relation: {"public", "test_table"},
+            record: %{"id" => "708", "value" => "causal-root"},
+            key: ~s'"public"."test_table"/"708"',
+            log_offset: LogOffset.new(708, 0)
+          }
+        ])
+
+      assert :ok =
+               GenServer.call(
+                 consumer_pid,
+                 {:handle_event, later_root_txn,
+                  Electric.Telemetry.OpenTelemetry.get_current_context()},
+                 :infinity
+               )
+
+      # A later collector call cannot exist until tx 707 finished publishing.
+      # Process the earlier causal slot first so tx 708 is evaluated against the
+      # dependency view that tx 707 established.
+      assert_receive {:causal_end_forwarding, ^consumer_pid}, @receive_timeout
+      refute_receive {^changes_ref, :new_changes, _offset}, 100
+      send(consumer_pid, :release_causal_end)
+      assert_receive {^changes_ref, :new_changes, _offset}, @receive_timeout
+
+      assert :drained =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if state.deferred_materializer_move_count == 0 and
+                      state.deferred_replication_event_count == 0 do
+                   {:ok, :drained}
+                 else
+                   :retry
+                 end
+               end)
+    end
+
+    test "fragmented same-transaction root drains through commit before causal work", ctx do
+      parent = self()
+
+      Repatch.patch(Materializer, :forward_causal_begin, [mode: :shared], fn _, _, _ -> :ok end)
+
+      Repatch.patch(Materializer, :forward_causal_end, [mode: :shared], fn _, _, _ ->
+        send(parent, {:causal_end_forwarding, self()})
+
+        receive do
+          :release_causal_end -> :ok
+        after
+          @receive_timeout * 5 -> raise "timed out waiting to release causal end"
+        end
+      end)
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery_or_value, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      changes_ref = Shapes.Consumer.register_for_changes(ctx.stack_id, shape_handle)
+
+      :sys.replace_state(consumer_pid, fn state ->
+        %{state | materializer_subscribed?: true}
+      end)
+
+      offset = LogOffset.new(709, 4)
+      token = Materializer.new_causal_token(offset)
+
+      assert :ok =
+               Consumer.reserve_materializer_batch(
+                 consumer_pid,
+                 dep_handle,
+                 token,
+                 offset,
+                 100
+               )
+
+      assert :ok =
+               Consumer.deliver_materializer_causal_end(
+                 consumer_pid,
+                 dep_handle,
+                 token,
+                 @receive_timeout
+               )
+
+      first_fragment =
+        txn_fragment(
+          709,
+          709,
+          [
+            %Changes.NewRecord{
+              relation: {"public", "test_table"},
+              record: %{"id" => "709", "value" => "causal-root"},
+              key: ~s'"public"."test_table"/"709"',
+              log_offset: LogOffset.new(709, 0)
+            }
+          ],
+          has_begin?: true
+        )
+
+      commit_fragment = txn_fragment(709, 709, [], has_commit?: true)
+
+      assert :ok =
+               GenServer.call(
+                 consumer_pid,
+                 {:handle_event, first_fragment,
+                  Electric.Telemetry.OpenTelemetry.get_current_context()},
+                 :infinity
+               )
+
+      assert :fragment_buffered =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if not is_nil(state.pending_txn) and
+                      state.deferred_replication_event_count == 0 do
+                   {:ok, :fragment_buffered}
+                 else
+                   :retry
+                 end
+               end)
+
+      refute_receive {:causal_end_forwarding, ^consumer_pid}, 100
+
+      assert :ok =
+               GenServer.call(
+                 consumer_pid,
+                 {:handle_event, commit_fragment,
+                  Electric.Telemetry.OpenTelemetry.get_current_context()},
+                 :infinity
+               )
+
+      assert_receive {^changes_ref, :new_changes, _offset}, @receive_timeout
+      assert_receive {:causal_end_forwarding, ^consumer_pid}, @receive_timeout
+      send(consumer_pid, :release_causal_end)
+
+      assert :drained =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if is_nil(state.pending_txn) and
+                      state.deferred_materializer_move_count == 0 and
+                      state.deferred_replication_event_count == 0 do
+                   {:ok, :drained}
+                 else
+                   :retry
+                 end
+               end)
+    end
+
+    test "a pulled replay payload yields to a same-transaction root arriving afterwards", ctx do
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery_or_value, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      changes_ref = Shapes.Consumer.register_for_changes(ctx.stack_id, shape_handle)
+
+      replay_offset = LogOffset.new(720, 2)
+
+      patch_next_replay(consumer_pid, self(), [
+        {:ok, %{move_in: [], move_out: [], txids: [720], lsn: replay_offset}},
+        :done
+      ])
+
+      arm_materializer_replay(consumer_pid, ctx.stack_id, dep_handle)
+      send(consumer_pid, {:materializer_replay_ready, dep_handle})
+
+      assert_receive {:next_replay_called, 1}, @receive_timeout
+
+      assert :replay_waiting =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if state.deferred_materializer_move_count == 1,
+                   do: {:ok, :replay_waiting},
+                   else: :retry
+               end)
+
+      refute_receive {:next_replay_called, 2}, 100
+
+      root_txn =
+        complete_txn_fragment(720, Lsn.from_integer(720), [
+          %Changes.NewRecord{
+            relation: {"public", "test_table"},
+            record: %{"id" => "720", "value" => "causal-root"},
+            key: ~s'"public"."test_table"/"720"',
+            log_offset: LogOffset.new(720, 0)
+          }
+        ])
+
+      assert :ok =
+               GenServer.call(
+                 consumer_pid,
+                 {:handle_event, root_txn,
+                  Electric.Telemetry.OpenTelemetry.get_current_context()},
+                 :infinity
+               )
+
+      assert_receive {^changes_ref, :new_changes, _offset}, @receive_timeout
+      assert_receive {:next_replay_called, 2}, @receive_timeout
+    end
+
+    test "a same-transaction root already queued before replay pull still runs first", ctx do
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery_or_value, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      changes_ref = Shapes.Consumer.register_for_changes(ctx.stack_id, shape_handle)
+
+      replay_offset = LogOffset.new(721, 2)
+
+      patch_next_replay(consumer_pid, self(), [
+        {:ok, %{move_in: [], move_out: [], txids: [721], lsn: replay_offset}},
+        :done
+      ])
+
+      root_txn =
+        complete_txn_fragment(721, Lsn.from_integer(721), [
+          %Changes.NewRecord{
+            relation: {"public", "test_table"},
+            record: %{"id" => "721", "value" => "causal-root"},
+            key: ~s'"public"."test_table"/"721"',
+            log_offset: LogOffset.new(721, 0)
+          }
+        ])
+
+      root_bytes = :erlang.external_size(root_txn)
+      otel_ctx = Electric.Telemetry.OpenTelemetry.get_current_context()
+
+      :sys.replace_state(consumer_pid, fn state ->
+        materializer_pid = Materializer.whereis(ctx.stack_id, dep_handle)
+
+        %{
+          state
+          | pending_materializer_replays: :queue.from_list([{dep_handle, materializer_pid}]),
+            pending_materializer_replay_count: 1,
+            materializer_barrier_active?: true,
+            deferred_replication_events: :queue.from_list([{root_txn, otel_ctx, root_bytes}]),
+            deferred_replication_event_count: 1,
+            deferred_event_bytes: state.deferred_event_bytes + root_bytes
+        }
+      end)
+
+      send(consumer_pid, {:materializer_replay_ready, dep_handle})
+
+      assert_receive {:next_replay_called, 1}, @receive_timeout
+      assert_receive {^changes_ref, :new_changes, _offset}, @receive_timeout
+      assert_receive {:next_replay_called, 2}, @receive_timeout
+    end
+
+    test "a dependency-only replay waits for the collector global frontier", ctx do
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      replay_offset = LogOffset.new(722, 0)
+
+      patch_next_replay(consumer_pid, self(), [
+        {:ok, %{move_in: [], move_out: [], txids: [722], lsn: replay_offset}},
+        :done
+      ])
+
+      arm_materializer_replay(consumer_pid, ctx.stack_id, dep_handle)
+      send(consumer_pid, {:materializer_replay_ready, dep_handle})
+
+      assert_receive {:next_replay_called, 1}, @receive_timeout
+      refute_receive {:next_replay_called, 2}, 100
+
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 721)
+      refute_receive {:next_replay_called, 2}, 100
+
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 722)
+      assert_receive {:next_replay_called, 2}, @receive_timeout
+
+      assert :committed =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if state.pending_materializer_replay_count == 0 and
+                      Map.get(state.move_positions, dep_handle) == replay_offset do
+                   {:ok, :committed}
+                 else
+                   :retry
+                 end
+               end)
+    end
+
+    test "dependency replay gates on causal origin while committing its local cursor", ctx do
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+      local_replay_cursor = LogOffset.new(100, 2)
+      causal_origin = LogOffset.new(900, 4)
+
+      patch_next_replay(consumer_pid, self(), [
+        {:ok,
+         %{
+           move_in: [],
+           move_out: [],
+           txids: [900],
+           lsn: local_replay_cursor,
+           causal_origin: causal_origin,
+           causal_depth: 2
+         }},
+        :done
+      ])
+
+      arm_materializer_replay(consumer_pid, ctx.stack_id, dep_handle)
+      send(consumer_pid, {:materializer_replay_ready, dep_handle})
+
+      assert_receive {:next_replay_called, 1}, @receive_timeout
+      refute_receive {:next_replay_called, 2}, 100
+
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 899)
+      refute_receive {:next_replay_called, 2}, 100
+
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 900)
+      assert_receive {:next_replay_called, 2}, @receive_timeout
+
+      assert :committed =
+               poll_until(@receive_timeout, fn ->
+                 with {:ok, positions} <- Storage.fetch_move_positions(shape_storage),
+                      ^local_replay_cursor <- Map.get(positions, dep_handle),
+                      {:ok, 900} <- Storage.fetch_root_delivery_tx_offset(shape_storage) do
+                   {:ok, :committed}
+                 else
+                   _ -> :retry
+                 end
+               end)
+    end
+
+    test "pulls only one replay transaction until its move-in commit completes", ctx do
+      parent = self()
+
+      Repatch.patch(
+        Electric.Shapes.Consumer.Effects,
+        :query_move_in_async,
+        [mode: :shared],
+        fn _task_sup, _consumer_state, _buffering_state, consumer_pid ->
+          send(parent, {:query_requested, consumer_pid})
+          :ok
+        end
+      )
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+      replay_offset = LogOffset.new(723, 0)
+
+      patch_next_replay(consumer_pid, self(), [
+        {:ok, %{move_in: [{1, "1"}], move_out: [], txids: [723], lsn: replay_offset}},
+        :done
+      ])
+
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 723)
+      arm_materializer_replay(consumer_pid, ctx.stack_id, dep_handle)
+      send(consumer_pid, {:materializer_replay_ready, dep_handle})
+
+      assert_receive {:next_replay_called, 1}, @receive_timeout
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+      refute_receive {:next_replay_called, 2}, 100
+
+      send(consumer_pid, {:pg_snapshot_known, {723, 724, []}})
+      send_stored_move_in_complete(consumer_pid, shape_storage, [], Lsn.from_integer(723))
+
+      assert_receive {:next_replay_called, 2}, @receive_timeout
+
+      assert :committed =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if Map.get(state.move_positions, dep_handle) == replay_offset,
+                   do: {:ok, :committed},
+                   else: :retry
+               end)
+    end
+
+    test "replay queue overflow fails closed", ctx do
+      Electric.StackConfig.put(ctx.stack_id, :subquery_buffer_max_transactions, 0)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      consumer_ref = Process.monitor(consumer_pid)
+
+      patch_next_replay(consumer_pid, self(), [
+        {:ok, %{move_in: [], move_out: [], txids: [724], lsn: LogOffset.new(724, 0)}}
+      ])
+
+      arm_materializer_replay(consumer_pid, ctx.stack_id, dep_handle)
+      send(consumer_pid, {:materializer_replay_ready, dep_handle})
+
+      assert_receive {:next_replay_called, 1}, @receive_timeout
+
+      assert_receive {:DOWN, ^consumer_ref, :process, ^consumer_pid, {:shutdown, :cleanup}},
+                     @receive_timeout
+    end
+
+    test "replay byte overflow fails closed", ctx do
+      Electric.StackConfig.put(ctx.stack_id, :subquery_deferred_event_memory_limit_bytes, 1)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      consumer_ref = Process.monitor(consumer_pid)
+
+      patch_next_replay(consumer_pid, self(), [
+        {:ok,
+         %{
+           move_in: [],
+           move_out: [String.duplicate("overflow", 128)],
+           txids: [725],
+           lsn: LogOffset.new(725, 0)
+         }}
+      ])
+
+      arm_materializer_replay(consumer_pid, ctx.stack_id, dep_handle)
+      send(consumer_pid, {:materializer_replay_ready, dep_handle})
+
+      assert_receive {:next_replay_called, 1}, @receive_timeout
+
+      assert_receive {:DOWN, ^consumer_ref, :process, ^consumer_pid, {:shutdown, :cleanup}},
+                     @receive_timeout
+    end
+
+    test "move-in and causal frontier subscriptions release independently", ctx do
+      alias Electric.Shapes.Consumer.Effects
+      alias Electric.Shapes.Consumer.State
+
+      state = %State{stack_id: ctx.stack_id}
+      registry = Electric.StackSupervisor.registry_name(ctx.stack_id)
+
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 42)
+
+      state = Effects.acquire_global_lsn_subscription(state, :move_in)
+      assert_receive {:global_last_seen_lsn, 42}
+
+      state = Effects.acquire_global_lsn_subscription(state, :causal_barrier)
+      assert_receive {:global_last_seen_lsn, 42}
+
+      assert state.global_lsn_subscription_reasons == MapSet.new([:move_in, :causal_barrier])
+
+      assert Enum.any?(
+               Registry.lookup(registry, :global_lsn_updates),
+               &match?({pid, _} when pid == self(), &1)
+             )
+
+      state = Effects.release_global_lsn_subscription(state, :move_in)
+      assert state.global_lsn_subscription_reasons == MapSet.new([:causal_barrier])
+
+      assert Enum.any?(
+               Registry.lookup(registry, :global_lsn_updates),
+               &match?({pid, _} when pid == self(), &1)
+             )
+
+      state = Effects.release_global_lsn_subscription(state, :causal_barrier)
+      assert state.global_lsn_subscription_reasons == MapSet.new()
+
+      refute Enum.any?(
+               Registry.lookup(registry, :global_lsn_updates),
+               &match?({pid, _} when pid == self(), &1)
+             )
+    end
+
+    test "oversized root events behind a replay barrier invalidate instead of accumulating",
+         ctx do
+      Electric.StackConfig.put(ctx.stack_id, :subquery_deferred_event_memory_limit_bytes, 1)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+
+      :sys.replace_state(consumer_pid, fn state ->
+        %{state | materializer_barrier_active?: true}
+      end)
+
+      ref = Process.monitor(consumer_pid)
+
+      txn =
+        complete_txn_fragment(702, Lsn.from_integer(702), [
+          %Changes.NewRecord{
+            relation: {"public", "test_table"},
+            record: %{"id" => "702", "value" => String.duplicate("y", 1_024)},
+            log_offset: LogOffset.new(702, 0)
+          }
+        ])
+
+      assert :ok =
+               GenServer.call(
+                 consumer_pid,
+                 {:handle_event, txn, Electric.Telemetry.OpenTelemetry.get_current_context()}
+               )
+
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :cleanup}},
+                     @receive_timeout
+    end
+
+    test "restore invalidates an outer shape when a dependency cursor is missing", ctx do
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+
+      {:ok, positions} = Storage.fetch_move_positions(shape_storage)
+      assert map_size(positions) == 1
+      :ok = Storage.set_move_positions!(%{}, shape_storage)
+
+      old_ref = Process.monitor(consumer_pid)
+      assert :ok = Consumer.stop(consumer_pid, :shutdown)
+      assert_receive {:DOWN, ^old_ref, :process, ^consumer_pid, :shutdown}, @receive_timeout
+
+      expected_error = "Failed to start consumer for #{shape_handle}"
+
+      assert {:error, ^expected_error} =
+               ShapeCache.start_consumer_for_handle(shape_handle, ctx.stack_id)
+
+      # Restore waits for initialization, so the missing durable dependency
+      # cursor is reported synchronously and the invalid outer shape is already
+      # removed before the caller receives the error.
+      assert Support.TestUtils.wait_until(
+               fn -> is_nil(Consumer.whereis(ctx.stack_id, shape_handle)) end,
+               @receive_timeout
+             )
+
+      refute ShapeCache.has_shape?(shape_handle, ctx.stack_id)
+    end
+
+    test "restore accepts an ordinary shape without a root-delivery frontier", ctx do
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+
+      # The frontier proves how a subquery shape evaluated root transactions.
+      # An ordinary shape has no dependency-local view that could change across
+      # a restart, so it deliberately does not persist this record.
+      assert {:ok, nil} = Storage.fetch_root_delivery_tx_offset(shape_storage)
+
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      consumer_ref = Process.monitor(consumer_pid)
+
+      assert :ok = Consumer.stop(consumer_pid, :shutdown)
+      assert_receive {:DOWN, ^consumer_ref, :process, ^consumer_pid, :shutdown}, @receive_timeout
+      :ok = ConsumerRegistry.remove_consumer(shape_handle, ctx.stack_id)
+
+      assert {:ok, restored_pid} =
+               ShapeCache.start_consumer_for_handle(shape_handle, ctx.stack_id)
+
+      assert is_pid(restored_pid)
+      assert Process.alive?(restored_pid)
+      assert restored_pid != consumer_pid
+      assert ShapeCache.has_shape?(shape_handle, ctx.stack_id)
+    end
+
+    test "materializer shutdown lazily restores a nested chain and keeps dependency flow live",
+         ctx do
+      test_pid = self()
+
+      Repatch.patch(
+        Electric.Shapes.Consumer.Effects,
+        :query_move_in_async,
+        [mode: :shared],
+        fn _task_sup, _consumer_state, _buffering_state, consumer_pid ->
+          send(test_pid, {:query_requested, consumer_pid})
+          :ok
+        end
+      )
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {outer_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_nested_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(outer_handle, ctx.stack_id)
+      {:ok, outer_shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, outer_handle)
+      [middle_handle] = outer_shape.shape_dependencies_handles
+      {:ok, middle_shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, middle_handle)
+      [leaf_handle] = middle_shape.shape_dependencies_handles
+
+      outer_consumer_pid = Consumer.whereis(ctx.stack_id, outer_handle)
+      middle_consumer_pid = Consumer.whereis(ctx.stack_id, middle_handle)
+      leaf_consumer_pid = Consumer.whereis(ctx.stack_id, leaf_handle)
+
+      assert Enum.all?(
+               [outer_consumer_pid, middle_consumer_pid, leaf_consumer_pid],
+               &is_pid/1
+             )
+
+      outer_storage = Storage.for_shape(outer_handle, ctx.storage)
+      middle_storage = Storage.for_shape(middle_handle, ctx.storage)
+      seed_ref = Shapes.Consumer.register_for_changes(ctx.stack_id, outer_handle)
+      seed_lsn = Lsn.from_integer(100)
+
+      # Seed the entire chain through the real leaf materializer. The move-in
+      # query results are supplied deterministically because this unit harness
+      # intentionally has no database pool.
+      assert :ok =
+               ShapeLogCollector.handle_event(
+                 complete_txn_fragment(100, seed_lsn, [
+                   %Changes.NewRecord{
+                     relation: {"public", "something else"},
+                     record: %{"id" => "1", "value" => "visible"},
+                     log_offset: LogOffset.new(seed_lsn, 0)
+                   }
+                 ]),
+                 ctx.stack_id
+               )
+
+      assert_receive {:query_requested, ^middle_consumer_pid}, @receive_timeout * 5
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 100)
+      send(middle_consumer_pid, {:pg_snapshot_known, {100, 101, []}})
+
+      middle_tag =
+        Electric.Shapes.SubqueryTags.make_value_hash(ctx.stack_id, middle_handle, "1")
+
+      send_stored_move_in_complete(
+        middle_consumer_pid,
+        middle_storage,
+        [
+          [
+            ~s'"public"."other_table"/"1"',
+            [middle_tag],
+            Jason.encode!(%{
+              "key" => ~s'"public"."other_table"/"1"',
+              "value" => %{"id" => "1", "value" => "middle"},
+              "headers" => %{
+                "operation" => "insert",
+                "relation" => ["public", "other_table"],
+                "tags" => [middle_tag],
+                "active_conditions" => [true]
+              }
+            })
+          ]
+        ],
+        seed_lsn
+      )
+
+      assert_receive {:query_requested, ^outer_consumer_pid}, @receive_timeout * 5
+      send(outer_consumer_pid, {:pg_snapshot_known, {100, 101, []}})
+
+      outer_tag = Electric.Shapes.SubqueryTags.make_value_hash(ctx.stack_id, outer_handle, "1")
+
+      send_stored_move_in_complete(
+        outer_consumer_pid,
+        outer_storage,
+        [
+          [
+            ~s'"public"."test_table"/"1"',
+            [outer_tag],
+            Jason.encode!(%{
+              "key" => ~s'"public"."test_table"/"1"',
+              "value" => %{"id" => "1", "value" => "outer"},
+              "headers" => %{
+                "operation" => "insert",
+                "relation" => ["public", "test_table"],
+                "tags" => [outer_tag],
+                "active_conditions" => [true]
+              }
+            })
+          ]
+        ],
+        seed_lsn
+      )
+
+      assert_receive {^seed_ref, :new_changes, _offset}, @receive_timeout * 5
+
+      assert :seed_drained =
+               poll_until(@receive_timeout * 5, fn ->
+                 if Enum.all?([middle_consumer_pid, outer_consumer_pid], fn pid ->
+                      state = :sys.get_state(pid)
+
+                      not state.move_transaction_open? and
+                        state.deferred_materializer_move_count == 0
+                    end) do
+                   {:ok, :seed_drained}
+                 else
+                   :retry
+                 end
+               end)
+
+      {:ok, before_dependency_delete} = Storage.fetch_latest_offset(outer_storage)
+      leaf_materializer_pid = Materializer.whereis(ctx.stack_id, leaf_handle)
+      middle_materializer_pid = Materializer.whereis(ctx.stack_id, middle_handle)
+
+      assert is_pid(leaf_materializer_pid)
+      assert is_pid(middle_materializer_pid)
+
+      old_consumers = %{
+        outer_handle => outer_consumer_pid,
+        middle_handle => middle_consumer_pid,
+        leaf_handle => leaf_consumer_pid
+      }
+
+      consumer_refs =
+        Map.new(old_consumers, fn {handle, pid} -> {handle, {pid, Process.monitor(pid)}} end)
+
+      # The explicit tuple shutdown exercises that materializer-DOWN clause.
+      # The middle materializer then exits with plain :shutdown when its source
+      # consumer suspends, exercising the second clause on the outer consumer.
+      assert :ok =
+               GenServer.stop(leaf_materializer_pid, {:shutdown, :dependency_restart})
+
+      suspend_reason = Electric.ShapeCache.ShapeCleaner.consumer_suspend_reason()
+
+      Enum.each(consumer_refs, fn {_handle, {pid, ref}} ->
+        assert_receive {:DOWN, ^ref, :process, ^pid, ^suspend_reason}, @receive_timeout * 5
+      end)
+
+      for handle <- [leaf_handle, middle_handle, outer_handle] do
+        assert ShapeCache.has_shape?(handle, ctx.stack_id)
+        assert is_nil(ConsumerRegistry.whereis(ctx.stack_id, handle))
+      end
+
+      assert {:ok, restored_outer_pid} =
+               ShapeCache.start_consumer_for_handle(outer_handle, ctx.stack_id)
+
+      assert :started = ShapeCache.await_snapshot_start(outer_handle, ctx.stack_id)
+      assert restored_outer_pid != outer_consumer_pid
+
+      for handle <- [leaf_handle, middle_handle, outer_handle] do
+        restored_pid = Consumer.whereis(ctx.stack_id, handle)
+        assert is_pid(restored_pid)
+        assert Process.alive?(restored_pid)
+        assert restored_pid != Map.fetch!(old_consumers, handle)
+      end
+
+      restored_leaf_materializer_pid = Materializer.whereis(ctx.stack_id, leaf_handle)
+      restored_middle_materializer_pid = Materializer.whereis(ctx.stack_id, middle_handle)
+
+      assert is_pid(restored_leaf_materializer_pid)
+      assert restored_leaf_materializer_pid != leaf_materializer_pid
+      assert is_pid(restored_middle_materializer_pid)
+      assert restored_middle_materializer_pid != middle_materializer_pid
+
+      # Only the leaf table changes after restoration. Its move-out must cross
+      # both restored materializers and reach the outer shape under the same
+      # persisted handle.
+      restored_ref = Shapes.Consumer.register_for_changes(ctx.stack_id, outer_handle)
+      delete_lsn = Lsn.from_integer(101)
+
+      assert :ok =
+               ShapeLogCollector.handle_event(
+                 complete_txn_fragment(101, delete_lsn, [
+                   %Changes.DeletedRecord{
+                     relation: {"public", "something else"},
+                     old_record: %{"id" => "1", "value" => "visible"},
+                     log_offset: LogOffset.new(delete_lsn, 0)
+                   }
+                 ]),
+                 ctx.stack_id
+               )
+
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 101)
+      assert_receive {^restored_ref, :new_changes, _offset}, @receive_timeout * 5
+
+      assert :dependency_move_reached_outer =
+               poll_until(@receive_timeout * 5, fn ->
+                 before_dependency_delete
+                 |> Storage.get_log_stream(outer_storage)
+                 |> Enum.map(&Jason.decode!/1)
+                 |> Enum.any?(fn
+                   %{"headers" => %{"event" => "move-out", "patterns" => patterns}} ->
+                     patterns != []
+
+                   _ ->
+                     false
+                 end)
+                 |> case do
+                   true -> {:ok, :dependency_move_reached_outer}
+                   false -> :retry
+                 end
+               end)
+    end
+
     test "consumer advances and persists the per-dependency moves-position on move application",
          ctx do
       parent = self()
@@ -2647,21 +5815,63 @@ defmodule Electric.Shapes.ConsumerTest do
       ref = Shapes.Consumer.register_for_changes(ctx.stack_id, shape_handle)
       shape_storage = Storage.for_shape(shape_handle, ctx.storage)
 
-      move_lsn = LogOffset.new(777, 0)
+      first_move_lsn = LogOffset.new(777, 0)
+      final_move_lsn = LogOffset.new(778, 0)
 
       assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 100)
 
       send(
         consumer_pid,
-        {:materializer_changes, dep_handle, %{move_in: [{1, "1"}], move_out: [], lsn: move_lsn}}
+        {:materializer_changes, dep_handle,
+         %{move_in: [{1, "1"}], move_out: [], lsn: first_move_lsn}}
       )
 
-      assert_receive {:query_requested, ^consumer_pid}
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
+      assert :sys.get_state(consumer_pid).move_transaction_open?
+      refute_receive {^ref, :new_changes, _offset}, 100
+
+      # Queue another payload while the first asynchronous query is in flight.
+      # Payloads are serialized so each gets a bounded atomic transaction and a
+      # publication boundary; sustained traffic cannot keep one transaction
+      # open forever.
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle,
+         %{move_in: [{2, "2"}], move_out: [], lsn: final_move_lsn}}
+      )
+
+      assert :sys.get_state(consumer_pid).deferred_materializer_move_count == 1
+
+      # A root-table transaction arriving after the second dependency payload
+      # must not be evaluated against the first payload's older dependency
+      # view. The synchronous collector call is acknowledged, but the event is
+      # held behind the dependency barrier until both moves commit.
+      root_txn =
+        complete_txn_fragment(779, Lsn.from_integer(779), [
+          %Changes.NewRecord{
+            relation: {"public", "test_table"},
+            record: %{"id" => "99", "value" => "after-dependency"},
+            log_offset: LogOffset.new(Lsn.from_integer(779), 0)
+          }
+        ])
+
+      assert :ok =
+               GenServer.call(
+                 consumer_pid,
+                 {:handle_event, root_txn,
+                  Electric.Telemetry.OpenTelemetry.get_current_context()},
+                 :infinity
+               )
+
+      barrier_state = :sys.get_state(consumer_pid)
+      assert barrier_state.materializer_barrier_active?
+      assert barrier_state.move_transaction_open?
+      assert barrier_state.deferred_replication_event_count == 1
 
       # While the move-in is still buffering the position has NOT advanced to the
       # move's LSN — it must only advance once the move is applied.
       {:ok, buffering_positions} = Storage.fetch_move_positions(shape_storage)
-      refute Map.get(buffering_positions, dep_handle) == move_lsn
+      refute Map.get(buffering_positions, dep_handle) in [first_move_lsn, final_move_lsn]
 
       send(consumer_pid, {:pg_snapshot_known, {100, 300, []}})
 
@@ -2682,23 +5892,105 @@ defmodule Electric.Shapes.ConsumerTest do
         Lsn.from_integer(100)
       )
 
-      assert_receive {^ref, :new_changes, _offset}, @receive_timeout
+      assert_receive {^ref, :new_changes, _offset}, @receive_timeout * 5
+      assert_receive {:query_requested, ^consumer_pid}, @receive_timeout
 
-      # The splice has been applied to the writer buffer, but the moves-position
-      # is only *staged* — it must not be persisted ahead of a durable flush, or
-      # a restart could leave it pointing past storage. So until the writer
-      # confirms the flush, the persisted position has not advanced.
-      {:ok, staged_positions} = Storage.fetch_move_positions(shape_storage)
-      refute Map.get(staged_positions, dep_handle) == move_lsn
+      {:ok, first_applied_positions} = Storage.fetch_move_positions(shape_storage)
+      assert Map.get(first_applied_positions, dep_handle) == first_move_lsn
 
-      # Once the writer confirms a flush at/after the move's splice, the
-      # per-dependency moves-position is advanced to the move's source LSN and
-      # persisted to storage.
-      send(consumer_pid, {Storage, :flushed, LogOffset.new(1_000_000_000, 0)})
-      :sys.get_state(consumer_pid)
+      {:ok, first_move_boundary} = Storage.fetch_latest_offset(shape_storage)
 
+      {_offset, marker} =
+        Storage.get_log_stream_with_offsets(
+          LogOffset.last_before_real_offsets(),
+          first_move_boundary,
+          shape_storage
+        )
+        |> Enum.to_list()
+        |> List.last()
+
+      assert %{
+               "headers" => %{
+                 "event" => "move-out",
+                 "patterns" => [],
+                 "txids" => [],
+                 "last" => true
+               }
+             } = Jason.decode!(marker)
+
+      state_between_splices = :sys.get_state(consumer_pid)
+      assert state_between_splices.move_transaction_open?
+      assert state_between_splices.deferred_materializer_move_count == 0
+      assert state_between_splices.materializer_barrier_active?
+      assert state_between_splices.deferred_replication_event_count == 0
+
+      # The root transaction can leave the Consumer-level queue only after the
+      # second dependency move is active. Buffering it in that move proves it
+      # will be classified against the post-778 dependency view, not the older
+      # post-777 view.
+      assert %Electric.Shapes.Consumer.EventHandler.Subqueries.Buffering{
+               active_move: %{
+                 values: [{2, "2"}],
+                 buffered_txn_count: 1,
+                 buffered_txns: [%Changes.Transaction{xid: 779}]
+               }
+             } = state_between_splices.event_handler
+
+      test_pid = self()
+
+      subscription_task =
+        Task.async(fn ->
+          Consumer.subscribe_materializer(ctx.stack_id, shape_handle, test_pid)
+        end)
+
+      # Subscription cannot expose the partially spliced second move. It stays
+      # pending while the Consumer remains free to receive query completion.
+      assert Task.yield(subscription_task, 50) == nil
+
+      send(consumer_pid, {:pg_snapshot_known, {100, 300, []}})
+
+      send_stored_move_in_complete(
+        consumer_pid,
+        shape_storage,
+        [
+          [
+            ~s'"public"."test_table"/"2"',
+            [],
+            Jason.encode!(%{
+              "key" => ~s'"public"."test_table"/"2"',
+              "value" => %{"id" => "2", "value" => "second"},
+              "headers" => %{"operation" => "insert", "relation" => ["public", "test_table"]}
+            })
+          ]
+        ],
+        Lsn.from_integer(100)
+      )
+
+      assert_receive {^ref, :new_changes, _offset}, @receive_timeout * 5
+      refute :sys.get_state(consumer_pid).move_transaction_open?
+
+      assert {:ok, {:ok, published_offset}} =
+               Task.yield(subscription_task, @receive_timeout)
+
+      assert published_offset == :sys.get_state(consumer_pid).latest_offset
+
+      assert :drained =
+               poll_until(@receive_timeout, fn ->
+                 state = :sys.get_state(consumer_pid)
+
+                 if not state.materializer_barrier_active? and
+                      state.deferred_replication_event_count == 0 do
+                   {:ok, :drained}
+                 else
+                   :retry
+                 end
+               end)
+
+      # Draining the pipeline commits the splice boundary and dependency cursor
+      # together. There is no post-flush mailbox window where data is durable
+      # while the cursor still points behind it.
       {:ok, applied_positions} = Storage.fetch_move_positions(shape_storage)
-      assert Map.get(applied_positions, dep_handle) == move_lsn
+      assert Map.get(applied_positions, dep_handle) == final_move_lsn
     end
 
     test "consumer startup seeds the stack-scoped subquery index", ctx do
@@ -2773,7 +6065,7 @@ defmodule Electric.Shapes.ConsumerTest do
       )
 
       # Wait for the consumer to process the event and request a move_in query
-      assert_receive {:query_requested, consumer_pid}
+      assert_receive {:query_requested, consumer_pid}, @receive_timeout
 
       # During buffering, the value should have been added to the index
       # (union for positive dependency: before ∪ after)
@@ -3275,5 +6567,189 @@ defmodule Electric.Shapes.ConsumerTest do
       consumer_pid,
       {:query_move_in_complete, snapshot_name, length(rows), row_bytes, lsn}
     )
+  end
+
+  defp assert_replay_sequence_precedes_live(shape, replay_offsets, live_offset, ctx) do
+    consumer_pid =
+      prepare_replay_and_live_dependency(shape, replay_offsets, live_offset, ctx)
+
+    Enum.each(1..(length(replay_offsets) + 1), fn call ->
+      assert next_scheduler_event(consumer_pid) == {:next_replay, call}
+    end)
+
+    assert next_scheduler_event(consumer_pid) == :live_dependency
+  end
+
+  defp assert_replay_sequence_follows_live(shape, replay_offset, live_offset, ctx) do
+    consumer_pid =
+      prepare_replay_and_live_dependency(shape, [replay_offset], live_offset, ctx)
+
+    assert next_scheduler_event(consumer_pid) == {:next_replay, 1}
+    assert next_scheduler_event(consumer_pid) == :live_dependency
+    assert next_scheduler_event(consumer_pid) == {:next_replay, 2}
+  end
+
+  defp prepare_replay_and_live_dependency(shape, replay_offsets, live_offset, ctx) do
+    replay_replies =
+      Enum.map(replay_offsets, fn %LogOffset{tx_offset: tx_offset} = offset ->
+        {:ok, %{move_in: [], move_out: [], txids: [tx_offset], lsn: offset}}
+      end) ++ [:done]
+
+    {consumer_pid, _replay_dep} =
+      setup_replay_and_live_dependency(
+        shape,
+        replay_offsets,
+        replay_replies,
+        live_offset,
+        ctx
+      )
+
+    consumer_pid
+  end
+
+  defp assert_pending_replay_order(shape, replay_offset, live_offset, expected_order, ctx) do
+    replay_payload =
+      {:ok,
+       %{
+         move_in: [],
+         move_out: [],
+         txids: [replay_offset.tx_offset],
+         lsn: replay_offset
+       }}
+
+    {consumer_pid, replay_dep} =
+      setup_replay_and_live_dependency(
+        shape,
+        [replay_offset],
+        [:pending, replay_payload, :done],
+        live_offset,
+        ctx
+      )
+
+    assert next_scheduler_event(consumer_pid) == {:next_replay, 1}
+    refute_receive {:scheduler_live_dependency_processed, ^consumer_pid}, 100
+
+    waiting_state = :sys.get_state(consumer_pid)
+    assert waiting_state.materializer_replay_waiting?
+    assert waiting_state.deferred_materializer_move_count == 1
+    refute :queue.is_empty(waiting_state.deferred_materializer_moves)
+
+    send(consumer_pid, {:materializer_replay_ready, replay_dep})
+    assert next_scheduler_event(consumer_pid) == {:next_replay, 2}
+
+    case expected_order do
+      :replay_first ->
+        assert next_scheduler_event(consumer_pid) == {:next_replay, 3}
+        assert next_scheduler_event(consumer_pid) == :live_dependency
+
+      :live_first ->
+        assert next_scheduler_event(consumer_pid) == :live_dependency
+        assert next_scheduler_event(consumer_pid) == {:next_replay, 3}
+    end
+  end
+
+  defp setup_replay_and_live_dependency(
+         shape,
+         replay_offsets,
+         replay_replies,
+         live_offset,
+         ctx
+       ) do
+    test_pid = self()
+
+    Repatch.patch(Materializer, :forward_causal_begin, [mode: :shared], fn _, _, _ -> :ok end)
+
+    Repatch.patch(Materializer, :forward_causal_end, [mode: :shared], fn _, _, _ ->
+      send(test_pid, {:scheduler_live_dependency_processed, self()})
+      :ok
+    end)
+
+    {shape_handle, _} = ShapeCache.get_or_create_shape_handle(shape, ctx.stack_id)
+    :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+    {:ok, persisted_shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+    [replay_dep, live_dep] = persisted_shape.shape_dependencies_handles
+    consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+
+    patch_next_replay(consumer_pid, test_pid, replay_replies)
+
+    frontier =
+      [live_offset | replay_offsets]
+      |> Enum.map(& &1.tx_offset)
+      |> Enum.max()
+
+    arm_materializer_replay(consumer_pid, ctx.stack_id, replay_dep)
+
+    :sys.replace_state(consumer_pid, fn state ->
+      %{
+        state
+        | materializer_subscribed?: true,
+          last_seen_global_lsn: frontier
+      }
+    end)
+
+    live_token = Materializer.new_causal_token(live_offset)
+
+    assert :ok =
+             Consumer.reserve_materializer_batch(
+               consumer_pid,
+               live_dep,
+               live_token,
+               live_offset,
+               100
+             )
+
+    assert :ok =
+             Consumer.deliver_materializer_causal_end(
+               consumer_pid,
+               live_dep,
+               live_token,
+               @receive_timeout
+             )
+
+    {consumer_pid, replay_dep}
+  end
+
+  defp next_scheduler_event(consumer_pid) do
+    receive do
+      {:next_replay_called, call} ->
+        {:next_replay, call}
+
+      {:scheduler_live_dependency_processed, ^consumer_pid} ->
+        :live_dependency
+    after
+      @receive_timeout ->
+        flunk("timed out waiting for replay/live scheduler event")
+    end
+  end
+
+  defp patch_next_replay(consumer_pid, test_pid, replies) do
+    calls = :atomics.new(1, [])
+
+    Repatch.patch(Materializer, :next_replay, [mode: :shared], fn _materializer, ^consumer_pid ->
+      call = :atomics.add_get(calls, 1, 1)
+      send(test_pid, {:next_replay_called, call})
+
+      case Enum.fetch(replies, call - 1) do
+        {:ok, reply} -> reply
+        :error -> raise "unexpected Materializer.next_replay/2 call #{call}"
+      end
+    end)
+
+    Repatch.allow(self(), consumer_pid)
+    calls
+  end
+
+  defp arm_materializer_replay(consumer_pid, stack_id, dep_handle) do
+    materializer_pid = Materializer.whereis(stack_id, dep_handle)
+    assert is_pid(materializer_pid)
+
+    :sys.replace_state(consumer_pid, fn state ->
+      %{
+        state
+        | pending_materializer_replays: :queue.from_list([{dep_handle, materializer_pid}]),
+          pending_materializer_replay_count: 1,
+          materializer_barrier_active?: true
+      }
+    end)
   end
 end

@@ -14,6 +14,24 @@ defmodule Electric.Connection.ConnectionManagerTest do
 
   @moduletag :tmp_dir
 
+  def acknowledge_event_async(event) do
+    ref = make_ref()
+    send(self(), {ref, :ok})
+
+    case event do
+      %Electric.Replication.Changes.TransactionFragment{
+        lsn: lsn,
+        commit: %Electric.Replication.Changes.Commit{}
+      } ->
+        send(self(), {:flush_boundary_updated, Electric.Postgres.Lsn.to_integer(lsn)})
+
+      _event ->
+        :ok
+    end
+
+    ref
+  end
+
   setup [
     :with_unique_db,
     :with_stack_id_from_test,
@@ -39,7 +57,7 @@ defmodule Electric.Connection.ConnectionManagerTest do
       publication_name: publication_name,
       try_creating_publication?: true,
       slot_temporary?: Map.get(ctx, :slot_temporary?, true),
-      handle_event: nil
+      handle_event: {ShapeLogCollector, :handle_event_async, [stack_id]}
     ]
 
     connection_manager_opts = [
@@ -292,6 +310,60 @@ defmodule Electric.Connection.ConnectionManagerTest do
 
       status = StatusMonitor.status(stack_id)
       assert status.shape == :read_only
+    end
+  end
+
+  describe "replication readiness split" do
+    test "ready-to-stream advances bootstrap without publishing external readiness", %{
+      stack_id: stack_id
+    } do
+      test_pid = self()
+
+      Repatch.patch(StatusMonitor, :mark_replication_client_ready, [mode: :shared], fn _, _ ->
+        send(test_pid, :replication_ready)
+        :ok
+      end)
+
+      state = %Connection.Manager.State{
+        current_phase: :connection_setup,
+        current_step: {:start_replication_client, :configuring_connection},
+        stack_id: stack_id,
+        replication_client_pid: self()
+      }
+
+      assert {:noreply, bootstrapping_state, {:continue, :start_snapshot_pool}} =
+               Connection.Manager.handle_cast(:replication_client_ready_to_stream, state)
+
+      assert bootstrapping_state.current_step == {:start_snapshot_pool, nil}
+      refute_receive :replication_ready
+
+      assert {:noreply, ^bootstrapping_state} =
+               Connection.Manager.handle_cast(
+                 {:replication_client_caught_up, self()},
+                 bootstrapping_state
+               )
+
+      assert_receive :replication_ready
+    end
+
+    test "ignores a catch-up signal from a replaced replication client", %{
+      stack_id: stack_id
+    } do
+      stale_client = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(stale_client, :kill) end)
+
+      state = %Connection.Manager.State{
+        current_phase: :running,
+        current_step: :streaming,
+        stack_id: stack_id,
+        replication_client_pid: self()
+      }
+
+      assert {:noreply, ^state} =
+               Connection.Manager.handle_cast(
+                 {:replication_client_caught_up, stale_client},
+                 state
+               )
     end
   end
 
@@ -613,12 +685,18 @@ defmodule Electric.Connection.ConnectionManagerTest do
       send(manager_pid, {:timeout, tref, {:check_status, :replication_lock}})
 
       # The lock breaker should terminate the stuck backend, freeing the lock.
-      # The lock breaker should terminate the stuck backend, freeing the lock.
       # The replication client should then acquire the lock and proceed.
       assert_receive {:stack_status, _, :connection_lock_acquired}, 5000
     end
 
     test "does not break the lock when slot is active", ctx do
+      start_supervised!(
+        {Task.Supervisor,
+         name: Electric.ProcessRegistry.name(ctx.stack_id, Electric.StackTaskSupervisor)}
+      )
+
+      Electric.Shapes.ConsumerRegistry.registry_table(ctx.stack_id)
+
       # Start a replication client that acquires the lock and makes the slot active.
       # This simulates a healthy Electric instance holding the lock.
       {:ok, replication_client_pid} =
@@ -631,7 +709,7 @@ defmodule Electric.Connection.ConnectionManagerTest do
              publication_name: "test_pub_#{:erlang.phash2(ctx.stack_id)}",
              try_creating_publication?: true,
              slot_name: ctx.slot_name,
-             handle_event: nil,
+             handle_event: {__MODULE__, :acknowledge_event_async, []},
              connection_manager: self()
            ]}
         )

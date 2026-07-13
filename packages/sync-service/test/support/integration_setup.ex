@@ -19,6 +19,7 @@ defmodule Support.IntegrationSetup do
 
     router_opts = build_router_opts(ctx, Keyword.get(opts, :router_opts, []))
     num_clients = Keyword.get(opts, :num_clients, 1)
+    fetch_timeout = Keyword.get(opts, :fetch_timeout)
 
     {:ok, server_pid} =
       ExUnit.Callbacks.start_supervised(
@@ -32,7 +33,7 @@ defmodule Support.IntegrationSetup do
     {:ok, {_ip, port}} = ThousandIsland.listener_info(server_pid)
     base_url = "http://localhost:#{port}"
 
-    client_opts =
+    fetch_opts =
       if num_clients > 1 do
         finch_name = :"Electric.Client.Finch.Test.#{System.unique_integer([:positive])}"
 
@@ -41,10 +42,18 @@ defmodule Support.IntegrationSetup do
             {Finch, name: finch_name, pools: %{default: [size: num_clients]}}
           )
 
-        [fetch: {Electric.Client.Fetch.HTTP, [request: [finch: finch_name]]}]
+        [request: [finch: finch_name]]
       else
         []
       end
+
+    fetch_opts =
+      if is_nil(fetch_timeout),
+        do: fetch_opts,
+        else: Keyword.put(fetch_opts, :timeout, fetch_timeout)
+
+    client_opts =
+      if fetch_opts == [], do: [], else: [fetch: {Electric.Client.Fetch.HTTP, fetch_opts}]
 
     {:ok, client} = Electric.Client.new([base_url: base_url] ++ client_opts)
 

@@ -5,17 +5,20 @@ defmodule Electric.Postgres.ReplicationClient do
   use Electric.Postgres.ReplicationConnection
 
   alias Electric.Postgres.LogicalReplication.Decoder
+  alias Electric.Postgres.LogicalReplication.Messages, as: LR
   alias Electric.Postgres.Lsn
-  alias Electric.LsnTracker
+  alias Electric.Postgres.CausalMarker
   alias Electric.Postgres.ReplicationClient.MessageConverter
   alias Electric.Postgres.ReplicationClient.ConnectionSetup
+  alias Electric.Replication.ShapeLogCollector
   alias Electric.Replication.Changes.TransactionFragment
   alias Electric.Replication.Changes.Relation
+  alias Electric.Shapes.Consumer
+  alias Electric.Shapes.ConsumerRegistry
   alias Electric.Telemetry.OpenTelemetry
   alias Electric.Telemetry.Sampler
 
   require Logger
-  require MessageConverter
 
   @type step ::
           :disconnected
@@ -30,6 +33,7 @@ defmodule Electric.Postgres.ReplicationClient do
           | :query_slot_flushed_lsn
           | :set_display_setting
           | :ready_to_stream
+          | :refresh_wal_target
           | :start_streaming
           | :streaming
 
@@ -53,8 +57,18 @@ defmodule Electric.Postgres.ReplicationClient do
       :replication_idle_timeout,
       wal_sender_timeout: 60_000,
       step: :disconnected,
-      wait_for_active_ref: nil,
+      event_retry_wait: nil,
+      connection_retry_deadline: nil,
+      shape_log_collector_processing_pid: nil,
       pending_event: nil,
+      startup_wal_flush_lsn: nil,
+      pending_causal_marker_lsn: nil,
+      pending_causal_marker_xid: nil,
+      event_causal_marker_lsn: nil,
+      event_causal_marker_xid: nil,
+      last_processed_causal_marker_lsn: 0,
+      replication_caught_up?: false,
+      causal_catch_up_task: nil,
       received_wal: 0,
       flushed_wal: 0,
       last_seen_txn_lsn: Lsn.from_integer(0),
@@ -79,8 +93,18 @@ defmodule Electric.Postgres.ReplicationClient do
             replication_idle_timeout: non_neg_integer(),
             wal_sender_timeout: non_neg_integer(),
             step: Electric.Postgres.ReplicationClient.step(),
-            wait_for_active_ref: {reference(), term()} | nil,
+            event_retry_wait: {:collector_processing, term()} | nil,
+            connection_retry_deadline: integer() | nil,
+            shape_log_collector_processing_pid: pid() | nil,
             pending_event: {reference(), term(), non_neg_integer(), integer()} | nil,
+            startup_wal_flush_lsn: non_neg_integer() | nil,
+            pending_causal_marker_lsn: non_neg_integer() | nil,
+            pending_causal_marker_xid: non_neg_integer() | nil,
+            event_causal_marker_lsn: non_neg_integer() | nil,
+            event_causal_marker_xid: non_neg_integer() | nil,
+            last_processed_causal_marker_lsn: non_neg_integer(),
+            replication_caught_up?: boolean(),
+            causal_catch_up_task: {pid(), reference(), non_neg_integer()} | nil,
             received_wal: non_neg_integer(),
             flushed_wal: non_neg_integer(),
             last_seen_txn_lsn: Lsn.t(),
@@ -152,6 +176,8 @@ defmodule Electric.Postgres.ReplicationClient do
   # Delay before retrying a failed event dispatch.
   @event_retry_delay 50
 
+  @max_logical_message_bytes 1_024
+
   # Maximum time to spend retrying a crashed event handler before giving up.
   @max_event_retry_time 10 * 60_000
 
@@ -181,11 +207,68 @@ defmodule Electric.Postgres.ReplicationClient do
     Electric.ProcessRegistry.name(stack_id, __MODULE__)
   end
 
+  @doc false
+  @spec notify_shape_log_collector_processing_started(String.t(), pid()) :: :ok
+  def notify_shape_log_collector_processing_started(stack_id, collector_pid)
+      when is_pid(collector_pid) do
+    case GenServer.whereis(name(stack_id)) do
+      nil -> :ok
+      pid -> send(pid, {__MODULE__, :shape_log_collector_processing_started, collector_pid})
+    end
+
+    :ok
+  rescue
+    ArgumentError ->
+      # A missing per-stack registry means the notification cannot be routed
+      # reliably. Crash the announcing collector so supervision retries the
+      # whole startup edge instead of silently losing the only wakeup.
+      exit({:process_registry_unavailable, stack_id})
+  end
+
   # This is a send() and not a call() to prevent the caller (the Connection.Manager process) from
   # getting blocked when the replication connection is blocked some replication slot condition
   # that doesn't let it start streaming immediately.
   def start_streaming(client) do
     send(client, :start_streaming)
+  end
+
+  @doc false
+  @spec causal_drain_max_concurrency(Electric.stack_id(), non_neg_integer()) :: pos_integer()
+  def causal_drain_max_concurrency(stack_id, consumer_count)
+      when is_binary(stack_id) and is_integer(consumer_count) and consumer_count >= 0 do
+    configured_limit =
+      Electric.StackConfig.lookup(
+        stack_id,
+        :causal_drain_max_concurrency,
+        Electric.Config.default(:causal_drain_max_concurrency)
+      )
+
+    if not (is_integer(configured_limit) and configured_limit > 0) do
+      raise ArgumentError,
+            "causal_drain_max_concurrency must be a positive integer, got: #{inspect(configured_limit)}"
+    end
+
+    consumer_count
+    |> max(1)
+    |> min(configured_limit)
+  end
+
+  @doc false
+  @spec causal_drain_timeout_ms(Electric.stack_id()) :: pos_integer()
+  def causal_drain_timeout_ms(stack_id) when is_binary(stack_id) do
+    configured_timeout =
+      Electric.StackConfig.lookup(
+        stack_id,
+        :causal_drain_timeout_ms,
+        Electric.Config.default(:causal_drain_timeout_ms)
+      )
+
+    if not (is_integer(configured_timeout) and configured_timeout > 0) do
+      raise ArgumentError,
+            "causal_drain_timeout_ms must be a positive integer, got: #{inspect(configured_timeout)}"
+    end
+
+    configured_timeout
   end
 
   def stop(client, reason) do
@@ -298,7 +381,67 @@ defmodule Electric.Postgres.ReplicationClient do
         %{state | flushed_wal: max(lsn, state.flushed_wal), received_wal: state.received_wal}
       end
 
+    state = maybe_mark_replication_caught_up(state)
+
     {:noreply, [encode_standby_status_update(state)], state}
+  end
+
+  def handle_info(
+        {ref, :ok},
+        %State{causal_catch_up_task: {_task_pid, ref, target}} = state
+      )
+      when is_reference(ref) do
+    Process.demonitor(ref, [:flush])
+    state = %{state | causal_catch_up_task: nil}
+
+    if not state.replication_caught_up? and state.startup_wal_flush_lsn == target and
+         state.received_wal >= target and state.flushed_wal >= target and
+         state.last_processed_causal_marker_lsn == target do
+      Logger.notice(
+        "Replication caught up to startup WAL target #{Lsn.from_integer(target)} " <>
+          "and drained its causal consumer frontier " <>
+          "(received=#{Lsn.from_integer(state.received_wal)}, " <>
+          "flushed=#{Lsn.from_integer(state.flushed_wal)})"
+      )
+
+      :ok =
+        Electric.Connection.Manager.replication_client_caught_up(
+          state.connection_manager,
+          self()
+        )
+
+      {:noreply, %{state | replication_caught_up?: true}}
+    else
+      {:noreply, maybe_mark_replication_caught_up(state)}
+    end
+  end
+
+  def handle_info(
+        {ref,
+         {:error, {:causal_frontier_timeout, stack_id, target, timeout_ms} = timeout_reason}},
+        %State{causal_catch_up_task: {_task_pid, ref, target}}
+      )
+      when is_reference(ref) do
+    Process.demonitor(ref, [:flush])
+
+    Logger.error(
+      "Causal startup frontier timed out for stack #{inspect(stack_id)} after #{timeout_ms}ms " <>
+        "at target #{Lsn.from_integer(target)}"
+    )
+
+    {:disconnect, {:causal_catch_up_failed, timeout_reason}}
+  end
+
+  def handle_info(
+        {:DOWN, ref, :process, task_pid, reason},
+        %State{causal_catch_up_task: {task_pid, ref, target}}
+      ) do
+    Logger.error(
+      "Causal startup frontier worker failed for target #{Lsn.from_integer(target)}: " <>
+        inspect(reason)
+    )
+
+    {:disconnect, {:causal_catch_up_failed, reason}}
   end
 
   @impl true
@@ -337,21 +480,50 @@ defmodule Electric.Postgres.ReplicationClient do
   def handle_info({:process_event, event, time_remaining}, state),
     do: apply_event(event, time_remaining, state)
 
-  # StatusMonitor notification: stack became active — retry the pending event.
-  # The delay prevents spinning if the handler returns :not_ready again despite
-  # StatusMonitor reporting :active (a brief race during startup).
+  # A connection retry carries one absolute deadline across every attempt. This
+  # keeps the socket paused without coupling replication progress to externally
+  # visible stack health, which itself depends on replication catching up.
   def handle_info(
-        {{Electric.StatusMonitor, ref}, {:ok, :active}},
-        %State{wait_for_active_ref: {ref, event}} = state
+        {:retry_connection_event, event, deadline},
+        %State{connection_retry_deadline: deadline} = state
       ) do
-    Process.send_after(self(), {:process_event, event, @max_event_retry_time}, @event_retry_delay)
-    {:noreply, %{state | wait_for_active_ref: nil}}
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining > 0 do
+      apply_event(event, remaining, state)
+    else
+      connection_retry_budget_exhausted()
+    end
   end
 
-  # Stale or unexpected StatusMonitor notification (e.g. after a retry already
-  # succeeded and cleared wait_ref). Discard silently.
-  def handle_info({{Electric.StatusMonitor, _ref}, _result}, state) do
-    {:noreply, state}
+  # An event can complete or change failure mode before an already-delivered
+  # retry timer is handled. Never let that stale timer start a second attempt.
+  def handle_info({:retry_connection_event, _event, _deadline}, state),
+    do: {:noreply, state}
+
+  # Shape restore deliberately opens collector processing before advertising
+  # the stack as externally active. If an event reached the collector just
+  # before that transition, retry it on this internal readiness notification
+  # instead of waiting for external health and deadlocking restore replay.
+  def handle_info(
+        {__MODULE__, :shape_log_collector_processing_started, collector_pid},
+        state
+      ) do
+    if current_shape_log_collector_pid(state) == collector_pid do
+      state = %{state | shape_log_collector_processing_pid: collector_pid}
+
+      case state.event_retry_wait do
+        {:collector_processing, event} ->
+          retry_pending_event(event, %{state | event_retry_wait: nil})
+
+        _ ->
+          {:noreply, state}
+      end
+    else
+      # A delayed signal from the collector that belonged to a previous stack
+      # incarnation must not open processing for its replacement.
+      {:noreply, state}
+    end
   end
 
   # Async event handler replied :ok — demonitor, ack transaction, resume socket.
@@ -361,9 +533,11 @@ defmodule Electric.Postgres.ReplicationClient do
       )
       when is_reference(ref) do
     Process.demonitor(ref, [:flush])
-    state = %{state | pending_event: nil}
-    state = maybe_update_flush_up_to_date(state)
+    state = %{state | pending_event: nil, connection_retry_deadline: nil}
     {acks, state} = acknowledge_transaction(event, state)
+    state = update_flush_up_to_date(event, state)
+    state = promote_causal_marker_after_event(event, state)
+    state = maybe_mark_replication_caught_up(state)
     {:noreply_and_resume, acks, state}
   end
 
@@ -374,9 +548,27 @@ defmodule Electric.Postgres.ReplicationClient do
       )
       when is_reference(ref) and error in [:not_ready, :connection_not_available] do
     Process.demonitor(ref, [:flush])
-    remaining = time_remaining - (System.monotonic_time(:millisecond) - start_time)
     state = %{state | pending_event: nil}
-    wait_for_active_and_retry(event, remaining, state)
+
+    case error do
+      :not_ready ->
+        state = %{state | connection_retry_deadline: nil}
+
+        if shape_log_collector_processing?(state) do
+          retry_pending_event(event, state)
+        else
+          # Collector processing is an internal startup level, not external
+          # stack health. Hold the single paused-socket event directly and let
+          # the collector's level-triggered signal wake it; registering an
+          # :active waiter here would leak one stale StatusMonitor waiter per
+          # pre-active retry cycle.
+          {:noreply, %{state | event_retry_wait: {:collector_processing, event}}}
+        end
+
+      :connection_not_available ->
+        deadline = state.connection_retry_deadline || start_time + time_remaining
+        retry_connection_event(event, deadline, state)
+    end
   end
 
   # Async event handler crashed — retry with budget.
@@ -385,7 +577,7 @@ defmodule Electric.Postgres.ReplicationClient do
         %State{pending_event: {ref, event, time_remaining, start_time}} = state
       ) do
     remaining = time_remaining - (System.monotonic_time(:millisecond) - start_time)
-    state = %{state | pending_event: nil}
+    state = %{state | pending_event: nil, connection_retry_deadline: nil}
 
     if remaining > 0 do
       Logger.error(
@@ -462,32 +654,53 @@ defmodule Electric.Postgres.ReplicationClient do
       "Primary Keepalive: wal_end=#{wal_end} (#{Lsn.from_integer(wal_end)}) reply=#{reply}"
     end)
 
-    in_transaction? = MessageConverter.in_transaction?(state.message_converter)
-
-    # Broadcast the server's latest WAL position to consumers with materializer
-    # dependencies. This covers silent-postgres periods where no transactions
-    # arrive but buffered move-in results may be ready to splice.
-    unless in_transaction? do
-      LsnTracker.broadcast_last_seen_lsn(state.stack_id, wal_end)
-    end
-
     case reply do
-      1 when in_transaction? ->
-        {:noreply, [encode_standby_status_update(state)], state}
-
-      # if we are not in a transaction, advance the replication slot
-      # with keepalives to avoid it getting filled with irrelevant changes, like
-      # heartbeats from the database provider
       1 ->
-        state = update_stored_wals(state, wal_end)
         {:noreply, [encode_standby_status_update(state)], state}
-
-      0 when in_transaction? ->
-        {:noreply, [], state}
 
       0 ->
-        state = update_stored_wals(state, wal_end)
         {:noreply, [], state}
+    end
+  end
+
+  def handle_data(
+        <<@repl_msg_x_log_data, _wal_start::64, _server_wal_end::64, _clock::64, ?M,
+          _rest::binary>> = frame,
+        %State{} = state
+      ) do
+    <<_header::binary-size(25), logical_message::binary>> = frame
+
+    cond do
+      byte_size(logical_message) > @max_logical_message_bytes ->
+        count_ignored_logical_message(state, :oversized, byte_size(logical_message))
+        {:noreply, state}
+
+      true ->
+        case {CausalMarker.decode_wire(logical_message), state.message_converter.txn_fragment} do
+          {{:ok, marker_lsn}, %TransactionFragment{xid: xid}}
+          when is_integer(xid) ->
+            marker_lsn = Lsn.to_integer(marker_lsn)
+
+            if marker_lsn == state.startup_wal_flush_lsn do
+              {:noreply,
+               %{
+                 state
+                 | pending_causal_marker_lsn: marker_lsn,
+                   pending_causal_marker_xid: xid
+               }}
+            else
+              count_ignored_logical_message(state, :non_startup_causal_marker, 0)
+              {:noreply, state}
+            end
+
+          {{:ok, _marker_lsn}, _converter_state} ->
+            count_ignored_logical_message(state, :marker_outside_transaction, 0)
+            {:noreply, state}
+
+          {:not_marker, _converter_state} ->
+            count_ignored_logical_message(state, :foreign_or_invalid, 0)
+            {:noreply, state}
+        end
     end
   end
 
@@ -505,9 +718,79 @@ defmodule Electric.Postgres.ReplicationClient do
         {:noreply, %{state | message_converter: converter}}
 
       {:ok, event, converter} ->
-        state = %{state | message_converter: converter}
+        state =
+          state
+          |> Map.put(:message_converter, converter)
+          |> associate_pending_causal_marker(msg, event)
+
         dispatch_event(event, state)
     end
+  end
+
+  defp associate_pending_causal_marker(
+         %State{
+           pending_causal_marker_lsn: marker_lsn,
+           pending_causal_marker_xid: xid,
+           event_causal_marker_lsn: nil,
+           event_causal_marker_xid: nil
+         } = state,
+         %LR.Commit{},
+         %TransactionFragment{xid: xid, lsn: event_lsn, commit: commit}
+       )
+       when is_integer(marker_lsn) and is_integer(xid) and not is_nil(commit) do
+    transaction_final_lsn = Lsn.to_integer(event_lsn)
+
+    if transaction_final_lsn >= marker_lsn do
+      %{
+        state
+        | # The logical message record LSN identifies the exact marker emitted by
+          # the startup query, but it is not the causal boundary of its enclosing
+          # transaction. Use Begin.final_lsn for flushing and downstream draining
+          # so WAL committed between the marker record and this transaction's
+          # commit cannot fall outside the startup frontier.
+          startup_wal_flush_lsn: transaction_final_lsn,
+          pending_causal_marker_lsn: nil,
+          pending_causal_marker_xid: nil,
+          event_causal_marker_lsn: transaction_final_lsn,
+          event_causal_marker_xid: xid
+      }
+    else
+      %{state | pending_causal_marker_lsn: nil, pending_causal_marker_xid: nil}
+    end
+  end
+
+  defp associate_pending_causal_marker(
+         %State{pending_causal_marker_lsn: marker_lsn} = state,
+         %LR.Commit{},
+         _event
+       )
+       when is_integer(marker_lsn) do
+    %{state | pending_causal_marker_lsn: nil, pending_causal_marker_xid: nil}
+  end
+
+  defp associate_pending_causal_marker(state, _message, _event), do: state
+
+  defp promote_causal_marker_after_event(
+         %TransactionFragment{xid: xid, commit: commit},
+         %State{event_causal_marker_lsn: marker_lsn, event_causal_marker_xid: xid} = state
+       )
+       when not is_nil(commit) and is_integer(marker_lsn) and is_integer(xid) do
+    %{
+      state
+      | event_causal_marker_lsn: nil,
+        event_causal_marker_xid: nil,
+        last_processed_causal_marker_lsn: marker_lsn
+    }
+  end
+
+  defp promote_causal_marker_after_event(_event, state), do: state
+
+  defp count_ignored_logical_message(state, reason, bytes) do
+    :telemetry.execute(
+      [:electric, :postgres, :replication, :logical_message_ignored],
+      %{count: 1, bytes: bytes},
+      %{stack_id: state.stack_id, reason: reason}
+    )
   end
 
   # Dispatch event processing asynchronously. Pauses the socket so we don't
@@ -520,7 +803,7 @@ defmodule Electric.Postgres.ReplicationClient do
   # where they only ran after handle_event succeeded.
   defp dispatch_event(event, state) do
     send(self(), {:process_event, event, @max_event_retry_time})
-    {:noreply_and_pause, [], state}
+    {:noreply_and_pause, [], %{state | connection_retry_deadline: nil}}
   end
 
   # Dispatch the event handler as a non-blocking $gen_call. The MFA returns a
@@ -538,6 +821,7 @@ defmodule Electric.Postgres.ReplicationClient do
     catch
       kind, reason ->
         remaining = time_remaining - (System.monotonic_time(:millisecond) - start_time)
+        state = %{state | connection_retry_deadline: nil}
 
         if remaining > 0 do
           Logger.error(
@@ -558,17 +842,40 @@ defmodule Electric.Postgres.ReplicationClient do
     end
   end
 
-  # Downstream returned :not_ready — subscribe to StatusMonitor for notification
-  # when the stack becomes active, then retry. This replaces the old blocking
-  # wait_until_active(timeout: :infinity) call with an async notification.
-  # The keepalive timer prevents wal_sender_timeout during the wait.
-  # The remaining budget is intentionally discarded — a fresh @max_event_retry_time
-  # is used after the stack becomes active, matching the old apply_with_retries
-  # behavior which reset the retry timer after wait_until_active returned.
-  defp wait_for_active_and_retry(event, _remaining, state) do
-    ref = Electric.StatusMonitor.wait_until_async(state.stack_id, :active)
-    {:noreply, %{state | wait_for_active_ref: {ref, event}}}
+  defp retry_connection_event(event, deadline, state) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining > 0 do
+      delay = min(@event_retry_delay, remaining)
+      Process.send_after(self(), {:retry_connection_event, event, deadline}, delay)
+      {:noreply, %{state | connection_retry_deadline: deadline}}
+    else
+      connection_retry_budget_exhausted()
+    end
   end
+
+  defp connection_retry_budget_exhausted do
+    Logger.error("Exhausted retry budget while the event handler connection was unavailable")
+    {:disconnect, {:event_delivery_retry_budget_exhausted, :connection_not_available}}
+  end
+
+  defp retry_pending_event(event, state) do
+    Process.send_after(self(), {:process_event, event, @max_event_retry_time}, @event_retry_delay)
+    {:noreply, %{state | connection_retry_deadline: nil}}
+  end
+
+  defp shape_log_collector_processing?(state) do
+    is_pid(state.shape_log_collector_processing_pid) and
+      current_shape_log_collector_pid(state) == state.shape_log_collector_processing_pid
+  end
+
+  defp current_shape_log_collector_pid(%State{stack_id: stack_id}) when is_binary(stack_id) do
+    GenServer.whereis(ShapeLogCollector.name(stack_id))
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp current_shape_log_collector_pid(_state), do: nil
 
   defp acknowledge_transaction(%TransactionFragment{commit: nil}, state), do: {[], state}
 
@@ -602,13 +909,17 @@ defmodule Electric.Postgres.ReplicationClient do
 
   defp acknowledge_transaction(%Relation{}, state), do: {[], state}
 
-  defp maybe_update_flush_up_to_date(state) do
-    if MessageConverter.in_transaction?(state.message_converter) do
-      %{state | flush_up_to_date?: false}
-    else
+  defp update_flush_up_to_date(%TransactionFragment{commit: nil}, state),
+    do: %{state | flush_up_to_date?: false}
+
+  defp update_flush_up_to_date(%TransactionFragment{}, state) do
+    %{
       state
-    end
+      | flush_up_to_date?: state.flushed_wal >= Lsn.to_integer(state.last_seen_txn_lsn)
+    }
   end
+
+  defp update_flush_up_to_date(%Relation{}, state), do: state
 
   defp encode_standby_status_update(state) do
     Logger.debug(fn ->
@@ -637,24 +948,150 @@ defmodule Electric.Postgres.ReplicationClient do
   @epoch DateTime.to_unix(~U[2000-01-01 00:00:00Z], :microsecond)
   defp current_time(), do: System.os_time(:microsecond) - @epoch
 
-  defp update_stored_wals(
-         %{
-           received_wal: received_wal,
-           flushed_wal: flushed_wal,
-           flush_up_to_date?: flush_up_to_date?
-         } = state,
-         wal
-       ) do
-    received_wal = max(received_wal, wal)
-    flushed_wal = if flush_up_to_date?, do: max(flushed_wal, wal), else: flushed_wal
-
-    %{state | received_wal: received_wal, flushed_wal: flushed_wal}
-  end
-
   defp update_received_wal(state, wal) when is_number(wal) and wal >= state.received_wal,
     do: %{state | received_wal: wal}
 
   defp update_received_wal(state, wal) when is_number(wal), do: state
+
+  defp maybe_mark_replication_caught_up(
+         %State{
+           replication_caught_up?: false,
+           causal_catch_up_task: nil,
+           startup_wal_flush_lsn: target,
+           stack_id: stack_id,
+           received_wal: received_wal,
+           flushed_wal: flushed_wal,
+           last_processed_causal_marker_lsn: processed_marker_lsn
+         } = state
+       )
+       when is_integer(target) and received_wal >= target and flushed_wal >= target and
+              processed_marker_lsn == target do
+    supervisor = Electric.ProcessRegistry.name(stack_id, Electric.StackTaskSupervisor)
+    owner = self()
+    timeout_ms = causal_drain_timeout_ms(stack_id)
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    task_fun = fn ->
+      await_consumer_causal_frontier_while_owner_alive(
+        owner,
+        stack_id,
+        target,
+        deadline,
+        timeout_ms
+      )
+    end
+
+    task = Task.Supervisor.async_nolink(supervisor, task_fun)
+
+    %{state | causal_catch_up_task: {task.pid, task.ref, target}}
+  end
+
+  defp maybe_mark_replication_caught_up(state), do: state
+
+  defp await_consumer_causal_frontier_while_owner_alive(
+         owner,
+         stack_id,
+         target,
+         deadline,
+         timeout_ms
+       ) do
+    token =
+      case ConsumerRegistry.activate_causal_drain(stack_id, target) do
+        {:ok, token} -> token
+        {:error, reason} -> exit({:causal_drain_activation_failed, reason})
+      end
+
+    try do
+      owner_ref = Process.monitor(owner)
+      outer = self()
+      result_ref = make_ref()
+
+      {worker_pid, worker_ref} =
+        :erlang.spawn_opt(
+          fn ->
+            send(outer, {result_ref, await_consumer_causal_frontier(stack_id, target, token)})
+          end,
+          [:link, :monitor]
+        )
+
+      remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+      receive do
+        {^result_ref, result} ->
+          Process.demonitor(worker_ref, [:flush])
+          Process.demonitor(owner_ref, [:flush])
+          result
+
+        {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
+          terminate_causal_frontier_worker(worker_pid, worker_ref)
+          exit(:normal)
+
+        {:DOWN, ^worker_ref, :process, ^worker_pid, reason} ->
+          Process.demonitor(owner_ref, [:flush])
+          exit({:causal_frontier_worker_failed, reason})
+      after
+        remaining ->
+          terminate_causal_frontier_worker(worker_pid, worker_ref)
+          Process.demonitor(owner_ref, [:flush])
+          {:error, {:causal_frontier_timeout, stack_id, target, timeout_ms}}
+      end
+    after
+      ConsumerRegistry.deactivate_causal_drain(stack_id, token)
+    end
+  end
+
+  defp terminate_causal_frontier_worker(worker_pid, worker_ref) do
+    Process.unlink(worker_pid)
+    Process.exit(worker_pid, :kill)
+
+    receive do
+      {:DOWN, ^worker_ref, :process, ^worker_pid, _reason} -> :ok
+    end
+  end
+
+  # Root flush closes creation of causal work at or below the sampled startup
+  # cut: every derived batch recursively installs its consumer reservation
+  # before the collector event can acknowledge. A fixed-point snapshot is
+  # therefore sufficient, while still catching consumers lazily created by
+  # restore during the first pass. Raw registry entries are intentional: a
+  # dead/stale consumer must be removed or replaced, never mistaken for drained.
+  defp await_consumer_causal_frontier(stack_id, target, token) do
+    generation = ConsumerRegistry.causal_generation(stack_id)
+    snapshot = ConsumerRegistry.consumer_snapshot(stack_id)
+
+    all_drained? =
+      snapshot
+      |> Task.async_stream(
+        fn {_shape_handle, consumer_pid} ->
+          try do
+            Consumer.await_causal_frontier(consumer_pid, target)
+          catch
+            :exit, reason -> {:error, {:exit, reason}}
+          end
+        end,
+        max_concurrency: causal_drain_max_concurrency(stack_id, map_size(snapshot)),
+        ordered: false,
+        timeout: :infinity
+      )
+      |> Enum.all?(&match?({:ok, :ok}, &1))
+
+    final_snapshot = ConsumerRegistry.consumer_snapshot(stack_id)
+    final_generation = ConsumerRegistry.causal_generation(stack_id)
+
+    if all_drained? and final_snapshot == snapshot and final_generation == generation do
+      case ConsumerRegistry.close_causal_drain(stack_id, target, generation, token) do
+        :ok ->
+          :ok
+
+        :retry ->
+          Process.sleep(10)
+          await_consumer_causal_frontier(stack_id, target, token)
+      end
+    else
+      Process.sleep(10)
+      await_consumer_causal_frontier(stack_id, target, token)
+    end
+  end
 
   defp notify_connection_opened(%State{connection_manager: manager} = state) do
     :ok = Electric.Connection.Manager.replication_client_started(manager)

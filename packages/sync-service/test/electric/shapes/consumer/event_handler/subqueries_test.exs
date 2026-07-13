@@ -198,6 +198,35 @@ defmodule Electric.Shapes.Consumer.EventHandler.SubqueriesTest do
              ] = plan
     end
 
+    test "records a post-snapshot deferred root as the current buffer boundary" do
+      handler = new_handler()
+      dep_handle = dep_handle(handler)
+      buffered_txn = txn(50, [child_insert("10", "1")])
+
+      assert {:ok, %Buffering{active_move: %ActiveMove{}} = handler, _plan} =
+               EventHandler.handle_event(
+                 handler,
+                 {:materializer_changes, dep_handle, %{move_in: [{1, "1"}], move_out: []}}
+               )
+
+      assert {:ok, %Buffering{active_move: %ActiveMove{}} = handler, []} =
+               EventHandler.handle_event(handler, buffered_txn)
+
+      assert {:ok, %Buffering{active_move: %ActiveMove{}} = handler, []} =
+               EventHandler.handle_event(handler, {:pg_snapshot_known, {100, 200, []}})
+
+      assert {:ok,
+              %Buffering{
+                active_move: %ActiveMove{
+                  boundary_txn_count: 1,
+                  buffered_txn_count: 1,
+                  buffered_txns: [^buffered_txn],
+                  move_in_snapshot_name: nil
+                }
+              }, []} =
+               EventHandler.handle_event(handler, {:deferred_root_post_snapshot, 200})
+    end
+
     test "splices move-in query rows between emitted pre and post boundary changes" do
       handler = new_handler(subquery_view: MapSet.new([1]))
       dep_handle = dep_handle(handler)

@@ -179,9 +179,77 @@ defmodule Support.OracleHarness do
 
     new_ctx = Map.merge(ctx, Support.ComponentSetup.restart_complete_stack(ctx))
 
+    assert_stack_active_after_restart!(new_ctx, timeout_ms, batch_idx)
     new_pids = recreate_checkers(new_ctx, [], shapes, oracle_pool, timeout_ms, batch_idx)
+    assert_stack_active_after_restart!(new_ctx, timeout_ms, batch_idx)
 
     {new_pids, new_ctx}
+  end
+
+  defp assert_stack_active_after_restart!(ctx, timeout_ms, batch_idx) do
+    case Electric.StatusMonitor.wait_until_active(ctx.stack_id, timeout: timeout_ms) do
+      :ok ->
+        :ok
+
+      error ->
+        pending = pending_causal_consumers(ctx.stack_id)
+
+        raise "stack did not become active after batch_#{batch_idx}: #{inspect(error)}\n" <>
+                "pending causal consumers: #{inspect(pending, pretty: true, limit: :infinity)}"
+    end
+  end
+
+  defp pending_causal_consumers(stack_id) do
+    stack_id
+    |> Electric.Shapes.ConsumerRegistry.consumer_snapshot()
+    |> Task.async_stream(
+      fn {shape_handle, pid} ->
+        try do
+          state = :sys.get_state(pid, 1_000)
+
+          case state.causal_drain_waiters do
+            [] ->
+              nil
+
+            waiters ->
+              %{
+                shape_handle: shape_handle,
+                pid: inspect(pid),
+                waiter_targets: Enum.map(waiters, &elem(&1, 1)),
+                pending_initialization?: not is_nil(state.pending_initialization),
+                pending_dependency_subscription?:
+                  not is_nil(state.pending_dependency_subscription),
+                pending_materializer_replay_count: state.pending_materializer_replay_count,
+                pending_materializer_replay_queue: :queue.len(state.pending_materializer_replays),
+                deferred_materializer_move_count: state.deferred_materializer_move_count,
+                deferred_replication_event_count: state.deferred_replication_event_count,
+                pending_txn_xid: state.pending_txn && state.pending_txn.xid,
+                move_transaction_open?: state.move_transaction_open?,
+                pending_move_causal_origin: state.pending_move_causal_origin,
+                root_delivery_tx_offset: state.root_delivery_tx_offset,
+                last_observed_global_lsn: state.last_observed_global_lsn,
+                last_seen_global_lsn: state.last_seen_global_lsn,
+                pending_global_last_seen_lsn: state.pending_global_last_seen_lsn,
+                active_downstream_causal_token?: not is_nil(state.active_downstream_causal_token),
+                completed_downstream_causal_token?:
+                  not is_nil(state.completed_downstream_causal_token)
+              }
+          end
+        catch
+          :exit, reason ->
+            %{shape_handle: shape_handle, pid: inspect(pid), state_error: inspect(reason)}
+        end
+      end,
+      ordered: false,
+      max_concurrency: 32,
+      timeout: 1_500,
+      on_timeout: :kill_task
+    )
+    |> Enum.flat_map(fn
+      {:ok, nil} -> []
+      {:ok, diagnostic} -> [diagnostic]
+      {:exit, reason} -> [%{diagnostic_task_exit: inspect(reason)}]
+    end)
   end
 
   # Throws away the existing checkers and creates fresh ones (client-side

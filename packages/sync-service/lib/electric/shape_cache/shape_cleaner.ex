@@ -4,6 +4,7 @@ defmodule Electric.ShapeCache.ShapeCleaner do
   """
 
   alias Electric.Shapes.Consumer
+  alias Electric.Shapes.Consumer.Materializer
   alias Electric.ShapeCache.ShapeStatus
   alias Electric.ShapeCache.Storage
   alias Electric.ShapeCache.ShapeCleaner.CleanupTaskSupervisor
@@ -42,18 +43,18 @@ defmodule Electric.ShapeCache.ShapeCleaner do
     remove_shapes(stack_id, List.wrap(shape_handle), reason)
   end
 
-  @spec remove_shapes_async(stack_id(), [shape_handle()]) :: :ok
-  def remove_shapes_async(stack_id, shape_handles) do
+  @spec remove_shapes_async(stack_id(), [shape_handle()], reason()) :: :ok
+  def remove_shapes_async(stack_id, shape_handles, reason \\ @shutdown_cleanup) do
     CleanupTaskSupervisor.perform_async(stack_id, fn ->
       activate_mocked_functions_from_test_process()
 
-      remove_shapes(stack_id, shape_handles)
+      remove_shapes(stack_id, shape_handles, reason)
     end)
   end
 
-  @spec remove_shape_async(stack_id(), shape_handle()) :: :ok
-  def remove_shape_async(stack_id, shape_handle) do
-    remove_shapes_async(stack_id, List.wrap(shape_handle))
+  @spec remove_shape_async(stack_id(), shape_handle(), reason()) :: :ok
+  def remove_shape_async(stack_id, shape_handle, reason \\ @shutdown_cleanup) do
+    remove_shapes_async(stack_id, List.wrap(shape_handle), reason)
   end
 
   @spec remove_shapes_for_relations(list(Electric.oid_relation()), stack_id(), term()) :: :ok
@@ -154,25 +155,31 @@ defmodule Electric.ShapeCache.ShapeCleaner do
   end
 
   defp remove_shape_immediate(stack_id, shape_handle, reason) do
-    OpenTelemetry.start_interval(:"remove_shape.shape_status_remove.duration_µs")
+    try do
+      OpenTelemetry.start_interval(:"remove_shape.shape_status_remove.duration_µs")
 
-    case Electric.ShapeCache.ShapeStatus.remove_shape(stack_id, shape_handle) do
-      :ok ->
-        OpenTelemetry.start_interval(:"remove_shape.shape_consumer_stop.duration_µs")
+      case Electric.ShapeCache.ShapeStatus.remove_shape(stack_id, shape_handle) do
+        :ok ->
+          OpenTelemetry.start_interval(:"remove_shape.shape_consumer_stop.duration_µs")
 
-        stack_storage = Storage.for_stack(stack_id)
+          stack_storage = Storage.for_stack(stack_id)
 
-        with :ok <- Consumer.stop(stack_id, shape_handle, reason),
-             OpenTelemetry.start_interval(:"remove_shape.storage_cleanup.duration_µs"),
-             :ok <- Storage.cleanup!(stack_storage, shape_handle),
-             OpenTelemetry.start_interval(:"remove_shape.shape_log_collector_remove.duration_µs"),
-             :ok <-
-               Electric.Replication.ShapeLogCollector.remove_shape(stack_id, shape_handle) do
-          :ok
-        end
+          with :ok <- Consumer.stop(stack_id, shape_handle, reason),
+               OpenTelemetry.start_interval(:"remove_shape.storage_cleanup.duration_µs"),
+               :ok <- Storage.cleanup!(stack_storage, shape_handle),
+               OpenTelemetry.start_interval(
+                 :"remove_shape.shape_log_collector_remove.duration_µs"
+               ),
+               :ok <-
+                 Electric.Replication.ShapeLogCollector.remove_shape(stack_id, shape_handle) do
+            :ok
+          end
 
-      {:error, _reason} ->
-        {:error, :data_removed}
+        {:error, _reason} ->
+          {:error, :data_removed}
+      end
+    after
+      Materializer.delete_link_values(stack_id, shape_handle)
     end
   end
 

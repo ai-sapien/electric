@@ -120,6 +120,36 @@ defmodule Electric.Config do
     # Heap-size threshold (in BYTES) above which a consumer runs :erlang.garbage_collect()
     # after processing a transaction fragment.
     consumer_gc_heap_threshold: nil,
+    # Maximum estimated raw log bytes retained/applied by one stale dependency
+    # replay session. Larger histories invalidate and rebuild the outer shape
+    # rather than risking an unbounded materializer heap.
+    materializer_replay_memory_limit_bytes: 8 * 1024 * 1024,
+    # Stale outer Consumers waiting on one source materializer retain only a pid
+    # and cursor, but the queue itself must still be bounded.
+    materializer_replay_max_pending: 100,
+    # One stack-wide replay lease must keep making progress. Seed scans or
+    # subscribers that stop pulling are invalidated instead of retaining the
+    # only replay index indefinitely.
+    materializer_replay_idle_timeout_ms: :timer.seconds(30),
+    # Bound the live monitor/fan-out set independently from stale replay jobs.
+    materializer_live_max_subscribers: 1000,
+    # Maximum serialized payload bytes retained by one live dependency
+    # Materializer while source storage durability catches up. This is a shared
+    # source-side bound, separate from each outer Consumer's deferred queue.
+    materializer_live_backlog_memory_limit_bytes: 8 * 1024 * 1024,
+    # Synchronous causal reservation and delivery cannot block the replication
+    # DAG forever. A timed-out derived shape is invalidated independently.
+    materializer_causal_call_timeout_ms: :timer.seconds(30),
+    # Startup catch-up asks cached Consumers to drain concurrently, but this
+    # fan-out must stay bounded independently of the number of cached shapes.
+    causal_drain_max_concurrency: 32,
+    # A stuck cached Consumer must not hold external stack readiness closed
+    # forever. One absolute deadline covers the complete fixed-point drain.
+    causal_drain_timeout_ms: :timer.minutes(10),
+    # Maximum serialized term bytes retained across one outer Consumer's
+    # deferred dependency-move and root-replication queues. Replay waiters must
+    # not turn a large transaction into an unbounded per-shape heap fan-out.
+    subquery_deferred_event_memory_limit_bytes: 1024 * 1024,
     ## Misc
     process_registry_partitions: &Electric.Config.Defaults.process_registry_partitions/0,
     feature_flags: if(Mix.env() == :test, do: @known_feature_flags, else: []),

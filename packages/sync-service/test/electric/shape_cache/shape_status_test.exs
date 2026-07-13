@@ -42,6 +42,10 @@ defmodule Electric.ShapeCache.ShapeStatusTest do
 
   setup [:with_stack_id_from_test, :with_async_deleter, :with_shape_db]
 
+  test "cache version invalidates metadata written before storage compaction became part of shape identity" do
+    assert ShapeStatus.version() == 11
+  end
+
   test "starts empty", ctx do
     {:ok, state, []} = new_state(ctx)
     assert [] = ShapeStatus.list_shapes(state)

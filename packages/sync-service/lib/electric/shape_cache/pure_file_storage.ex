@@ -49,13 +49,30 @@ defmodule Electric.ShapeCache.PureFileStorage do
   @behaviour Electric.ShapeCache.Storage
 
   # Struct that can be used to create a writer_state record or a reader
-  @version 1
+  # Transaction state changes the durability contract of the cache. A
+  # storage-version fence makes both directions of a rolling change
+  # safe: this binary rebuilds version-1 caches, and a version-1 binary rebuilds
+  # caches written by this binary instead of advancing only the legacy cursor.
+  @version 2
+  @legacy_transaction_state_version 1
+  @transaction_state_version 2
+  @chunk_index_intent_version 1
+  @read_generation_version 1
+  @legacy_read_generation_attempts 3
+
+  # Chunk boundaries that would expose an uncommitted root transaction or
+  # dependency move remain heap-resident until the atomic commit. Bound that
+  # staging area to 64 KiB (1,024 complete chunks, or roughly 10 GiB of log
+  # data at the default chunk threshold) so one transaction cannot grow a
+  # writer process without limit.
+  @default_max_deferred_chunk_index_bytes 64 * 1024
   defstruct [
     :buffer_ets,
     :chunk_bytes_threshold,
     :shape_handle,
     :stack_id,
     :stack_ets,
+    max_deferred_chunk_index_bytes: @default_max_deferred_chunk_index_bytes,
     read_only?: false,
     snapshot_file_timeout: :timer.seconds(5),
     version: @version
@@ -70,6 +87,9 @@ defmodule Electric.ShapeCache.PureFileStorage do
     :snapshot_started?,
     :pg_snapshot,
     :move_positions,
+    :transaction_state,
+    :read_generation,
+    :log_replay_history_start,
     :last_snapshot_chunk,
     :compaction_started?,
     :compaction_boundary
@@ -88,6 +108,7 @@ defmodule Electric.ShapeCache.PureFileStorage do
     :last_persisted_offset,
     :last_persisted_txn_offset,
     :last_seen_txn_offset,
+    :log_replay_history_start,
     :last_snapshot_chunk,
     :latest_name,
     :snapshot_started?
@@ -111,6 +132,9 @@ defmodule Electric.ShapeCache.PureFileStorage do
       stack_id: stack_id,
       chunk_bytes_threshold:
         Keyword.get(opts, :chunk_bytes_threshold) || LogChunker.default_chunk_size_threshold(),
+      max_deferred_chunk_index_bytes:
+        Keyword.get(opts, :max_deferred_chunk_index_bytes) ||
+          @default_max_deferred_chunk_index_bytes,
       flush_period: Keyword.get(opts, :flush_period) || :timer.seconds(1),
       compaction_config: %{
         period: Keyword.get(opts, :compaction_period) || :timer.minutes(10),
@@ -126,6 +150,12 @@ defmodule Electric.ShapeCache.PureFileStorage do
     %__MODULE__{
       buffer_ets: buffer_ets,
       chunk_bytes_threshold: stack_opts.chunk_bytes_threshold,
+      max_deferred_chunk_index_bytes:
+        Map.get(
+          stack_opts,
+          :max_deferred_chunk_index_bytes,
+          @default_max_deferred_chunk_index_bytes
+        ),
       read_only?: Map.get(stack_opts, :read_only?, false),
       shape_handle: shape_handle,
       stack_id: stack_id,
@@ -278,93 +308,360 @@ defmodule Electric.ShapeCache.PureFileStorage do
   end
 
   defp prepare_compaction(%__MODULE__{} = opts, end_offset, file_pos) do
-    # Just-in-case file-existence-based lock
-    if !read_cached_metadata(opts, :compaction_started?) do
-      write_cached_metadata!(opts, :compaction_started?, true)
+    attempt_id = System.unique_integer([:positive, :monotonic])
+    owner = self()
+    claim = compaction_claim(opts, attempt_id, owner)
 
-      Task.Supervisor.start_child(
-        stack_task_supervisor(opts.stack_id),
-        __MODULE__,
-        :make_compacted_files,
-        [self(), opts, end_offset, file_pos]
-      )
+    if acquire_compaction_claim(opts, claim) do
+      try do
+        reconcile_stale_compaction!(opts)
 
-      :ok
+        if !read_metadata!(opts, :compaction_started?) do
+          case start_compaction_attempt(owner, opts, end_offset, file_pos, attempt_id) do
+            {:ok, task_pid} ->
+              register_compaction_attempt!(opts, attempt_id, owner, task_pid)
+
+            {:error, reason} ->
+              raise Storage.Error,
+                message:
+                  "failed to start compaction attempt for shape #{inspect(opts.shape_handle)}: " <>
+                    inspect(reason)
+          end
+        else
+          :already_in_progress
+        end
+      after
+        release_compaction_claim(opts, claim)
+      end
     else
       :already_in_progress
     end
   end
 
-  def make_compacted_files(parent, %__MODULE__{} = opts, offset, log_file_pos)
-      when is_pid(parent) do
-    mkdir_p!(tmp_dir(opts))
+  defp compaction_claim(%__MODULE__{} = opts, attempt_id, owner) do
+    # The stack ETS uses tuple element 2 as its key. A distinct tagged key lets
+    # concurrent public compact/2 callers claim startup atomically without
+    # changing the shared storage_meta record read by hot-path readers.
+    {:compaction_claim, {__MODULE__, :compaction_claim, opts.shape_handle}, attempt_id, owner}
+  end
 
-    current_suffix = latest_name(opts)
-    {_, compacted_suffix} = compaction_boundary(opts)
-
-    # We're copying parts of the file & keyfile to the tmp dir, because we expect tmp dir to be on a faster FS
-    if compacted_suffix do
-      File.copy!(key_file(opts, compacted_suffix), tmp_file(opts, "compacted.keyfile"))
+  defp acquire_compaction_claim(
+         %__MODULE__{stack_ets: stack_ets} = opts,
+         {:compaction_claim, claim_key, _attempt_id, _owner} = claim
+       ) do
+    if :ets.insert_new(stack_ets, claim) do
+      true
     else
-      File.touch!(tmp_file(opts, "compacted.keyfile"))
+      case :ets.lookup(stack_ets, claim_key) do
+        [{:compaction_claim, ^claim_key, _active_attempt_id, active_owner} = stale_claim]
+        when is_pid(active_owner) ->
+          if Process.alive?(active_owner) do
+            false
+          else
+            :ets.delete_object(stack_ets, stale_claim)
+            acquire_compaction_claim(opts, claim)
+          end
+
+        [] ->
+          acquire_compaction_claim(opts, claim)
+      end
+    end
+  end
+
+  defp release_compaction_claim(%__MODULE__{stack_ets: stack_ets}, claim) do
+    # delete_object/2 prevents a dying, superseded claimant from deleting the
+    # replacement claim installed after its process was observed dead.
+    :ets.delete_object(stack_ets, claim)
+    :ok
+  end
+
+  @doc false
+  def start_compaction_attempt(owner, %__MODULE__{} = opts, offset, log_file_pos, attempt_id) do
+    Task.Supervisor.start_child(
+      stack_task_supervisor(opts.stack_id),
+      __MODULE__,
+      :run_compaction_attempt,
+      [owner, opts, offset, log_file_pos, attempt_id]
+    )
+  end
+
+  defp register_compaction_attempt!(opts, attempt_id, owner, task_pid) do
+    task_monitor = Process.monitor(task_pid)
+    token = {:running, attempt_id, owner, task_pid}
+
+    try do
+      write_cached_metadata!(opts, :compaction_started?, token)
+      send(task_pid, {:begin_compaction_attempt, owner, attempt_id})
+
+      receive do
+        {:compaction_attempt_started, ^attempt_id, ^task_pid} ->
+          Process.demonitor(task_monitor, [:flush])
+          :ok
+
+        {:DOWN, ^task_monitor, :process, ^task_pid, reason} ->
+          clear_compaction_token_if_matches(opts, token)
+
+          raise Storage.Error,
+            message:
+              "compaction attempt for shape #{inspect(opts.shape_handle)} exited during startup: " <>
+                inspect(reason)
+      end
+    rescue
+      exception ->
+        stop_compaction_task(task_pid)
+        clear_compaction_token_if_matches(opts, token)
+        reraise exception, __STACKTRACE__
+    catch
+      kind, reason ->
+        stop_compaction_task(task_pid)
+        clear_compaction_token_if_matches(opts, token)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  @doc false
+  def run_compaction_attempt(owner, %__MODULE__{} = opts, offset, log_file_pos, attempt_id) do
+    Process.flag(:trap_exit, true)
+    owner_monitor = Process.monitor(owner)
+    running_token = {:running, attempt_id, owner, self()}
+
+    receive do
+      {:begin_compaction_attempt, ^owner, ^attempt_id} ->
+        send(owner, {:compaction_attempt_started, attempt_id, self()})
+
+        activate_mocked_functions_from_test_process()
+
+        {worker_pid, worker_monitor} =
+          :erlang.spawn_opt(
+            fn ->
+              receive do
+                {:begin_compaction_work, ^attempt_id} -> :ok
+              end
+
+              suffix =
+                make_compacted_files(owner, opts, offset, log_file_pos, attempt_id)
+
+              exit({:compaction_complete, suffix})
+            end,
+            [:link, :monitor]
+          )
+
+        allow_mocked_functions_for_child(worker_pid)
+        send(worker_pid, {:begin_compaction_work, attempt_id})
+
+        await_compaction_attempt(
+          owner,
+          owner_monitor,
+          worker_pid,
+          worker_monitor,
+          opts,
+          offset,
+          log_file_pos,
+          attempt_id,
+          running_token
+        )
+
+      {:DOWN, ^owner_monitor, :process, ^owner, _reason} ->
+        abort_compaction_attempt(opts, attempt_id, running_token)
+    end
+  end
+
+  defp await_compaction_attempt(
+         owner,
+         owner_monitor,
+         worker_pid,
+         worker_monitor,
+         opts,
+         offset,
+         log_file_pos,
+         attempt_id,
+         running_token
+       ) do
+    receive do
+      {:DOWN, ^owner_monitor, :process, ^owner, _reason} ->
+        stop_compaction_task(worker_pid)
+        abort_compaction_attempt(opts, attempt_id, running_token)
+
+      {:DOWN, ^worker_monitor, :process, ^worker_pid,
+       {:compaction_complete, new_compacted_suffix}} ->
+        Process.demonitor(owner_monitor, [:flush])
+
+        finish_compaction_attempt(
+          owner,
+          opts,
+          offset,
+          log_file_pos,
+          attempt_id,
+          running_token,
+          new_compacted_suffix
+        )
+
+      {:DOWN, ^worker_monitor, :process, ^worker_pid, reason} ->
+        Process.demonitor(owner_monitor, [:flush])
+
+        Logger.error("Compaction worker failed",
+          shape_handle: opts.shape_handle,
+          compaction_attempt_id: attempt_id,
+          reason: inspect(reason)
+        )
+
+        abort_compaction_attempt(opts, attempt_id, running_token)
+
+      {:EXIT, ^worker_pid, _reason} ->
+        await_compaction_attempt(
+          owner,
+          owner_monitor,
+          worker_pid,
+          worker_monitor,
+          opts,
+          offset,
+          log_file_pos,
+          attempt_id,
+          running_token
+        )
+    end
+  end
+
+  defp finish_compaction_attempt(
+         owner,
+         opts,
+         offset,
+         log_file_pos,
+         attempt_id,
+         running_token,
+         new_compacted_suffix
+       ) do
+    finished_token =
+      {:finished, attempt_id, owner, elem(running_token, 3), new_compacted_suffix}
+
+    if Process.alive?(owner) and
+         replace_compaction_token(opts, running_token, finished_token) == :ok do
+      send(
+        owner,
+        {Storage,
+         {__MODULE__, :handle_compaction_finished, [offset, new_compacted_suffix, log_file_pos]}}
+      )
+    else
+      remove_compacted_files_if_unreferenced(opts, new_compacted_suffix)
+      clear_compaction_token_if_matches(opts, running_token)
+    end
+  end
+
+  defp abort_compaction_attempt(opts, attempt_id, running_token) do
+    cleanup_compaction_attempt_dir(opts, attempt_id)
+    remove_compaction_attempt_outputs(opts, attempt_id)
+    clear_compaction_token_if_matches(opts, running_token)
+    :ok
+  end
+
+  defp replace_compaction_token(opts, expected, replacement) do
+    if read_metadata!(opts, :compaction_started?) == expected do
+      write_cached_metadata!(opts, :compaction_started?, replacement)
+      :ok
+    else
+      :stale
+    end
+  end
+
+  defp clear_compaction_token_if_matches(opts, expected) do
+    if read_metadata!(opts, :compaction_started?) == expected do
+      write_cached_metadata!(opts, :compaction_started?, false)
     end
 
-    KeyIndex.create_from_log(
-      json_file(opts, current_suffix),
-      tmp_file(opts, "latest_part.keyfile"),
-      log_file_pos
-    )
+    :ok
+  end
 
-    KeyIndex.sort(
-      [tmp_file(opts, "latest_part.keyfile"), tmp_file(opts, "compacted.keyfile")],
-      tmp_file(opts, "merged.keyfile")
-    )
+  defp stop_compaction_task(pid) when is_pid(pid) do
+    if Process.alive?(pid) do
+      monitor = Process.monitor(pid)
+      Process.exit(pid, :kill)
 
-    rm_rf!(tmp_file(opts, "latest_part.keyfile"))
-    rm_rf!(tmp_file(opts, "compacted.keyfile"))
+      receive do
+        {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+      end
+    end
 
-    action_file =
-      ActionFile.create_from_key_index(
-        tmp_file(opts, "merged.keyfile"),
-        tmp_file(opts, "merged.actionfile")
+    :ok
+  end
+
+  @doc false
+  def make_compacted_files(_parent, %__MODULE__{} = opts, _offset, log_file_pos, attempt_id)
+      when is_integer(attempt_id) do
+    attempt_tmp_dir = compaction_tmp_dir(opts, attempt_id)
+    mkdir_p!(attempt_tmp_dir)
+
+    try do
+      current_suffix = latest_name(opts)
+      {_, compacted_suffix} = compaction_boundary(opts)
+
+      # We're copying parts of the file & keyfile to the tmp dir, because we expect tmp dir to be on a faster FS
+      if compacted_suffix do
+        File.copy!(
+          key_file(opts, compacted_suffix),
+          compaction_tmp_file(opts, attempt_id, "compacted.keyfile")
+        )
+      else
+        File.touch!(compaction_tmp_file(opts, attempt_id, "compacted.keyfile"))
+      end
+
+      KeyIndex.create_from_log(
+        json_file(opts, current_suffix),
+        compaction_tmp_file(opts, attempt_id, "latest_part.keyfile"),
+        log_file_pos
       )
 
-    files =
-      if compacted_suffix,
-        do: %{0 => json_file(opts, current_suffix), 1 => json_file(opts, compacted_suffix)},
-        else: %{0 => json_file(opts, current_suffix)}
-
-    {log_file, chunk_file, key_file} =
-      LogFile.merge_with_actions(
-        action_file,
-        files,
-        tmp_file(opts, "merged.logfile"),
-        opts.chunk_bytes_threshold
-      )
-
-    new_compacted_suffix = "compacted.#{DateTime.utc_now() |> DateTime.to_unix(:millisecond)}"
-
-    # Tmp dir is likely to be on the different FS, so we need to in-process copy instead of rename
-    #    side-note, Erlang doesn't expose kernel-level copy :(
-    #    see: https://github.com/erlang/otp/issues/7273
-    File.cp!(log_file, json_file(opts, new_compacted_suffix))
-    File.cp!(chunk_file, chunk_file(opts, new_compacted_suffix))
-    File.cp!(key_file, key_file(opts, new_compacted_suffix))
-
-    for path <- [
-          log_file,
-          chunk_file,
-          key_file,
-          tmp_file(opts, "merged.keyfile"),
-          tmp_file(opts, "merged.actionfile")
+      KeyIndex.sort(
+        [
+          compaction_tmp_file(opts, attempt_id, "latest_part.keyfile"),
+          compaction_tmp_file(opts, attempt_id, "compacted.keyfile")
         ],
-        do: rm_rf!(path)
+        compaction_tmp_file(opts, attempt_id, "merged.keyfile")
+      )
 
-    send(
-      parent,
-      {Storage,
-       {__MODULE__, :handle_compaction_finished, [offset, new_compacted_suffix, log_file_pos]}}
-    )
+      rm_rf!(compaction_tmp_file(opts, attempt_id, "latest_part.keyfile"))
+      rm_rf!(compaction_tmp_file(opts, attempt_id, "compacted.keyfile"))
+
+      action_file =
+        ActionFile.create_from_key_index(
+          compaction_tmp_file(opts, attempt_id, "merged.keyfile"),
+          compaction_tmp_file(opts, attempt_id, "merged.actionfile")
+        )
+
+      files =
+        if compacted_suffix,
+          do: %{0 => json_file(opts, current_suffix), 1 => json_file(opts, compacted_suffix)},
+          else: %{0 => json_file(opts, current_suffix)}
+
+      {log_file, chunk_file, key_file} =
+        LogFile.merge_with_actions(
+          action_file,
+          files,
+          compaction_tmp_file(opts, attempt_id, "merged.logfile"),
+          opts.chunk_bytes_threshold
+        )
+
+      new_compacted_suffix =
+        "compacted.#{DateTime.utc_now() |> DateTime.to_unix(:millisecond)}.#{attempt_id}"
+
+      # Tmp dir is likely to be on the different FS, so we need to in-process copy instead of rename
+      #    side-note, Erlang doesn't expose kernel-level copy :(
+      #    see: https://github.com/erlang/otp/issues/7273
+      File.cp!(log_file, json_file(opts, new_compacted_suffix))
+      File.cp!(chunk_file, chunk_file(opts, new_compacted_suffix))
+      File.cp!(key_file, key_file(opts, new_compacted_suffix))
+
+      new_compacted_suffix
+    after
+      rm_rf!(attempt_tmp_dir)
+    end
+  end
+
+  defp compaction_result_current?(opts, suffix) do
+    case read_metadata!(opts, :compaction_started?) do
+      {:finished, _attempt_id, _owner, _task_pid, ^suffix} -> true
+      {:finished, _attempt_id, _owner, ^suffix} -> true
+      _other -> false
+    end
   end
 
   @doc false
@@ -374,15 +671,37 @@ defmodule Electric.ShapeCache.PureFileStorage do
         new_suffix,
         log_file_pos
       ) do
+    if compaction_result_current?(opts, new_suffix) do
+      if WriteLoop.transaction_open?(writer_acc) do
+        writer_state(state,
+          writer_acc: WriteLoop.defer_compaction(writer_acc, {offset, new_suffix, log_file_pos})
+        )
+      else
+        do_handle_compaction_finished(state, offset, new_suffix, log_file_pos)
+      end
+    else
+      remove_compacted_files_if_unreferenced(opts, new_suffix)
+      state
+    end
+  end
+
+  defp do_handle_compaction_finished(
+         writer_state(opts: opts, writer_acc: writer_acc) = state,
+         offset,
+         new_suffix,
+         log_file_pos
+       ) do
     # This work is being done while the writer is stopped, so that the copy & trim doesn't miss anything,
     # but work here should be fast because writer is blocked.
-    {old_suffix, _} = compaction_boundary(opts)
+    {_, old_compacted_suffix} = compaction_boundary(opts)
     current_latest_suffix = latest_name(opts)
     set_compaction_boundary(opts, {offset, new_suffix})
 
     state = close_all_files(state)
 
-    new_latest_suffix = "latest.#{DateTime.utc_now() |> DateTime.to_unix(:millisecond)}"
+    new_latest_suffix =
+      "latest.#{DateTime.utc_now() |> DateTime.to_unix(:millisecond)}." <>
+        Integer.to_string(System.unique_integer([:positive, :monotonic]))
 
     File.open!(json_file(opts, current_latest_suffix), [:read, :raw], fn f1 ->
       {:ok, ^log_file_pos} = :file.position(f1, log_file_pos)
@@ -400,21 +719,31 @@ defmodule Electric.ShapeCache.PureFileStorage do
       0
     )
 
-    set_latest_name(opts, new_latest_suffix)
+    cached_chunk_boundaries =
+      opts
+      |> chunk_file(new_latest_suffix)
+      |> ChunkIndex.read_last_n_chunks(4)
+      |> reformat_chunks_for_cache()
+
+    publish_latest_read_generation!(opts, new_latest_suffix, cached_chunk_boundaries)
     write_cached_metadata!(opts, :compaction_started?, false)
 
     Task.Supervisor.start_child(stack_task_supervisor(opts.stack_id), fn ->
       rm_rf!(json_file(opts, current_latest_suffix))
       rm_rf!(chunk_file(opts, current_latest_suffix))
       rm_rf!(key_file(opts, current_latest_suffix))
-      rm_rf!(json_file(opts, old_suffix))
-      rm_rf!(chunk_file(opts, old_suffix))
-      rm_rf!(key_file(opts, old_suffix))
+
+      if old_compacted_suffix do
+        remove_compacted_files(opts, old_compacted_suffix)
+      end
     end)
 
     writer_state(state,
       latest_name: new_latest_suffix,
-      writer_acc: WriteLoop.adjust_write_positions(writer_acc, -log_file_pos)
+      writer_acc:
+        writer_acc
+        |> WriteLoop.adjust_write_positions(-log_file_pos)
+        |> WriteLoop.set_cached_chunk_boundaries(cached_chunk_boundaries)
     )
   end
 
@@ -430,30 +759,80 @@ defmodule Electric.ShapeCache.PureFileStorage do
   def snapshot_started?(%__MODULE__{} = opts),
     do: read_cached_metadata(opts, :snapshot_started?) || false
 
+  def compaction_boundary(%__MODULE__{read_only?: true} = opts) do
+    {_latest_name, compaction_boundary} = read_durable_read_generation!(opts)
+    compaction_boundary
+  end
+
   def compaction_boundary(%__MODULE__{} = opts),
-    do: read_metadata!(opts, :compaction_boundary) || {LogOffset.before_all(), nil}
+    do: read_cached_metadata(opts, :compaction_boundary) || {LogOffset.before_all(), nil}
 
   def set_compaction_boundary(%__MODULE__{stack_ets: stack_ets} = opts, boundary) do
+    latest_name = latest_name(opts)
+
+    # Publish the pair first. Read-only rolling-deploy processes consume this
+    # one atomic metadata record and can therefore see either complete
+    # generation, never a latest-name/compaction-boundary mix.
+    write_read_generation!(opts, latest_name, boundary)
+    write_metadata!(opts, :compaction_boundary, boundary)
+
     :ets.update_element(
       stack_ets,
       opts.shape_handle,
       {storage_meta(:compaction_boundary) + 1, boundary}
     )
+  end
 
-    write_metadata!(opts, :compaction_boundary, boundary)
+  def latest_name(%__MODULE__{read_only?: true} = opts) do
+    {latest_name, _compaction_boundary} = read_durable_read_generation!(opts)
+    latest_name
   end
 
   def latest_name(%__MODULE__{} = opts),
     do: read_cached_metadata(opts, :latest_name) || "latest.0"
 
   def set_latest_name(%__MODULE__{stack_ets: stack_ets} = opts, name) do
+    compaction_boundary = compaction_boundary(opts)
+
+    write_read_generation!(opts, name, compaction_boundary)
+    write_metadata!(opts, :latest_name, name)
+
     :ets.update_element(
       stack_ets,
       opts.shape_handle,
       {storage_meta(:latest_name) + 1, name}
     )
 
-    write_metadata!(opts, :latest_name, name)
+    :ok
+  end
+
+  @doc false
+  def publish_latest_read_generation!(
+        %__MODULE__{} = opts,
+        latest_name,
+        cached_chunk_boundaries
+      )
+      when is_binary(latest_name) do
+    compaction_boundary = compaction_boundary(opts)
+
+    # Read-only processes consume one durable generation record. Active readers
+    # obtain the same pair plus cached boundaries from one ETS record lookup.
+    write_read_generation!(opts, latest_name, compaction_boundary)
+    write_metadata!(opts, :latest_name, latest_name)
+
+    try do
+      write_metadata_cache(opts,
+        latest_name: latest_name,
+        compaction_boundary: compaction_boundary,
+        cached_chunk_boundaries: cached_chunk_boundaries
+      )
+    rescue
+      # A writer teardown can remove the stack entry after the durable
+      # generation is published. A replacement writer reconstructs the pair
+      # from the durable latest-name file and its chunk index.
+      ArgumentError -> :ok
+    end
+
     :ok
   end
 
@@ -465,16 +844,92 @@ defmodule Electric.ShapeCache.PureFileStorage do
     {:ok, read_cached_metadata(opts, :pg_snapshot)}
   end
 
-  # move_positions is written only when an outer subquery consumer applies a
-  # dependency move and read only at consumer startup, so it is persisted
-  # directly to disk (term-encoded) rather than through the ETS metadata cache.
+  # Keep the legacy move_positions file current for downgrade compatibility,
+  # while making the combined transaction_state record authoritative. This
+  # prevents a restart from observing move positions from a different durable
+  # log boundary.
   def set_move_positions!(move_positions, %__MODULE__{} = opts) do
-    write_metadata!(opts, :move_positions, move_positions)
+    last_persisted_txn_offset =
+      read_metadata!(opts, :last_persisted_txn_offset) ||
+        LogOffset.last_before_real_offsets()
+
+    transaction_state = read_transaction_state!(opts)
+    legacy_move_positions = read_metadata_file(opts, :move_positions)
+
+    root_delivery_tx_offset =
+      case transaction_state do
+        %{root_delivery_tx_offset: offset} -> offset
+        nil when is_nil(legacy_move_positions) -> 0
+        nil -> nil
+      end
+
+    persist_transaction_state!(opts, last_persisted_txn_offset, move_positions,
+      root_delivery_tx_offset: root_delivery_tx_offset
+    )
+
     :ok
   end
 
   def fetch_move_positions(%__MODULE__{} = opts) do
     {:ok, read_metadata!(opts, :move_positions) || %{}}
+  end
+
+  def fetch_root_delivery_tx_offset(%__MODULE__{} = opts) do
+    case read_transaction_state!(opts) do
+      nil -> {:ok, nil}
+      transaction_state -> {:ok, transaction_state.root_delivery_tx_offset}
+    end
+  end
+
+  def get_log_replay_safe_cursor(%__MODULE__{} = opts) do
+    history_start = read_immutable_cached_metadata(opts, :log_replay_history_start)
+    {compaction_offset, _suffix} = compaction_boundary(opts)
+    LogOffset.max(history_start, compaction_offset)
+  end
+
+  def begin_move_transaction!(writer_state(writer_acc: acc, write_timer: timer) = state) do
+    if not is_nil(timer), do: Process.cancel_timer(timer)
+
+    writer_state(state,
+      writer_acc: WriteLoop.begin_move_transaction(acc, state),
+      write_timer: nil
+    )
+  end
+
+  def commit_move_transaction!(
+        move_positions,
+        root_delivery_tx_offset,
+        writer_state(writer_acc: acc, write_timer: timer, opts: opts) = state
+      )
+      when is_integer(root_delivery_tx_offset) and root_delivery_tx_offset >= 0 do
+    ensure_root_delivery_frontier_monotonic!(opts, root_delivery_tx_offset)
+
+    if not is_nil(timer), do: Process.cancel_timer(timer)
+
+    state
+    |> writer_state(
+      writer_acc:
+        WriteLoop.commit_move_transaction(
+          move_positions,
+          root_delivery_tx_offset,
+          acc,
+          state
+        ),
+      write_timer: nil
+    )
+    |> apply_deferred_compaction()
+  end
+
+  defp apply_deferred_compaction(writer_state(writer_acc: acc) = state) do
+    case WriteLoop.take_deferred_compaction(acc) do
+      {nil, acc} ->
+        writer_state(state, writer_acc: acc)
+
+      {{offset, suffix, log_file_pos}, acc} ->
+        state
+        |> writer_state(writer_acc: acc)
+        |> do_handle_compaction_finished(offset, suffix, log_file_pos)
+    end
   end
 
   defp read_latest_offset(%__MODULE__{} = opts) do
@@ -501,15 +956,16 @@ defmodule Electric.ShapeCache.PureFileStorage do
   def init_writer!(shape_opts, shape_definition) do
     table = :ets.new(:in_memory_storage, [:ordered_set, :protected])
 
-    {initial_acc, suffix} = initialise_filesystem!(shape_opts)
+    {initial_acc, suffix, durable_compaction_boundary} = initialise_filesystem!(shape_opts)
 
     register_with_stack(
       shape_opts,
       table,
       WriteLoop.last_persisted_txn_offset(initial_acc),
-      compaction_boundary(shape_opts),
+      durable_compaction_boundary,
       suffix,
-      WriteLoop.cached_chunk_boundaries(initial_acc)
+      WriteLoop.cached_chunk_boundaries(initial_acc),
+      read_metadata!(shape_opts, :log_replay_history_start)
     )
 
     if shape_definition.storage.compaction == :enabled do
@@ -566,17 +1022,34 @@ defmodule Electric.ShapeCache.PureFileStorage do
       create_directories!(opts)
     end
 
-    suffix =
+    legacy_suffix =
       read_cached_metadata(opts, :latest_name) || write_metadata!(opts, :latest_name, "latest.0")
+
+    {suffix, durable_compaction_boundary} =
+      if initialize? do
+        boundary = {LogOffset.before_all(), nil}
+        write_read_generation!(opts, legacy_suffix, boundary)
+        {legacy_suffix, boundary}
+      else
+        reconcile_read_generation!(opts)
+      end
+
+    if not initialize? do
+      reconcile_stale_compaction!(opts)
+      reconcile_chunk_index_intent!(opts)
+    end
 
     {last_persisted_txn_offset, json_file_size, chunks} =
       if initialize? do
+        ensure_log_replay_history_start!(opts, LogOffset.before_all())
+
         {LogOffset.last_before_real_offsets(), 0, []}
       else
         last_persisted_txn_offset =
-          read_cached_metadata(opts, :last_persisted_txn_offset) ||
+          read_metadata!(opts, :last_persisted_txn_offset) ||
             LogOffset.last_before_real_offsets()
 
+        ensure_log_replay_history_start!(opts, last_persisted_txn_offset)
         trim_log!(opts, last_persisted_txn_offset, suffix)
 
         {
@@ -602,7 +1075,7 @@ defmodule Electric.ShapeCache.PureFileStorage do
        bytes_in_chunk: json_file_size - position,
        chunk_started?: is_nil(chunk_end_offset),
        chunks: reformat_chunks_for_cache(chunks)
-     ), suffix}
+     ), suffix, durable_compaction_boundary}
   end
 
   defp trim_log!(%__MODULE__{} = opts, last_persisted_offset, suffix) do
@@ -617,11 +1090,135 @@ defmodule Electric.ShapeCache.PureFileStorage do
     LogFile.trim(json_file(opts, suffix), log_search_start_pos, last_persisted_offset)
   end
 
+  # The durable token names both the result owner and its monitored guard task.
+  # A running attempt is valid only while both processes are alive. A finished
+  # attempt intentionally outlives its guard while the owner holds the result
+  # message, including while a dependency move defers publication.
+  defp reconcile_stale_compaction!(%__MODULE__{} = opts) do
+    case read_metadata!(opts, :compaction_started?) do
+      state when state in [nil, false] ->
+        remove_unreferenced_generation_files(opts)
+
+      {:running, _attempt_id, owner, task_pid} = state
+      when is_pid(owner) and is_pid(task_pid) ->
+        if Process.alive?(owner) and Process.alive?(task_pid) do
+          :ok
+        else
+          stop_compaction_task(task_pid)
+          abort_stale_compaction_attempt(opts, state)
+        end
+
+      {:finished, _attempt_id, owner, _task_pid, _suffix} = state when is_pid(owner) ->
+        if Process.alive?(owner),
+          do: :ok,
+          else: abort_stale_compaction_attempt(opts, state)
+
+      # Tokens written by the immediately preceding implementation do not
+      # identify the task and therefore cannot prove that work is still owned.
+      # New attempts use isolated workspaces, and any delayed old result fails
+      # the token check in handle_compaction_finished/4 and is deleted.
+      {:running, _attempt_id, owner} = state when is_pid(owner) ->
+        if Process.alive?(owner),
+          do: :ok,
+          else: abort_stale_compaction_attempt(opts, state)
+
+      {:finished, _attempt_id, owner, _suffix} = state when is_pid(owner) ->
+        if Process.alive?(owner),
+          do: :ok,
+          else: abort_stale_compaction_attempt(opts, state)
+
+      invalid ->
+        Logger.warning("Discarding invalid durable compaction token",
+          shape_handle: opts.shape_handle,
+          compaction_token: inspect(invalid)
+        )
+
+        abort_stale_compaction_attempt(opts, invalid)
+    end
+  end
+
+  defp abort_stale_compaction_attempt(opts, token) do
+    case token do
+      {:running, attempt_id, _owner, _task_pid}
+      when is_integer(attempt_id) ->
+        cleanup_compaction_attempt_dir(opts, attempt_id)
+        remove_compaction_attempt_outputs(opts, attempt_id)
+
+      {:finished, attempt_id, _owner, _task_pid, suffix}
+      when is_integer(attempt_id) and is_binary(suffix) ->
+        cleanup_compaction_attempt_dir(opts, attempt_id)
+        remove_compacted_files_if_unreferenced(opts, suffix)
+
+      {:finished, _attempt_id, _owner, suffix} when is_binary(suffix) ->
+        remove_compacted_files_if_unreferenced(opts, suffix)
+
+      _legacy_or_invalid ->
+        :ok
+    end
+
+    clear_compaction_token_if_matches(opts, token)
+    remove_unreferenced_generation_files(opts)
+  end
+
+  defp remove_unreferenced_generation_files(%__MODULE__{} = opts) do
+    latest_suffix = read_metadata!(opts, :latest_name)
+
+    {_offset, compacted_suffix} =
+      read_metadata!(opts, :compaction_boundary) || {LogOffset.before_all(), nil}
+
+    referenced_paths =
+      [latest_suffix, compacted_suffix]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.flat_map(fn suffix ->
+        [json_file(opts, suffix), chunk_file(opts, suffix), key_file(opts, suffix)]
+      end)
+      |> MapSet.new()
+
+    ["log.compacted.*", "log.latest.*"]
+    |> Enum.flat_map(fn pattern -> Path.wildcard(shape_log_path(opts, pattern)) end)
+    |> Enum.reject(&MapSet.member?(referenced_paths, &1))
+    |> Enum.each(&rm_rf!/1)
+  end
+
+  defp remove_compaction_attempt_outputs(%__MODULE__{} = opts, attempt_id) do
+    opts
+    |> shape_log_path("log.compacted.*.#{attempt_id}.*")
+    |> Path.wildcard()
+    |> Enum.each(&rm_rf!/1)
+  end
+
+  defp remove_compacted_files(%__MODULE__{} = opts, suffix) do
+    rm_rf!(json_file(opts, suffix))
+    rm_rf!(chunk_file(opts, suffix))
+    rm_rf!(key_file(opts, suffix))
+  end
+
+  defp remove_compacted_files_if_unreferenced(%__MODULE__{} = opts, suffix) do
+    case read_metadata!(opts, :compaction_boundary) do
+      {_offset, ^suffix} -> :ok
+      _other -> remove_compacted_files(opts, suffix)
+    end
+  end
+
   # optimization for snapshot started boolean to avoid expensive file open
   defp read_metadata!(%__MODULE__{} = opts, key) when key in @boolean_stored_keys,
     do: FileInfo.exists?(shape_metadata_path(opts, "#{key}.bin"))
 
+  defp read_metadata!(%__MODULE__{} = opts, key)
+       when key in [:last_persisted_txn_offset, :move_positions] do
+    case read_transaction_state!(opts) do
+      nil -> read_metadata_file(opts, key)
+      transaction_state -> Map.fetch!(transaction_state, key)
+    end
+  end
+
   defp read_metadata!(%__MODULE__{} = opts, key) when key in @stored_keys do
+    read_metadata_file(opts, key)
+  end
+
+  defp read_metadata!(%__MODULE__{} = _opts, _key), do: nil
+
+  defp read_metadata_file(%__MODULE__{} = opts, key) when key in @stored_keys do
     case File.open(
            shape_metadata_path(opts, "#{key}.bin"),
            [:read, :raw],
@@ -632,7 +1229,159 @@ defmodule Electric.ShapeCache.PureFileStorage do
     end
   end
 
-  defp read_metadata!(%__MODULE__{} = _opts, _key), do: nil
+  defp read_transaction_state!(%__MODULE__{} = opts) do
+    case read_metadata_file(opts, :transaction_state) do
+      nil ->
+        nil
+
+      %{
+        version: @transaction_state_version,
+        last_persisted_txn_offset: %LogOffset{},
+        move_positions: move_positions,
+        root_delivery_tx_offset: root_delivery_tx_offset
+      } = transaction_state
+      when is_map(move_positions) and
+             (is_nil(root_delivery_tx_offset) or
+                (is_integer(root_delivery_tx_offset) and root_delivery_tx_offset >= 0)) ->
+        transaction_state
+        |> Map.put_new(:chunk_index_intent, nil)
+        |> validate_chunk_index_transaction_intent!()
+
+      %{
+        version: @legacy_transaction_state_version,
+        last_persisted_txn_offset: %LogOffset{},
+        move_positions: move_positions
+      } = transaction_state
+      when is_map(move_positions) ->
+        transaction_state
+        |> Map.put(:version, @transaction_state_version)
+        |> Map.put(:root_delivery_tx_offset, nil)
+        |> Map.put_new(:chunk_index_intent, nil)
+        |> validate_chunk_index_transaction_intent!()
+
+      invalid ->
+        raise Storage.Error,
+          message: "Invalid dependency-move transaction state: #{inspect(invalid)}"
+    end
+  end
+
+  defp write_read_generation!(opts, latest_name, compaction_boundary) do
+    read_generation = %{
+      version: @read_generation_version,
+      latest_name: latest_name,
+      compaction_boundary: compaction_boundary
+    }
+
+    validate_read_generation!(read_generation)
+    write_metadata!(opts, :read_generation, read_generation)
+  end
+
+  defp read_durable_read_generation!(opts) do
+    case read_metadata_file(opts, :read_generation) do
+      nil -> read_stable_legacy_generation!(opts, @legacy_read_generation_attempts)
+      read_generation -> decode_read_generation!(read_generation)
+    end
+  end
+
+  defp reconcile_read_generation!(opts) do
+    {latest_name, compaction_boundary} = read_durable_read_generation!(opts)
+
+    # The combined record is authoritative. Mirror its values for rollback and
+    # repair a crash after combined publication but before either legacy file.
+    write_read_generation!(opts, latest_name, compaction_boundary)
+    write_metadata!(opts, :compaction_boundary, compaction_boundary)
+    write_metadata!(opts, :latest_name, latest_name)
+
+    {latest_name, compaction_boundary}
+  end
+
+  defp decode_read_generation!(read_generation) do
+    validate_read_generation!(read_generation)
+    {read_generation.latest_name, read_generation.compaction_boundary}
+  end
+
+  defp validate_read_generation!(%{
+         version: @read_generation_version,
+         latest_name: latest_name,
+         compaction_boundary: {%LogOffset{}, compacted_name}
+       })
+       when is_binary(latest_name) and latest_name != "" and
+              (is_nil(compacted_name) or
+                 (is_binary(compacted_name) and compacted_name != "")),
+       do: :ok
+
+  defp validate_read_generation!(invalid) do
+    raise Storage.Error,
+      message: "Invalid durable read generation: #{inspect(invalid)}"
+  end
+
+  defp read_stable_legacy_generation!(opts, attempts_remaining)
+       when attempts_remaining > 0 do
+    first = read_legacy_generation(opts)
+    second = read_legacy_generation(opts)
+
+    if first == second do
+      first
+    else
+      read_stable_legacy_generation!(opts, attempts_remaining - 1)
+    end
+  end
+
+  defp read_stable_legacy_generation!(opts, 0) do
+    raise Storage.Error,
+      message:
+        "Could not read a stable legacy storage generation for shape " <>
+          inspect(opts.shape_handle)
+  end
+
+  # Legacy writers publish the compaction boundary before the latest name. Read
+  # in that same order twice so a publication interleaving cannot synthesize the
+  # unsafe reverse pair (old boundary + new latest).
+  defp read_legacy_generation(opts) do
+    compaction_boundary =
+      read_metadata_file(opts, :compaction_boundary) || {LogOffset.before_all(), nil}
+
+    latest_name = read_metadata_file(opts, :latest_name) || "latest.0"
+
+    read_generation = %{
+      version: @read_generation_version,
+      latest_name: latest_name,
+      compaction_boundary: compaction_boundary
+    }
+
+    decode_read_generation!(read_generation)
+  end
+
+  defp validate_chunk_index_transaction_intent!(transaction_state) do
+    chunk_index_intent = normalize_chunk_index_intent(transaction_state.chunk_index_intent)
+    validate_chunk_index_intent!(chunk_index_intent)
+    %{transaction_state | chunk_index_intent: chunk_index_intent}
+  end
+
+  defp normalize_chunk_index_intent(nil), do: nil
+
+  defp normalize_chunk_index_intent(intent) when is_map(intent),
+    do: Map.put_new(intent, :addressability_bridge, nil)
+
+  defp validate_chunk_index_intent!(nil), do: :ok
+
+  defp validate_chunk_index_intent!(%{
+         version: @chunk_index_intent_version,
+         chunk_file_suffix: suffix,
+         start_position: start_position,
+         bytes: bytes,
+         addressability_bridge: addressability_bridge
+       })
+       when is_binary(suffix) and suffix != "" and is_integer(start_position) and
+              start_position >= 0 and is_binary(bytes) and byte_size(bytes) > 0 and
+              (is_nil(addressability_bridge) or
+                 (is_binary(addressability_bridge) and byte_size(addressability_bridge) > 0)),
+       do: :ok
+
+  defp validate_chunk_index_intent!(invalid_intent) do
+    raise Storage.Error,
+      message: "Invalid dependency-move chunk-index intent: #{inspect(invalid_intent)}"
+  end
 
   # Read metadata with ETS-first, disk-fallback pattern
   defp read_cached_metadata(%__MODULE__{} = opts, key) do
@@ -640,6 +1389,21 @@ defmodule Electric.ShapeCache.PureFileStorage do
       [{^key, nil}] -> read_metadata!(opts, key)
       [{^key, value}] -> value
     end
+  end
+
+  # This metadata never changes after shape initialization, so read-only
+  # rolling-deploy readers may safely use the shared ETS copy instead of
+  # reopening its metadata file for every replay transaction.
+  defp read_immutable_cached_metadata(%__MODULE__{shape_handle: handle} = opts, key) do
+    meta =
+      case :ets.lookup(opts.stack_ets, handle) do
+        [] -> populate_read_through_cache!(opts, [key])
+        [storage_meta() = meta] -> meta
+      end
+
+    meta
+    |> expand_storage_meta([key])
+    |> Keyword.fetch!(key)
   end
 
   defp read_multiple_cached_metadata(%__MODULE__{} = opts, keys) do
@@ -665,10 +1429,15 @@ defmodule Electric.ShapeCache.PureFileStorage do
 
   defp read_from_disk_without_caching(%__MODULE__{shape_handle: handle} = opts, extra_keys) do
     read_keys = Enum.into(extra_keys, MapSet.new(@read_path_keys))
+    {latest_name, compaction_boundary} = read_durable_read_generation!(opts)
 
     keys =
       for key <- read_keys do
-        {key, read_metadata!(opts, key)}
+        case key do
+          :latest_name -> {:latest_name, latest_name}
+          :compaction_boundary -> {:compaction_boundary, compaction_boundary}
+          key -> {key, read_metadata!(opts, key)}
+        end
       end
 
     create_storage_meta([{:shape_handle, handle} | keys])
@@ -756,7 +1525,15 @@ defmodule Electric.ShapeCache.PureFileStorage do
     mkdir_p!(shape_metadata_dir(opts))
   end
 
-  defp register_with_stack(opts, table, stable_offset, compaction_boundary, suffix, chunks) do
+  defp register_with_stack(
+         opts,
+         table,
+         stable_offset,
+         compaction_boundary,
+         suffix,
+         chunks,
+         log_replay_history_start
+       ) do
     metadata =
       read_multiple_cached_metadata(opts, [
         :snapshot_started?,
@@ -780,6 +1557,7 @@ defmodule Electric.ShapeCache.PureFileStorage do
         last_persisted_txn_offset: stable_offset,
         last_persisted_offset: stable_offset,
         last_seen_txn_offset: stable_offset,
+        log_replay_history_start: log_replay_history_start,
         compaction_boundary: compaction_boundary,
         latest_name: suffix,
         snapshot_started?: snapshot_started,
@@ -809,6 +1587,11 @@ defmodule Electric.ShapeCache.PureFileStorage do
           compacted :: {boundary :: LogOffset.t(), path :: String.t()},
           cached_chunks :: {prev_max :: LogOffset.t() | nil, [chunk]}
         }
+  defp read_boundary_info(%__MODULE__{read_only?: true} = opts) do
+    {latest_name, compaction_boundary} = read_durable_read_generation!(opts)
+    {latest_name, compaction_boundary, {nil, []}}
+  end
+
   defp read_boundary_info(%__MODULE__{} = opts) do
     metadata =
       read_multiple_cached_metadata(opts, [
@@ -864,30 +1647,81 @@ defmodule Electric.ShapeCache.PureFileStorage do
   end
 
   def get_chunk_end_log_offset(offset, %__MODULE__{} = opts) do
+    get_chunk_end_log_offset(offset, opts, 1)
+  end
+
+  defp get_chunk_end_log_offset(offset, %__MODULE__{} = opts, retries_remaining) do
     case fetch_chunk(offset, opts) do
-      {:ok, max_offset, _} -> max_offset
-      :error -> nil
+      {:ok, nil, _} ->
+        nil
+
+      {:ok, max_offset, _} ->
+        published_offset = read_latest_offset(opts)
+
+        if LogOffset.is_log_offset_lte(max_offset, published_offset),
+          do: max_offset,
+          else: nil
+
+      :error ->
+        nil
     end
+  rescue
+    error in File.Error ->
+      if retries_remaining > 0 and error.reason == :enoent and not shape_gone?(opts) do
+        # A compaction generation can be reclaimed after this lookup captures
+        # it but before the chunk index is opened. Match the streaming read path
+        # by retrying once from one fresh metadata snapshot.
+        get_chunk_end_log_offset(offset, opts, retries_remaining - 1)
+      else
+        reraise error, __STACKTRACE__
+      end
   end
 
   defp fetch_chunk(offset, %__MODULE__{} = opts, boundary_info \\ nil) do
     {latest_name, {compaction_boundary, compacted_name}, {cached_min, chunks}} =
-      boundary_info || read_boundary_info(opts)
+      boundary_info = boundary_info || read_boundary_info(opts)
 
     # Any virtual offsets are handled elsewhere - normalize them to the last before real offsets for main log
     offset = if is_virtual_offset(offset), do: LogOffset.last_before_real_offsets(), else: offset
 
-    cond do
-      LogOffset.is_log_offset_lt(offset, compaction_boundary) ->
-        ChunkIndex.fetch_chunk(chunk_file(opts, compacted_name), offset)
+    result =
+      cond do
+        LogOffset.is_log_offset_lt(offset, compaction_boundary) ->
+          ChunkIndex.fetch_chunk(chunk_file(opts, compacted_name), offset)
 
-      not is_nil(cached_min) and LogOffset.is_log_offset_lte(cached_min, offset) ->
-        find_chunk_positions_in_cache(chunks, offset)
+        not is_nil(cached_min) and LogOffset.is_log_offset_lte(cached_min, offset) ->
+          find_chunk_positions_in_cache(chunks, offset)
 
-      true ->
-        ChunkIndex.fetch_chunk(chunk_file(opts, latest_name), offset)
-    end
+        true ->
+          ChunkIndex.fetch_chunk(chunk_file(opts, latest_name), offset)
+      end
+
+    chunk_path =
+      if LogOffset.is_log_offset_lt(offset, compaction_boundary),
+        do: chunk_file(opts, compacted_name),
+        else: chunk_file(opts, latest_name)
+
+    ensure_missing_chunk_is_current!(result, chunk_path, boundary_info, opts)
   end
+
+  defp ensure_missing_chunk_is_current!(:error, chunk_path, captured_generation, opts) do
+    if not FileInfo.exists?(chunk_path) and not shape_gone?(opts) do
+      fresh_generation = read_boundary_info(opts)
+
+      if read_generation_identity(fresh_generation) !=
+           read_generation_identity(captured_generation) do
+        raise File.Error, path: chunk_path, reason: :enoent
+      end
+    end
+
+    :error
+  end
+
+  defp ensure_missing_chunk_is_current!(result, _chunk_path, _captured_generation, _opts),
+    do: result
+
+  defp read_generation_identity({latest_name, compaction_boundary, _cached_chunks}),
+    do: {latest_name, compaction_boundary}
 
   defp find_chunk_positions_in_cache([], _), do: :error
   defp find_chunk_positions_in_cache([{{_, nil}, positions}], _), do: {:ok, nil, positions}
@@ -1100,6 +1934,65 @@ defmodule Electric.ShapeCache.PureFileStorage do
          project_item,
          exact_upper_bound?
        ) do
+    LogFile.stream_jsons_from_segment_initializer(
+      fn ->
+        initialize_main_log_stream(
+          min_offset,
+          max_offset,
+          opts,
+          project_item,
+          exact_upper_bound?,
+          1
+        )
+      end,
+      project_item
+    )
+  end
+
+  defp initialize_main_log_stream(
+         min_offset,
+         max_offset,
+         %__MODULE__{} = opts,
+         project_item,
+         exact_upper_bound?,
+         retries_remaining
+       ) do
+    {segment_specs, tail} =
+      prepare_main_log_stream(
+        min_offset,
+        max_offset,
+        opts,
+        project_item,
+        exact_upper_bound?
+      )
+
+    LogFile.initialize_json_stream(opts, segment_specs, tail)
+  rescue
+    error in File.Error ->
+      if retries_remaining > 0 and error.reason == :enoent and not shape_gone?(opts) do
+        # Opening every segment is one atomic initialization attempt from the
+        # reader's perspective. LogFile closes any descriptors opened before
+        # the failure; retry once from a fresh durable generation snapshot.
+        initialize_main_log_stream(
+          min_offset,
+          max_offset,
+          opts,
+          project_item,
+          exact_upper_bound?,
+          retries_remaining - 1
+        )
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
+
+  defp prepare_main_log_stream(
+         min_offset,
+         max_offset,
+         %__MODULE__{} = opts,
+         project_item,
+         exact_upper_bound?
+       ) do
     storage_meta(
       ets_table: ets,
       last_persisted_offset: last_persisted,
@@ -1118,13 +2011,26 @@ defmodule Electric.ShapeCache.PureFileStorage do
         )
 
     last_seen = last_seen || last_persisted
+
     boundary_info = normalize_boundary_info(opts, latest_name, compaction, cached_boundaries)
 
-    upper_read_bound = LogOffset.min(max_offset, last_seen)
+    published_offset = last_seen
+    upper_read_bound = LogOffset.min(max_offset, published_offset)
+
+    # Whole-chunk reads are part of the public API, but only when every byte in
+    # the chunk is published. Fragment and dependency-move writes may be
+    # datasync'd before their transaction cursor advances. Clamp those reads to
+    # the published cursor so a completed physical chunk cannot expose its
+    # uncommitted tail.
+    exact_upper_bound? =
+      exact_upper_bound? or is_log_offset_lt(last_seen, last_persisted)
 
     cond do
+      is_log_offset_lte(upper_read_bound, min_offset) ->
+        {[], []}
+
       is_log_offset_lte(last_persisted, min_offset) and is_nil(ets) ->
-        []
+        {[], []}
 
       is_log_offset_lte(last_persisted, min_offset) ->
         # Pure ETS read case
@@ -1133,28 +2039,28 @@ defmodule Electric.ShapeCache.PureFileStorage do
             # Empty or partial read - ETS was cleared by a concurrent flush.
             # Data is now on disk (flush writes to disk before clearing ETS),
             # so read directly from there using existing boundary info.
-            stream_from_disk(
-              opts,
-              min_offset,
-              upper_read_bound,
-              boundary_info,
-              project_item,
-              exact_upper_bound?
-            )
+            {disk_segment_specs(
+               opts,
+               min_offset,
+               upper_read_bound,
+               boundary_info,
+               exact_upper_bound?,
+               published_offset
+             ), []}
 
           {data, :complete} ->
-            data
+            {[], data}
         end
 
       is_log_offset_lte(upper_read_bound, last_persisted) ->
-        stream_from_disk(
-          opts,
-          min_offset,
-          upper_read_bound,
-          boundary_info,
-          project_item,
-          exact_upper_bound?
-        )
+        {disk_segment_specs(
+           opts,
+           min_offset,
+           upper_read_bound,
+           boundary_info,
+           exact_upper_bound?,
+           published_offset
+         ), []}
 
       true ->
         # Mixed disk + ETS case
@@ -1164,25 +2070,24 @@ defmodule Electric.ShapeCache.PureFileStorage do
           {_upper_range, :incomplete} ->
             # Empty or partial read - ETS was cleared by a concurrent flush.
             # Data is now on disk, so read the full range from there.
-            stream_from_disk(
-              opts,
-              min_offset,
-              upper_read_bound,
-              boundary_info,
-              project_item,
-              exact_upper_bound?
-            )
+            {disk_segment_specs(
+               opts,
+               min_offset,
+               upper_read_bound,
+               boundary_info,
+               exact_upper_bound?,
+               published_offset
+             ), []}
 
           {upper_range, :complete} ->
-            stream_from_disk(
-              opts,
-              min_offset,
-              last_persisted,
-              boundary_info,
-              project_item,
-              exact_upper_bound?
-            )
-            |> Stream.concat(upper_range)
+            {disk_segment_specs(
+               opts,
+               min_offset,
+               last_persisted,
+               boundary_info,
+               exact_upper_bound?,
+               published_offset
+             ), upper_range}
         end
     end
   end
@@ -1292,73 +2197,121 @@ defmodule Electric.ShapeCache.PureFileStorage do
     ArgumentError -> :ets_dead
   end
 
-  defp stream_from_disk(
+  defp disk_segment_specs(
          %__MODULE__{},
          min_offset,
          max_offset,
-         _,
-         _project_item,
-         _exact_upper_bound?
+         _boundary_info,
+         _exact_upper_bound?,
+         _published_offset
        )
        when is_log_offset_lte(max_offset, min_offset),
        do: []
 
-  defp stream_from_disk(
+  # A logical replay spans at most the compacted and latest generations. Build
+  # one segment per generation, then open every segment together in the outer
+  # Stream.resource initializer. This preserves ordinary whole-chunk reads
+  # without retaining one descriptor per physical chunk.
+  defp disk_segment_specs(
          %__MODULE__{} = opts,
          min_offset,
          max_offset,
          boundary_info,
-         project_item,
-         exact_upper_bound?
+         exact_upper_bound?,
+         published_offset
        ) do
     suffix = get_suffix(min_offset, boundary_info)
+    {_latest_name, {compaction_boundary, _compacted_name}, _cached_chunks} = boundary_info
+
+    generation_ceiling =
+      if is_log_offset_lt(min_offset, compaction_boundary),
+        do: compaction_boundary,
+        else: published_offset
+
+    requested_generation_max = LogOffset.min(max_offset, generation_ceiling)
 
     case fetch_chunk(min_offset, opts, boundary_info) do
-      {:ok, chunk_end_offset, {start_pos, end_pos}} when not is_nil(end_pos) ->
-        if exact_upper_bound? and is_log_offset_lt(max_offset, chunk_end_offset) do
-          LogFile.stream_jsons_until_offset(
-            opts,
-            json_file(opts, suffix),
-            start_pos,
-            min_offset,
-            max_offset,
-            project_item
-          )
-        else
-          LogFile.stream_jsons(
-            opts,
-            json_file(opts, suffix),
-            start_pos,
-            end_pos,
-            min_offset,
-            project_item
-          )
-          |> Stream.concat(
-            stream_from_disk(
+      {:ok, _chunk_end_offset, {start_pos, _end_pos}} = first_chunk ->
+        generation_max_offset =
+          if exact_upper_bound? do
+            requested_generation_max
+          else
+            ordinary_generation_max(
               opts,
-              chunk_end_offset,
-              max_offset,
+              requested_generation_max,
+              generation_ceiling,
+              published_offset,
               boundary_info,
-              project_item,
-              exact_upper_bound?
+              first_chunk
             )
-          )
-        end
+          end
 
-      {:ok, nil, {start_pos, nil}} ->
-        LogFile.stream_jsons_until_offset(
-          opts,
-          json_file(opts, suffix),
-          start_pos,
-          min_offset,
-          max_offset,
-          project_item
-        )
+        current_segment =
+          {json_file(opts, suffix), start_pos, min_offset, generation_max_offset}
+
+        if is_log_offset_lt(generation_max_offset, max_offset) do
+          [
+            current_segment
+            | disk_segment_specs(
+                opts,
+                generation_max_offset,
+                max_offset,
+                boundary_info,
+                exact_upper_bound?,
+                published_offset
+              )
+          ]
+        else
+          [current_segment]
+        end
 
       :error ->
         []
     end
   end
+
+  defp ordinary_generation_max(
+         opts,
+         requested_max,
+         generation_ceiling,
+         published_offset,
+         boundary_info,
+         {:ok, chunk_end_offset, {_start_pos, end_pos}}
+       )
+       when not is_nil(chunk_end_offset) and not is_nil(end_pos) do
+    cond do
+      is_log_offset_lt(published_offset, chunk_end_offset) ->
+        # A physical chunk may be completed before its transaction cursor is
+        # published. Never let ordinary whole-chunk behavior expose that tail.
+        requested_max
+
+      is_log_offset_lte(requested_max, chunk_end_offset) ->
+        LogOffset.min(chunk_end_offset, generation_ceiling)
+
+      is_log_offset_lt(chunk_end_offset, generation_ceiling) ->
+        ordinary_generation_max(
+          opts,
+          requested_max,
+          generation_ceiling,
+          published_offset,
+          boundary_info,
+          fetch_chunk(chunk_end_offset, opts, boundary_info)
+        )
+
+      true ->
+        generation_ceiling
+    end
+  end
+
+  defp ordinary_generation_max(
+         _opts,
+         requested_max,
+         _generation_ceiling,
+         _published_offset,
+         _boundary_info,
+         _incomplete_or_missing_chunk
+       ),
+       do: requested_max
 
   defp get_suffix(min_offset, {_, {compaction_boundary, compacted_name}, _})
        when is_log_offset_lt(min_offset, compaction_boundary),
@@ -1412,8 +2365,9 @@ defmodule Electric.ShapeCache.PureFileStorage do
   # xid is not actually used here since it's not possible for transaction writes to interleave.
   # It's part of the function signature for testing.
   def signal_txn_commit!(_xid, writer_state(writer_acc: acc) = state) do
-    acc = WriteLoop.signal_txn_commit(acc, state)
-    writer_state(state, writer_acc: acc)
+    state
+    |> writer_state(writer_acc: WriteLoop.signal_txn_commit(acc, state))
+    |> apply_deferred_compaction()
   end
 
   def update_chunk_boundaries_cache(opts, boundaries) do
@@ -1462,7 +2416,21 @@ defmodule Electric.ShapeCache.PureFileStorage do
         old_last_persisted_txn_offset
       ) do
     if old_last_persisted_txn_offset != last_persisted_txn_offset do
-      write_metadata!(opts, :last_persisted_txn_offset, last_persisted_txn_offset)
+      case read_transaction_state!(opts) do
+        nil ->
+          # Shapes stay on the single legacy cursor until either a dependency
+          # consumer or a crash-safe staged chunk-index commit activates the
+          # combined transaction state.
+          write_metadata!(opts, :last_persisted_txn_offset, last_persisted_txn_offset)
+
+        %{move_positions: move_positions} ->
+          persist_transaction_state!(
+            opts,
+            last_persisted_txn_offset,
+            move_positions,
+            mirror_move_positions?: false
+          )
+      end
     end
 
     try do
@@ -1475,6 +2443,360 @@ defmodule Electric.ShapeCache.PureFileStorage do
     rescue
       ArgumentError -> true
     end
+  end
+
+  @doc false
+  def commit_transaction_state!(
+        %__MODULE__{} = opts,
+        last_persisted_txn_offset,
+        move_positions,
+        root_delivery_tx_offset,
+        chunk_index_intent \\ nil
+      )
+      when is_map(move_positions) and
+             (is_nil(root_delivery_tx_offset) or
+                (is_integer(root_delivery_tx_offset) and root_delivery_tx_offset >= 0)) do
+    root_delivery_tx_offset =
+      monotonic_root_delivery_frontier!(opts, root_delivery_tx_offset)
+
+    persist_transaction_state!(opts, last_persisted_txn_offset, move_positions,
+      chunk_index_intent: chunk_index_intent,
+      root_delivery_tx_offset: root_delivery_tx_offset
+    )
+
+    try do
+      write_metadata_cache(
+        opts,
+        last_persisted_txn_offset: last_persisted_txn_offset,
+        last_persisted_offset: last_persisted_txn_offset,
+        last_seen_txn_offset: last_persisted_txn_offset
+      )
+    rescue
+      ArgumentError -> :ok
+    end
+
+    :ok
+  end
+
+  @doc false
+  def new_chunk_index_intent!(
+        %__MODULE__{} = opts,
+        chunk_file_suffix,
+        bytes
+      )
+      when is_binary(chunk_file_suffix) and chunk_file_suffix != "" and is_binary(bytes) and
+             byte_size(bytes) > 0 do
+    path = chunk_file(opts, chunk_file_suffix)
+
+    addressability_bridge =
+      case ChunkIndex.get_last_boundary(path) do
+        {:complete, _offset, _log_position, _key_position} ->
+          bridge_size = byte_size(ChunkIndex.make_half_entry(LogOffset.before_all(), 0, 0))
+          binary_part(bytes, 0, bridge_size)
+
+        {:incomplete, _offset, _log_position, _key_position} ->
+          nil
+      end
+
+    new_chunk_index_intent!(opts, chunk_file_suffix, bytes, addressability_bridge)
+  end
+
+  @doc false
+  def new_chunk_index_intent!(
+        %__MODULE__{} = opts,
+        chunk_file_suffix,
+        bytes,
+        addressability_bridge
+      )
+      when is_binary(chunk_file_suffix) and chunk_file_suffix != "" and is_binary(bytes) and
+             byte_size(bytes) > 0 and
+             (is_nil(addressability_bridge) or
+                (is_binary(addressability_bridge) and byte_size(addressability_bridge) > 0)) do
+    expected_bridge_size =
+      LogOffset.before_all()
+      |> ChunkIndex.make_half_entry(0, 0)
+      |> byte_size()
+
+    unless is_nil(addressability_bridge) or
+             byte_size(addressability_bridge) == expected_bridge_size do
+      raise Storage.Error,
+        message:
+          "dependency-move chunk-index bridge must contain exactly one half-entry " <>
+            "(expected_bytes=#{expected_bridge_size}, " <>
+            "actual_bytes=#{byte_size(addressability_bridge)})"
+    end
+
+    unless is_nil(addressability_bridge) or
+             (byte_size(bytes) >= expected_bridge_size and
+                binary_part(bytes, 0, expected_bridge_size) == addressability_bridge) do
+      raise Storage.Error,
+        message: "dependency-move chunk-index bridge is not a prefix of its append intent"
+    end
+
+    start_position = FileInfo.get_file_size!(chunk_file(opts, chunk_file_suffix)) || 0
+
+    case ChunkIndex.get_last_boundary(chunk_file(opts, chunk_file_suffix), start_position) do
+      {:complete, _offset, _log_position, _key_position}
+      when is_binary(addressability_bridge) ->
+        :ok
+
+      {:incomplete, _offset, _log_position, _key_position}
+      when is_nil(addressability_bridge) ->
+        :ok
+
+      {:complete, _offset, _log_position, _key_position} ->
+        raise Storage.Error,
+          message:
+            "dependency-move chunk-index intent starting a new chunk requires an " <>
+              "addressability bridge"
+
+      {:incomplete, _offset, _log_position, _key_position} ->
+        raise Storage.Error,
+          message:
+            "dependency-move chunk-index intent extending an incomplete chunk must not " <>
+              "publish a pre-commit bridge"
+    end
+
+    %{
+      version: @chunk_index_intent_version,
+      chunk_file_suffix: chunk_file_suffix,
+      start_position: start_position,
+      bytes: bytes,
+      addressability_bridge: addressability_bridge
+    }
+  end
+
+  @doc false
+  def publish_chunk_index_addressability_bridge!(%__MODULE__{}, nil), do: :ok
+
+  def publish_chunk_index_addressability_bridge!(
+        %__MODULE__{},
+        %{addressability_bridge: nil}
+      ),
+      do: :ok
+
+  def publish_chunk_index_addressability_bridge!(
+        %__MODULE__{} = opts,
+        %{
+          chunk_file_suffix: chunk_file_suffix,
+          start_position: start_position,
+          addressability_bridge: addressability_bridge
+        }
+      ) do
+    path = chunk_file(opts, chunk_file_suffix)
+
+    publish_append_intent!(
+      path,
+      start_position,
+      addressability_bridge,
+      "dependency-move chunk-index addressability bridge"
+    )
+
+    case ChunkIndex.get_last_boundary(path) do
+      {:incomplete, _offset, _log_position, _key_position} ->
+        :ok
+
+      {:complete, _offset, _log_position, _key_position} ->
+        raise Storage.Error,
+          message: "dependency-move chunk-index bridge unexpectedly completed a chunk"
+    end
+
+    # The writer's cached boundaries contain the still-private complete chunks.
+    # Force readers through the shared file, whose incomplete bridge always
+    # honors the published upper cursor until the full index intent is durable.
+    update_chunk_boundaries_cache(opts, {nil, []})
+    :ok
+  end
+
+  @doc false
+  def publish_chunk_index_intent!(
+        %__MODULE__{} = opts,
+        %{
+          version: @chunk_index_intent_version,
+          chunk_file_suffix: chunk_file_suffix,
+          start_position: start_position,
+          bytes: bytes
+        } = intent
+      ) do
+    path = chunk_file(opts, chunk_file_suffix)
+    publish_append_intent!(path, start_position, bytes, "dependency-move chunk-index")
+
+    intent
+  end
+
+  @doc false
+  def clear_chunk_index_intent!(%__MODULE__{} = opts, expected_intent) do
+    case read_transaction_state!(opts) do
+      %{
+        last_persisted_txn_offset: last_persisted_txn_offset,
+        move_positions: move_positions,
+        chunk_index_intent: ^expected_intent
+      } ->
+        persist_transaction_state!(opts, last_persisted_txn_offset, move_positions,
+          chunk_index_intent: nil,
+          mirror_move_positions?: false
+        )
+
+        :ok
+
+      %{chunk_index_intent: nil} ->
+        :ok
+
+      %{chunk_index_intent: other_intent} ->
+        raise Storage.Error,
+          message:
+            "Cannot clear superseded dependency-move chunk-index intent: " <>
+              "expected #{inspect(expected_intent)}, found #{inspect(other_intent)}"
+
+      nil ->
+        raise Storage.Error,
+          message: "Cannot clear dependency-move chunk-index intent without transaction state"
+    end
+  end
+
+  @doc false
+  def reconcile_chunk_index_intent!(%__MODULE__{} = opts) do
+    case read_transaction_state!(opts) do
+      nil ->
+        :ok
+
+      %{chunk_index_intent: nil} ->
+        :ok
+
+      %{chunk_index_intent: intent} ->
+        publish_chunk_index_intent!(opts, intent)
+        clear_chunk_index_intent!(opts, intent)
+    end
+  end
+
+  defp ensure_log_replay_history_start!(opts, boundary) do
+    case read_metadata!(opts, :log_replay_history_start) do
+      nil -> write_metadata!(opts, :log_replay_history_start, boundary)
+      %LogOffset{} -> :ok
+    end
+  end
+
+  defp persist_transaction_state!(
+         opts,
+         last_persisted_txn_offset,
+         move_positions,
+         persist_opts
+       ) do
+    current_transaction_state = read_transaction_state!(opts)
+
+    root_delivery_tx_offset =
+      case Keyword.fetch(persist_opts, :root_delivery_tx_offset) do
+        {:ok, offset} ->
+          offset
+
+        :error ->
+          case current_transaction_state do
+            %{root_delivery_tx_offset: offset} -> offset
+            nil -> nil
+          end
+      end
+
+    chunk_index_intent =
+      case Keyword.fetch(persist_opts, :chunk_index_intent) do
+        {:ok, intent} ->
+          intent
+
+        :error ->
+          case current_transaction_state do
+            %{chunk_index_intent: intent} -> intent
+            nil -> nil
+          end
+      end
+
+    transaction_state = %{
+      version: @transaction_state_version,
+      last_persisted_txn_offset: last_persisted_txn_offset,
+      move_positions: move_positions,
+      root_delivery_tx_offset: root_delivery_tx_offset,
+      chunk_index_intent: chunk_index_intent
+    }
+
+    # transaction_state is authoritative and is replaced atomically. Legacy
+    # files are refreshed afterwards for downgrade compatibility; a crash
+    # between those writes cannot split the state observed by this version.
+    write_metadata!(opts, :transaction_state, transaction_state)
+    write_metadata!(opts, :last_persisted_txn_offset, last_persisted_txn_offset)
+
+    if Keyword.get(persist_opts, :mirror_move_positions?, true) do
+      write_metadata!(opts, :move_positions, move_positions)
+    end
+
+    transaction_state
+  end
+
+  defp ensure_root_delivery_frontier_monotonic!(opts, new_offset) do
+    _ = monotonic_root_delivery_frontier!(opts, new_offset)
+    :ok
+  end
+
+  defp monotonic_root_delivery_frontier!(opts, new_offset) do
+    case read_transaction_state!(opts) do
+      %{root_delivery_tx_offset: current_offset}
+      when is_integer(current_offset) and is_integer(new_offset) and new_offset < current_offset ->
+        raise Storage.Error,
+          message: "cannot regress root-delivery frontier from #{current_offset} to #{new_offset}"
+
+      %{root_delivery_tx_offset: current_offset}
+      when is_integer(current_offset) and is_nil(new_offset) ->
+        current_offset
+
+      _ ->
+        new_offset
+    end
+  end
+
+  defp read_file_range!(_path, _start_position, 0), do: <<>>
+
+  defp read_file_range!(path, start_position, length) do
+    File.open!(path, [:read, :raw], fn file ->
+      case :file.pread(file, start_position, length) do
+        {:ok, bytes} when byte_size(bytes) == length ->
+          bytes
+
+        other ->
+          raise Storage.Error,
+            message:
+              "Could not read dependency-move chunk-index intent bytes from #{path}: " <>
+                inspect(other)
+      end
+    end)
+  end
+
+  defp publish_append_intent!(path, start_position, bytes, label) do
+    file_size = FileInfo.get_file_size!(path) || 0
+    intent_size = byte_size(bytes)
+
+    if file_size < start_position do
+      raise Storage.Error,
+        message:
+          "Cannot reconcile #{label} intent at #{start_position}: " <>
+            "#{path} is only #{file_size} bytes"
+    end
+
+    written_size = Kernel.min(file_size - start_position, intent_size)
+    expected_prefix = binary_part(bytes, 0, written_size)
+    actual_prefix = read_file_range!(path, start_position, written_size)
+
+    if actual_prefix != expected_prefix do
+      raise Storage.Error,
+        message:
+          "Cannot reconcile #{label} intent because existing bytes " <>
+            "do not match at #{path}:#{start_position}"
+    end
+
+    remaining = binary_part(bytes, written_size, intent_size - written_size)
+
+    File.open!(path, [:append, :raw, :sync], fn file ->
+      :ok = IO.binwrite(file, remaining)
+      :ok = :file.datasync(file)
+    end)
+
+    :ok
   end
 
   defp normalize_log_stream(stream) do
@@ -1528,7 +2850,51 @@ defmodule Electric.ShapeCache.PureFileStorage do
   end
 
   @doc false
-  def tmp_file(%__MODULE__{} = opts, filename), do: Path.join(tmp_dir(opts), filename)
+  def compaction_tmp_dir(%__MODULE__{} = opts, attempt_id) when is_integer(attempt_id) do
+    shape_namespace =
+      :crypto.hash(:sha256, opts.shape_handle)
+      |> Base.url_encode64(padding: false)
+
+    Path.join([tmp_dir(opts), "compaction", shape_namespace, Integer.to_string(attempt_id)])
+  end
+
+  defp compaction_tmp_file(%__MODULE__{} = opts, attempt_id, filename),
+    do: Path.join(compaction_tmp_dir(opts, attempt_id), filename)
+
+  defp cleanup_compaction_attempt_dir(%__MODULE__{} = opts, attempt_id),
+    do: rm_rf!(compaction_tmp_dir(opts, attempt_id))
+
+  if Mix.env() == :test do
+    def activate_mocked_functions_from_test_process do
+      try do
+        Support.TestUtils.activate_mocked_functions_for_module(__MODULE__)
+      rescue
+        Protocol.UndefinedError -> :ok
+      end
+
+      if is_nil(Repatch.owner(self())) do
+        Process.get(:"$callers", [])
+        |> Enum.find(&is_pid/1)
+        |> case do
+          nil -> :ok
+          caller -> Repatch.allow(caller, self())
+        end
+      end
+
+      :ok
+    end
+
+    defp allow_mocked_functions_for_child(child_pid) do
+      if Repatch.owner(self()) do
+        Repatch.allow(self(), child_pid)
+      end
+
+      :ok
+    end
+  else
+    def activate_mocked_functions_from_test_process, do: :noop
+    defp allow_mocked_functions_for_child(_child_pid), do: :noop
+  end
 
   @type file_opener() :: (Path.t(), [File.mode()] ->
                             {:ok, File.file_descriptor()} | {:error, File.posix()})

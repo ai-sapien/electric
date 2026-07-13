@@ -550,7 +550,7 @@ defmodule Electric.Client do
     |> stream(opts)
   end
 
-  @type poll_option :: {:replica, replica()}
+  @type poll_option :: {:replica, replica()} | {:timeout, timeout()}
   @type poll_options :: [poll_option()]
 
   @doc """
@@ -572,6 +572,8 @@ defmodule Electric.Client do
     * `state` - The current polling state (use `ShapeState.new()` for initial request)
     * `opts` - Options:
       * `:replica` - `:default` or `:full` (default: `:default`)
+      * `:timeout` - maximum time in milliseconds to wait for this request,
+        or `:infinity` (default: `:infinity`)
 
   ## Returns
 

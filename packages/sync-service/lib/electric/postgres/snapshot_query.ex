@@ -1,5 +1,6 @@
 defmodule Electric.Postgres.SnapshotQuery do
   alias Electric.Postgres.Lsn
+  alias Electric.Postgres.CausalMarker
   alias Electric.SnapshotError
   alias Electric.Shapes.{Querying, Shape}
   alias Electric.Telemetry.OpenTelemetry
@@ -29,6 +30,7 @@ defmodule Electric.Postgres.SnapshotQuery do
   - `:query_fn` - the function to execute the query.
   - `:snapshot_info_fn` - the function to call with the snapshot information.
   - `:stack_id` - the stack id for this shape.
+  - `:causal_marker?` - emit a transactional logical marker at the snapshot boundary.
   """
   @spec execute_for_shape(Postgrex.conn(), Shape.handle(), Shape.t(), [option]) ::
           {:ok, result} | {:error, any()}
@@ -36,13 +38,16 @@ defmodule Electric.Postgres.SnapshotQuery do
              option:
                {:snapshot_info_fn, (Shape.handle(), pg_snapshot, pos_integer() -> any())}
                | {:query_fn, (Postgrex.conn(), pg_snapshot, pos_integer() -> result)}
-               | {:stack_id, Electric.stack_id()},
+               | {:stack_id, Electric.stack_id()}
+               | {:causal_marker?, boolean()}
+               | {:query_reason, String.t()},
              pg_snapshot:
                {xmin :: pos_integer(), xmax :: pos_integer(), xip_list :: [pos_integer()]}
   def execute_for_shape(pool, shape_handle, shape, opts) do
     query_fn = Access.fetch!(opts, :query_fn)
     snapshot_info_fn = Access.fetch!(opts, :snapshot_info_fn)
     query_reason = Access.get(opts, :query_reason, "initial_snapshot")
+    causal_marker? = Access.get(opts, :causal_marker?, false)
     span_attrs = Shape.otel_attrs(shape_handle, shape, query_reason: query_reason)
     stack_id = Access.fetch!(opts, :stack_id)
 
@@ -68,10 +73,13 @@ defmodule Electric.Postgres.SnapshotQuery do
               span_name: "shape_snapshot.start_readonly_txn"
             )
 
+            snapshot_query =
+              if causal_marker?,
+                do: CausalMarker.snapshot_query(),
+                else: "SELECT pg_current_snapshot(), pg_current_wal_lsn()"
+
             [%{rows: [[pg_snapshot, lsn]]}] =
-              query!(ctx, "SELECT pg_current_snapshot(), pg_current_wal_lsn()",
-                span_name: "shape_snapshot.get_pg_snapshot"
-              )
+              query!(ctx, snapshot_query, span_name: "shape_snapshot.get_pg_snapshot")
 
             snapshot_info_fn.(shape_handle, pg_snapshot, lsn)
 

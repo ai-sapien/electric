@@ -144,6 +144,51 @@ defmodule Electric.Replication.PublicationManagerTest do
       end
     end
 
+    test "preserves the typed publication error when invalidating generated-column shapes", ctx do
+      supported_features = fetch_supported_features(ctx.db_conn)
+
+      if supported_features.supports_generated_column_replication do
+        shape = generate_shape(ctx.relation_with_oid, @where_clause_1)
+
+        shape = %Electric.Shapes.Shape{
+          shape
+          | flags: Map.put(shape.flags, :selects_generated_columns, true)
+        }
+
+        assert :ok == PublicationManager.add_shape(ctx.stack_id, @shape_handle_1, shape)
+
+        test_pid = self()
+
+        patch_calls(Electric.ShapeCache.ShapeCleaner,
+          remove_shapes_async: fn stack_id, handles, reason ->
+            send(test_pid, {:remove_shapes_async, stack_id, handles, reason})
+            :ok
+          end
+        )
+
+        PublicationManager.RelationTracker.notify_publication_status(
+          %{publishes_generated_columns?: false},
+          stack_id: ctx.stack_id,
+          server: PublicationManager.RelationTracker.name(ctx.stack_id)
+        )
+
+        stack_id = ctx.stack_id
+
+        assert_receive {
+          :remove_shapes_async,
+          ^stack_id,
+          [@shape_handle_1],
+          {:error,
+           %Electric.SnapshotError{
+             type: :publication_missing_generated_columns,
+             original_error: %Electric.DbConfigurationError{
+               type: :publication_missing_generated_columns
+             }
+           }}
+        }
+      end
+    end
+
     test "ignores subsequent shapes for same handle", ctx do
       notify_alter_queries()
       shape1 = generate_shape(ctx.relation_with_oid, @where_clause_1)

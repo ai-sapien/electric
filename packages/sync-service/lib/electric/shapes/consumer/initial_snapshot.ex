@@ -29,6 +29,12 @@ defmodule Electric.Shapes.Consumer.InitialSnapshot do
     }
   end
 
+  @doc false
+  @spec reinitialize(t(), Storage.pg_snapshot() | nil) :: t()
+  def reinitialize(%__MODULE__{awaiting_snapshot_start: waiters}, snapshot) do
+    %{new(snapshot) | awaiting_snapshot_start: waiters}
+  end
+
   def add_waiter(%__MODULE__{} = state, from) do
     %{state | awaiting_snapshot_start: [from | state.awaiting_snapshot_start]}
   end
@@ -80,17 +86,27 @@ defmodule Electric.Shapes.Consumer.InitialSnapshot do
     %{state | pg_snapshot: snapshot, filtering?: true}
   end
 
+  def mark_snapshot_started(state, stack_id, shape_handle, storage),
+    do: mark_snapshot_started(state, stack_id, shape_handle, storage, true)
+
   def mark_snapshot_started(
         %__MODULE__{snapshot_started?: true} = state,
         _stack_id,
         _shape_handle,
-        _
+        _,
+        _reply_waiters?
       ),
       do: state
 
-  def mark_snapshot_started(%__MODULE__{} = state, stack_id, shape_handle, storage) do
+  def mark_snapshot_started(
+        %__MODULE__{} = state,
+        stack_id,
+        shape_handle,
+        storage,
+        reply_waiters?
+      ) do
     Electric.Shapes.mark_snapshot_started(storage, stack_id, shape_handle)
-    state = reply_to_waiters(state, :started)
+    state = if reply_waiters?, do: reply_to_waiters(state, :started), else: state
     %{state | snapshot_started?: true}
   end
 

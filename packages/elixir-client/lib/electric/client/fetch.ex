@@ -7,11 +7,13 @@ defmodule Electric.Client.Fetch do
 
   @behaviour Electric.Client.Fetch.Pool
 
+  @spec request(Client.t(), Request.t(), keyword()) ::
+          Response.t() | {:error, Response.t() | term()}
   def request(client, request, opts \\ [])
 
   @impl Electric.Client.Fetch.Pool
-  def request(%Client{} = client, %Request{} = request, _opts) do
-    %{pool: {module, opts}} = client
-    apply(module, :request, [client, request, opts])
+  def request(%Client{} = client, %Request{} = request, request_opts) do
+    %{pool: {module, pool_opts}} = client
+    apply(module, :request, [client, request, Keyword.merge(pool_opts, request_opts)])
   end
 end

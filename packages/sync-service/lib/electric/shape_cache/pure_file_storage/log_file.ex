@@ -219,46 +219,205 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
         project_item \\ &json_only/2,
         read_fun \\ &:file.read/2
       ) do
-    Stream.resource(
-      fn ->
-        case safely_open_file!(opts, log_file_path, [:read, :raw]) do
-          {:ok, file} ->
-            {:ok, ^start_position} = :file.position(file, start_position)
-            {file, ""}
+    initializer = fn ->
+      initialize_json_stream(
+        opts,
+        [{log_file_path, start_position, exclusive_min_offset, inclusive_max_offset}],
+        []
+      )
+    end
 
-          {:halt, :data_removed} ->
-            :halt
-        end
-      end,
-      fn
-        :halt ->
-          {:halt, []}
-
-        {file, :halt} ->
-          {:halt, {file, ""}}
-
-        {file, binary_rest} ->
-          case read_fun.(file, 4096) do
-            {:ok, data} ->
-              {jsons, rest} =
-                extract_jsons_from_binary(
-                  binary_rest <> data,
-                  exclusive_min_offset,
-                  inclusive_max_offset,
-                  project_item
-                )
-
-              {jsons, {file, rest}}
-
-            :eof ->
-              {:halt, {file, binary_rest}}
-          end
-      end,
-      fn
-        [] -> :ok
-        {file, _} -> File.close(file)
-      end
+    stream_jsons_from_segment_initializer(
+      initializer,
+      project_item,
+      read_fun
     )
+  end
+
+  @doc false
+  def stream_jsons_until_offset_from_open_file(
+        %PFS{} = opts,
+        log_file_path,
+        start_position,
+        exclusive_min_offset,
+        inclusive_max_offset,
+        project_item \\ &json_only/2,
+        read_fun \\ &:file.read/2
+      ) do
+    stream_jsons_until_offset(
+      opts,
+      log_file_path,
+      start_position,
+      exclusive_min_offset,
+      inclusive_max_offset,
+      project_item,
+      read_fun
+    )
+  end
+
+  @doc false
+  def stream_jsons_from_segment_initializer(
+        initializer,
+        project_item \\ &json_only/2,
+        read_fun \\ &:file.read/2
+      )
+      when is_function(initializer, 0) and is_function(project_item, 2) and
+             is_function(read_fun, 2) do
+    Stream.resource(
+      initializer,
+      &next_json_stream(&1, project_item, read_fun),
+      &close_json_stream/1
+    )
+  end
+
+  @doc false
+  def initialize_json_stream(%PFS{} = opts, segment_specs, tail)
+      when is_list(segment_specs) and is_list(tail) do
+    case open_json_segments(opts, segment_specs) do
+      {:ok, opened_segments} ->
+        %{
+          segments:
+            Enum.map(opened_segments, fn {file, path, exclusive_min, inclusive_max} ->
+              {file, path, exclusive_min, inclusive_max, ""}
+            end),
+          files: Enum.map(opened_segments, &elem(&1, 0)),
+          tail: tail
+        }
+
+      :halt ->
+        :halt
+    end
+  end
+
+  defp open_json_segments(opts, segment_specs) do
+    Enum.reduce_while(segment_specs, {:ok, []}, fn spec, {:ok, opened} ->
+      try do
+        case open_json_segment(opts, spec) do
+          {:ok, segment} -> {:cont, {:ok, [segment | opened]}}
+          :halt -> {:halt, {:halt, opened}}
+        end
+      rescue
+        exception -> {:halt, {:raise, exception, __STACKTRACE__, opened}}
+      catch
+        kind, reason -> {:halt, {:throw, kind, reason, __STACKTRACE__, opened}}
+      end
+    end)
+    |> case do
+      {:ok, opened} ->
+        {:ok, Enum.reverse(opened)}
+
+      {:halt, opened} ->
+        close_open_json_segments(opened)
+        :halt
+
+      {:raise, exception, stacktrace, opened} ->
+        close_open_json_segments(opened)
+        reraise exception, stacktrace
+
+      {:throw, kind, reason, stacktrace, opened} ->
+        close_open_json_segments(opened)
+        :erlang.raise(kind, reason, stacktrace)
+    end
+  end
+
+  defp open_json_segment(
+         opts,
+         {path, start_position, %LogOffset{} = exclusive_min, %LogOffset{} = inclusive_max}
+       ) do
+    case safely_open_file!(opts, path, [:read, :raw]) do
+      {:ok, file} ->
+        try do
+          case :file.position(file, start_position) do
+            {:ok, ^start_position} ->
+              {:ok, {file, path, exclusive_min, inclusive_max}}
+
+            {:error, reason} ->
+              raise File.Error,
+                path: path,
+                reason: reason,
+                action: "position(#{start_position})"
+          end
+        rescue
+          exception ->
+            File.close(file)
+            reraise exception, __STACKTRACE__
+        catch
+          kind, reason ->
+            File.close(file)
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        end
+
+      {:halt, :data_removed} ->
+        :halt
+    end
+  end
+
+  defp next_json_stream(:halt, _project_item, _read_fun), do: {:halt, :halt}
+
+  defp next_json_stream(%{segments: [], tail: []} = state, _project_item, _read_fun),
+    do: {:halt, state}
+
+  defp next_json_stream(%{segments: [], tail: tail} = state, _project_item, _read_fun),
+    do: {tail, %{state | tail: []}}
+
+  defp next_json_stream(
+         %{segments: [{_file, _path, _exclusive_min, _inclusive_max, :halt} | rest]} = state,
+         project_item,
+         read_fun
+       ) do
+    next_json_stream(%{state | segments: rest}, project_item, read_fun)
+  end
+
+  defp next_json_stream(
+         %{
+           segments: [
+             {file, path, exclusive_min, inclusive_max, binary_rest} = segment | rest
+           ]
+         } = state,
+         project_item,
+         read_fun
+       ) do
+    case read_fun.(file, 4096) do
+      {:ok, data} ->
+        {jsons, next_rest} =
+          extract_jsons_from_binary(
+            binary_rest <> data,
+            exclusive_min,
+            inclusive_max,
+            project_item
+          )
+
+        next_segments =
+          case next_rest do
+            :halt -> rest
+            binary -> [put_elem(segment, 4, binary) | rest]
+          end
+
+        next_state = %{state | segments: next_segments}
+
+        case jsons do
+          [] -> next_json_stream(next_state, project_item, read_fun)
+          _ -> {jsons, next_state}
+        end
+
+      :eof ->
+        next_json_stream(%{state | segments: rest}, project_item, read_fun)
+
+      {:error, reason} ->
+        raise File.Error, path: path, reason: reason, action: "read(4096)"
+    end
+  end
+
+  defp close_json_stream(:halt), do: :ok
+
+  defp close_json_stream(%{files: files}) do
+    Enum.each(files, &File.close/1)
+  end
+
+  defp close_open_json_segments(opened_segments) do
+    Enum.each(opened_segments, fn {file, _path, _exclusive_min, _inclusive_max} ->
+      File.close(file)
+    end)
   end
 
   defp json_only(_offset, json), do: json

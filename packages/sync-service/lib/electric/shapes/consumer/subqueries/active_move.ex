@@ -113,6 +113,31 @@ defmodule Electric.Shapes.Consumer.Subqueries.ActiveMove do
     raise ArgumentError, "received {:pg_snapshot_known, snapshot} more than once for one move-in"
   end
 
+  @spec record_post_snapshot_root!(t(), Electric.Replication.Changes.xid()) :: t()
+  def record_post_snapshot_root!(
+        %__MODULE__{snapshot: nil},
+        xid
+      ) do
+    raise ArgumentError,
+          "cannot classify deferred root transaction #{inspect(xid)} before the move-in snapshot is known"
+  end
+
+  def record_post_snapshot_root!(
+        %__MODULE__{boundary_txn_count: boundary} = active_move,
+        _xid
+      )
+      when not is_nil(boundary),
+      do: active_move
+
+  def record_post_snapshot_root!(%__MODULE__{} = active_move, xid) do
+    if Transaction.visible_in_snapshot?(xid, active_move.snapshot) do
+      raise ArgumentError,
+            "cannot classify snapshot-visible root transaction #{inspect(xid)} as post-snapshot"
+    end
+
+    %{active_move | boundary_txn_count: active_move.buffered_txn_count}
+  end
+
   @spec record_query_complete!(t(), String.t(), non_neg_integer(), non_neg_integer(), Lsn.t()) ::
           t()
   def record_query_complete!(

@@ -58,6 +58,8 @@ defmodule Electric.Client.Poll do
     * `state` - The current polling state (use `ShapeState.new()` for initial request)
     * `opts` - Options:
       * `:replica` - `:default` or `:full` (default: `:default`)
+      * `:timeout` - maximum time in milliseconds to wait for this request,
+        or `:infinity` (default: `:infinity`)
 
   ## Returns
 
@@ -82,7 +84,7 @@ defmodule Electric.Client.Poll do
 
     request = build_request(client, state, replica, shape_key)
 
-    case Fetch.request(client, request) do
+    case Fetch.request(client, request, Keyword.take(opts, [:timeout])) do
       %Fetch.Response{status: status} = resp when status in 200..299 ->
         validate_headers!(resp, state)
         handle_success(resp, client, state, shape_key)

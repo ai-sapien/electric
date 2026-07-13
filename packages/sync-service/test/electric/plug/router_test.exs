@@ -14,11 +14,13 @@ defmodule Electric.Plug.RouterTest do
   alias Electric.Plug.Router
   alias Electric.Replication.Changes
   alias Electric.Replication.LogOffset
+  alias Electric.ShapeCache.Storage
 
   @moduletag :tmp_dir
 
   @first_offset to_string(LogOffset.first())
   @up_to_date %{"headers" => %{"control" => "up-to-date"}}
+  @shape_response_timeout 5_000
 
   defmacrop up_to_date_ctl() do
     quote do
@@ -179,9 +181,21 @@ defmodule Electric.Plug.RouterTest do
             response = Jason.decode!(conn.resp_body)
 
             case x do
-              0 -> assert [%{"headers" => %{"control" => "snapshot-end"}}] = response
-              10 -> assert [%{"value" => %{"value" => ^expected_value}}, @up_to_date] = response
-              _ -> assert [%{"value" => %{"value" => ^expected_value}}] = response
+              0 ->
+                assert [%{"headers" => %{"control" => "snapshot-end"}}] = response
+
+              10 ->
+                assert [%{"value" => %{"value" => ^expected_value}}, up_to_date_ctl()] =
+                         response
+
+              _ ->
+                assert [%{"value" => %{"value" => ^expected_value}} | control_messages] =
+                         response
+
+                case control_messages do
+                  [] -> :ok
+                  [up_to_date_ctl()] -> :ok
+                end
             end
 
             {:ok, offset} = LogOffset.from_string(get_resp_header(conn, "electric-offset"))
@@ -193,8 +207,22 @@ defmodule Electric.Plug.RouterTest do
       Electric.Shapes.Consumer.whereis(opts[:stack_id], shape_handle)
       |> Electric.ShapeCache.Storage.trigger_compaction(storage, 0)
 
-      # If this test is flaking, then the compaction didn't have time to complete - we don't have a good way to wait for it to complete though.
-      Process.sleep(200)
+      assert Support.TestUtils.wait_until(
+               fn ->
+                 conn =
+                   conn(
+                     "GET",
+                     "/v1/shape?table=items&handle=#{shape_handle}&offset=0_inf"
+                   )
+                   |> Router.call(opts)
+
+                 match?(
+                   [%{"value" => %{"value" => "test value 10"}}, _],
+                   Jason.decode!(conn.resp_body)
+                 )
+               end,
+               @shape_response_timeout
+             )
 
       conn =
         conn("GET", "/v1/shape?table=items&handle=#{shape_handle}&offset=0_inf")
@@ -1467,6 +1495,10 @@ defmodule Electric.Plug.RouterTest do
       assert op2_log_offset == LogOffset.increment(op1_log_offset, 2)
     end
 
+    # This test moves about 17.8 MB through the complete replication and HTTP
+    # path to validate chunk boundaries. Its timeout is a test-harness allowance,
+    # not a five-second latency SLO.
+    @large_chunk_semantics_timeout :timer.seconds(30)
     @tag with_sql: [
            "CREATE TABLE large_rows_table (id BIGINT PRIMARY KEY, value TEXT NOT NULL)"
          ]
@@ -1509,7 +1541,7 @@ defmodule Electric.Plug.RouterTest do
         third_val
       ])
 
-      assert %{status: 200} = Task.await(task)
+      assert %{status: 200} = Task.await(task, @large_chunk_semantics_timeout)
 
       conn =
         conn(
@@ -2833,6 +2865,127 @@ defmodule Electric.Plug.RouterTest do
               ]} = Task.await(task)
     end
 
+    @tag with_pure_file_storage_opts: [flush_period: 60_000]
+    @tag with_sql: [
+           "CREATE TABLE grandparent (id INT PRIMARY KEY, value INT NOT NULL)",
+           "CREATE TABLE parent (id INT PRIMARY KEY, value INT NOT NULL, grandparent_id INT NOT NULL REFERENCES grandparent(id))",
+           "CREATE TABLE child (id INT PRIMARY KEY, value INT NOT NULL, parent_id INT NOT NULL REFERENCES parent(id))",
+           "INSERT INTO grandparent (id, value) VALUES (1, 10), (2, 20)",
+           "INSERT INTO parent (id, value, grandparent_id) VALUES (1, 10, 1), (2, 20, 2)",
+           "INSERT INTO child (id, value, parent_id) VALUES (1, 10, 1), (2, 20, 2)"
+         ]
+    test "nested dependency barriers reach descendants before later root transactions", ctx do
+      orig_req =
+        make_shape_req("child",
+          where:
+            "parent_id in (SELECT id FROM parent WHERE grandparent_id in (SELECT id FROM grandparent WHERE value = 10))"
+        )
+
+      assert {req, 200,
+              [
+                %{"value" => %{"id" => "1", "value" => "10"}},
+                %{"headers" => %{"control" => "snapshot-end"}}
+              ]} = shape_req(orig_req, ctx.opts)
+
+      await_publication_tables(ctx, [
+        {"public", "grandparent"},
+        {"public", "parent"},
+        {"public", "child"}
+      ])
+
+      await_outer_dependency_subscriptions(ctx.stack_id, req.handle)
+
+      {:ok, outer_shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, req.handle)
+      [middle_handle] = outer_shape.shape_dependencies_handles
+      await_outer_dependency_subscriptions(ctx.stack_id, middle_handle)
+
+      # Make all three relations routable before the two transactions under
+      # test. The no-op writes do not enter the shape log.
+      Postgrex.query!(ctx.db_conn, "UPDATE grandparent SET value = value WHERE id = 2")
+      Postgrex.query!(ctx.db_conn, "UPDATE parent SET value = value WHERE id = 2")
+      Postgrex.query!(ctx.db_conn, "UPDATE child SET value = value WHERE id = 2")
+
+      await_replication_relations(ctx.stack_id, [
+        {"public", "grandparent"},
+        {"public", "parent"},
+        {"public", "child"}
+      ])
+
+      {:ok, middle_shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, middle_handle)
+      [leaf_handle] = middle_shape.shape_dependencies_handles
+      leaf_consumer = Electric.Shapes.Consumer.whereis(ctx.stack_id, leaf_handle)
+
+      # First prove the no-derived-row path: the leaf source logs a transaction,
+      # but its materialized id set does not change. The transitive fence must
+      # still end and release the later root transaction.
+      task = live_shape_req(req, ctx.opts)
+
+      assert {:ok, :ok} =
+               Postgrex.transaction(ctx.db_conn, fn conn ->
+                 Postgrex.query!(conn, "UPDATE grandparent SET value = 20 WHERE id = 1")
+                 Postgrex.query!(conn, "UPDATE grandparent SET value = 10 WHERE id = 1")
+                 :ok
+               end)
+
+      middle_consumer = Electric.Shapes.Consumer.whereis(ctx.stack_id, middle_handle)
+      outer_consumer = Electric.Shapes.Consumer.whereis(ctx.stack_id, req.handle)
+
+      assert Support.TestUtils.wait_until(
+               fn -> :sys.get_state(middle_consumer).deferred_materializer_move_count > 0 end,
+               @shape_response_timeout
+             )
+
+      assert Support.TestUtils.wait_until(
+               fn -> :sys.get_state(outer_consumer).deferred_materializer_move_count > 0 end,
+               @shape_response_timeout
+             )
+
+      Postgrex.query!(ctx.db_conn, "UPDATE child SET value = 11 WHERE id = 1")
+
+      assert Support.TestUtils.wait_until(
+               fn -> :sys.get_state(outer_consumer).deferred_replication_event_count > 0 end,
+               @shape_response_timeout
+             )
+
+      send(leaf_consumer, :timeout)
+
+      assert {req, 200,
+              [
+                %{"headers" => %{"operation" => "update"}, "value" => %{"value" => "11"}},
+                up_to_date_ctl()
+              ]} = Task.await(task, @shape_response_timeout)
+
+      task = live_shape_req(req, ctx.opts)
+
+      # T1 removes the parent through the leaf dependency. Its source log is
+      # deliberately kept volatile. T2 then updates the outer root. Without a
+      # transitive reservation, the outer shape logs T2 against the stale middle
+      # view before it ever hears about T1.
+      Postgrex.query!(ctx.db_conn, "UPDATE grandparent SET value = 20 WHERE id = 1")
+
+      assert Support.TestUtils.wait_until(
+               fn -> :sys.get_state(middle_consumer).deferred_materializer_move_count > 0 end,
+               @shape_response_timeout
+             )
+
+      assert Support.TestUtils.wait_until(
+               fn -> :sys.get_state(outer_consumer).deferred_materializer_move_count > 0 end,
+               @shape_response_timeout
+             )
+
+      Postgrex.query!(ctx.db_conn, "UPDATE child SET value = 99 WHERE id = 1")
+
+      # Force only the leaf source durability after both transactions have been
+      # accepted by the collector. This releases the dependency chain.
+      send(leaf_consumer, :timeout)
+
+      assert {_, 200,
+              [
+                %{"headers" => %{"event" => "move-out"}},
+                up_to_date_ctl()
+              ]} = Task.await(task, @shape_response_timeout)
+    end
+
     @tag with_sql: [
            "CREATE TABLE parent (id INT PRIMARY KEY, include_parent BOOLEAN NOT NULL DEFAULT FALSE)",
            "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT NOT NULL REFERENCES parent(id), include_child BOOLEAN NOT NULL DEFAULT FALSE)",
@@ -3228,6 +3381,10 @@ defmodule Electric.Plug.RouterTest do
                "headers" => %{"operation" => "insert", "tags" => [tag]}
              } = data
 
+      await_publication_tables(ctx, [{"public", "parent"}, {"public", "child"}])
+      await_outer_dependency_subscriptions(ctx.stack_id, req.handle)
+      prime_replication_relations(ctx)
+
       for stmt <- [
             # Move-out
             "UPDATE parent SET value = 2 WHERE id = 1",
@@ -3240,8 +3397,6 @@ defmodule Electric.Plug.RouterTest do
             "UPDATE child SET value = 13 WHERE id = 1"
           ],
           do: Postgrex.query!(ctx.db_conn, stmt)
-
-      Process.sleep(120)
 
       assert {req, 200,
               [
@@ -3258,27 +3413,120 @@ defmodule Electric.Plug.RouterTest do
                   "value" => %{"id" => "1", "parent_id" => "1", "value" => "13"}
                 },
                 %{"headers" => %{"control" => "snapshot-end"}},
-                up_to_date_ctl()
-              ]} = shape_req(req, ctx.opts)
+                %{
+                  "headers" => %{
+                    "control" => "up-to-date",
+                    "global_last_seen_lsn" => global_last_seen_lsn
+                  }
+                }
+              ]} =
+               await_shape_req(req, ctx.opts, fn response ->
+                 move_boundary_count(response) >= 3 and
+                   Enum.any?(response, &match?(%{"value" => %{"id" => "1", "value" => "13"}}, &1))
+               end)
+
+      await_consumer_deferred_work_drained(ctx.stack_id, req.handle)
+
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, req.handle)
+      [dependency_handle] = shape.shape_dependencies_handles
+      shape_storage = Storage.for_shape(req.handle, Storage.for_stack(ctx.stack_id))
+
+      assert {:ok, %{^dependency_handle => dependency_offset}} =
+               Storage.fetch_move_positions(shape_storage)
+
+      # The final child update committed before the move-in query snapshot, so
+      # the snapshot already contains value=13 and emitting the same update a
+      # second time would be redundant. Prove that the update was absorbed, not
+      # lost: the public global frontier is later than the durable dependency
+      # cursor and the move transaction ends at an exact replay boundary.
+      assert String.to_integer(global_last_seen_lsn) > dependency_offset.tx_offset
+
+      assert LogOffset.last_before_real_offsets()
+             |> Storage.get_log_stream(shape_storage)
+             |> Enum.map(&Jason.decode!/1)
+             |> List.last()
+             |> generated_move_replay_delimiter?()
+
+      assert %{rows: [[1, 13]]} =
+               Postgrex.query!(
+                 ctx.db_conn,
+                 "SELECT id, value FROM child WHERE parent_id = 1"
+               )
 
       task = live_shape_req(req, ctx.opts)
 
       # Total move-out
       Postgrex.query!(ctx.db_conn, "UPDATE parent SET value = 2")
 
-      assert {_, 200,
+      assert {next_req, 200, first_chunk} = Task.await(task)
+
+      assert {_, 200, remaining_chunks} =
+               await_shape_req(next_req, ctx.opts, fn response ->
+                 Enum.any?(response, fn
+                   %{
+                     "headers" => %{
+                       "event" => "move-out",
+                       "patterns" => patterns
+                     }
+                   } ->
+                     Enum.any?(patterns, &match?(%{"value" => ^tag2}, &1))
+
+                   _ ->
+                     false
+                 end)
+               end)
+
+      response = first_chunk ++ remaining_chunks
+      assert %{"headers" => %{"control" => "up-to-date"}} = List.last(response)
+
+      moved_values =
+        for %{"headers" => %{"event" => "move-out", "patterns" => patterns}} <- response,
+            %{"value" => value} <- patterns,
+            do: value
+
+      assert MapSet.new(moved_values) == MapSet.new([tag, tag2])
+    end
+
+    @tag with_sql: [
+           "CREATE TABLE parent (id INT PRIMARY KEY, value INT NOT NULL)",
+           "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT NOT NULL REFERENCES parent(id), value INT NOT NULL)",
+           "INSERT INTO parent (id, value) VALUES (1, 1), (2, 2)",
+           "INSERT INTO child (id, parent_id, value) VALUES (1, 1, 10), (2, 2, 20)"
+         ]
+    test "same-transaction root change precedes its causal move-out",
+         ctx do
+      req = make_shape_req("child", where: "parent_id in (SELECT id FROM parent WHERE value = 1)")
+
+      assert {req, 200, [%{"value" => %{"id" => "1"}}, _snapshot_end]} =
+               shape_req(req, ctx.opts)
+
+      await_publication_tables(ctx, [{"public", "parent"}, {"public", "child"}])
+      await_outer_dependency_subscriptions(ctx.stack_id, req.handle)
+      prime_replication_relations(ctx)
+
+      assert {:ok, %{rows: [[xid]]}} =
+               Postgrex.transaction(ctx.db_conn, fn conn ->
+                 Postgrex.query!(conn, "UPDATE parent SET value = 2 WHERE id = 1")
+                 Postgrex.query!(conn, "UPDATE child SET value = 11 WHERE id = 1")
+                 Postgrex.query!(conn, "SELECT pg_current_xact_id()::text::bigint")
+               end)
+
+      _result = await_shape_req(req, ctx.opts, &(move_boundary_count(&1) >= 1))
+      await_consumer_deferred_work_drained(ctx.stack_id, req.handle)
+
+      assert {_req, 200,
               [
                 %{
                   "headers" => %{
-                    "event" => "move-out",
-                    "patterns" => [
-                      %{"pos" => 0, "value" => ^tag},
-                      %{"pos" => 0, "value" => ^tag2}
-                    ]
-                  }
+                    "operation" => "update",
+                    "last" => true,
+                    "txids" => [^xid]
+                  },
+                  "value" => %{"id" => "1", "value" => "11"}
                 },
-                %{"headers" => %{"control" => "up-to-date"}}
-              ]} = Task.await(task)
+                %{"headers" => %{"event" => "move-out", "txids" => [^xid]}},
+                up_to_date_ctl()
+              ]} = shape_req(req, ctx.opts)
     end
 
     @tag with_sql: [
@@ -3287,7 +3535,7 @@ defmodule Electric.Plug.RouterTest do
            "INSERT INTO parent (id, value) VALUES (1, 1), (2, 2), (3, 3)",
            "INSERT INTO child (id, parent_id, value) VALUES (1, 1, 10), (2, 2, 20), (3, 3, 30)"
          ]
-    test "move-in into move-out into move-in of the same dependency row collapses queued oscillations",
+    test "queued dependency oscillations preserve exact logical commit boundaries",
          ctx do
       req = make_shape_req("child", where: "parent_id in (SELECT id FROM parent WHERE value = 1)")
 
@@ -3297,6 +3545,10 @@ defmodule Electric.Plug.RouterTest do
                "value" => %{"id" => "1", "parent_id" => "1", "value" => "10"},
                "headers" => %{"operation" => "insert", "tags" => [_tag]}
              } = data
+
+      await_publication_tables(ctx, [{"public", "parent"}, {"public", "child"}])
+      await_outer_dependency_subscriptions(ctx.stack_id, req.handle)
+      prime_replication_relations(ctx)
 
       for stmt <- [
             # Move-in
@@ -3310,18 +3562,15 @@ defmodule Electric.Plug.RouterTest do
           ],
           do: Postgrex.query!(ctx.db_conn, stmt)
 
-      # Hard to wait exactly what we want, so this should be OK
-      Process.sleep(1000)
-
       tag2 =
         value_tag(ctx.stack_id, req.handle, "v:2")
 
       tag3 =
         value_tag(ctx.stack_id, req.handle, "v:3")
 
-      # The reduced move queue keeps the first move-in/move-out pair for
-      # dependency row 2, then drops the later move-in/move-out oscillation
-      # before dependency row 3 moves in.
+      # Each materializer payload is an independently durable logical commit.
+      # Later payloads therefore cannot cancel an earlier committed move, even
+      # when the same dependency row oscillates while another row moves in.
       assert {_req, 200,
               [
                 %{"headers" => %{"event" => "move-in"}},
@@ -3337,13 +3586,48 @@ defmodule Electric.Plug.RouterTest do
                   }
                 },
                 %{"headers" => %{"event" => "move-in"}},
-                %{
-                  "headers" => %{"operation" => "insert", "is_move_in" => true, "tags" => [^tag3]},
-                  "value" => %{"id" => "3", "value" => "30"}
-                },
+                first_move_in_row,
+                second_move_in_row,
                 %{"headers" => %{"control" => "snapshot-end"}},
+                %{
+                  "headers" => %{
+                    "event" => "move-out",
+                    "patterns" => [%{"pos" => 0, "value" => ^tag2}]
+                  }
+                },
                 up_to_date_ctl()
-              ]} = shape_req(req, ctx.opts)
+              ]} =
+               await_shape_req(req, ctx.opts, fn response ->
+                 move_boundary_count(response) >= 4 and
+                   Enum.any?(response, &match?(%{"value" => %{"id" => "3"}}, &1))
+               end)
+
+      assert [first_move_in_row, second_move_in_row]
+             |> Enum.map(fn %{
+                              "headers" => %{
+                                "operation" => "insert",
+                                "is_move_in" => true,
+                                "tags" => [tag]
+                              },
+                              "value" => %{
+                                "id" => id,
+                                "parent_id" => parent_id,
+                                "value" => value
+                              }
+                            } ->
+               {tag, id, parent_id, value}
+             end)
+             |> MapSet.new() ==
+               MapSet.new([
+                 {tag2, "2", "2", "20"},
+                 {tag3, "3", "3", "30"}
+               ])
+
+      assert %{rows: [[1], [3]]} =
+               Postgrex.query!(
+                 ctx.db_conn,
+                 "SELECT child.id FROM child JOIN parent ON child.parent_id = parent.id WHERE parent.value = 1 ORDER BY child.id"
+               )
     end
 
     @tag with_sql: [
@@ -4018,17 +4302,174 @@ defmodule Electric.Plug.RouterTest do
       {200, ["true"]} ->
         base
         |> Map.put(:handle, get_resp_shape_handle(result))
-        |> then(&{&1, result.status, Jason.decode!(result.resp_body)})
+        |> then(&{&1, result.status, decode_semantic_body(result.resp_body)})
 
       {200, _} ->
         base
         |> Map.put(:handle, get_resp_shape_handle(result))
         |> Map.put(:offset, get_resp_last_offset(result))
-        |> then(&{&1, result.status, Jason.decode!(result.resp_body)})
+        |> then(&{&1, result.status, decode_semantic_body(result.resp_body)})
 
       _ ->
         {base, result.status, Jason.decode!(result.resp_body)}
     end
+  end
+
+  defp decode_semantic_body(body) do
+    case Jason.decode!(body) do
+      response when is_list(response) ->
+        Enum.reject(response, &generated_move_replay_delimiter?/1)
+
+      response ->
+        response
+    end
+  end
+
+  defp generated_move_replay_delimiter?(%{
+         "headers" => %{
+           "event" => "move-out",
+           "patterns" => [],
+           "txids" => [],
+           "last" => true,
+           "generated_move_boundary" => 1,
+           "causal_origin" => causal_origin,
+           "causal_depth" => causal_depth
+         }
+       })
+       when is_binary(causal_origin) and is_integer(causal_depth) and causal_depth > 0,
+       do: true
+
+  defp generated_move_replay_delimiter?(_message), do: false
+
+  defp move_boundary_count(response) do
+    Enum.count(response, fn
+      %{"headers" => %{"event" => event}} when event in ["move-in", "move-out"] -> true
+      _ -> false
+    end)
+  end
+
+  defp await_shape_req(base, router_opts, ready?) do
+    deadline = System.monotonic_time(:millisecond) + @shape_response_timeout
+    do_await_shape_req(base, base, router_opts, ready?, deadline, [])
+  end
+
+  defp do_await_shape_req(base, original_base, router_opts, ready?, deadline, accumulated) do
+    {next_base, status, response} = shape_req(base, router_opts)
+    {up_to_date, semantic_response} = Enum.split_with(response, &up_to_date_message?/1)
+    accumulated = accumulated ++ semantic_response
+    complete? = ready?.(accumulated) and up_to_date != []
+
+    if complete? or System.monotonic_time(:millisecond) >= deadline do
+      {original_base, status, accumulated ++ up_to_date}
+    else
+      Process.sleep(50)
+      do_await_shape_req(next_base, original_base, router_opts, ready?, deadline, accumulated)
+    end
+  end
+
+  defp up_to_date_message?(%{"headers" => %{"control" => "up-to-date"}}), do: true
+  defp up_to_date_message?(_message), do: false
+
+  defp await_publication_tables(ctx, expected_tables) do
+    expected_tables = MapSet.new(expected_tables)
+
+    assert Support.TestUtils.wait_until(
+             fn ->
+               ctx.db_conn
+               |> Support.TestUtils.fetch_publication_tables(ctx.publication_name)
+               |> MapSet.new()
+               |> then(&MapSet.subset?(expected_tables, &1))
+             end,
+             @shape_response_timeout
+           )
+  end
+
+  defp await_outer_dependency_subscriptions(stack_id, shape_handle) do
+    {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(stack_id, shape_handle)
+
+    assert Support.TestUtils.wait_until(
+             fn ->
+               with outer_pid when is_pid(outer_pid) <-
+                      Electric.Shapes.Consumer.whereis(stack_id, shape_handle),
+                    %{
+                      pending_initialization: nil,
+                      pending_dependency_subscription: nil,
+                      event_handler: event_handler
+                    }
+                    when not is_nil(event_handler) <-
+                      :sys.get_state(outer_pid) do
+                 Enum.all?(shape.shape_dependencies_handles, fn dependency_handle ->
+                   case Electric.Shapes.Consumer.Materializer.whereis(
+                          stack_id,
+                          dependency_handle
+                        ) do
+                     nil ->
+                       false
+
+                     materializer_pid ->
+                       materializer_pid
+                       |> :sys.get_state()
+                       |> Map.fetch!(:subscribers)
+                       |> MapSet.member?(outer_pid)
+                   end
+                 end)
+               else
+                 _ -> false
+               end
+             end,
+             @shape_response_timeout
+           )
+  end
+
+  defp await_replication_relations(stack_id, expected_tables) do
+    expected_tables = MapSet.new(expected_tables)
+    collector = Electric.Replication.ShapeLogCollector.name(stack_id)
+
+    assert Support.TestUtils.wait_until(
+             fn ->
+               collector
+               |> :sys.get_state()
+               |> get_in([:tracked_relations, :table_to_id])
+               |> Map.keys()
+               |> MapSet.new()
+               |> then(&MapSet.subset?(expected_tables, &1))
+             end,
+             @shape_response_timeout
+           )
+  end
+
+  defp await_consumer_deferred_work_drained(stack_id, shape_handle) do
+    assert Support.TestUtils.wait_until(
+             fn ->
+               case Electric.Shapes.Consumer.whereis(stack_id, shape_handle) do
+                 nil ->
+                   false
+
+                 pid ->
+                   state = :sys.get_state(pid)
+
+                   is_nil(state.pending_txn) and not state.move_transaction_open? and
+                     not state.materializer_barrier_active? and
+                     state.deferred_materializer_move_count == 0 and
+                     state.deferred_replication_event_count == 0
+               end
+             end,
+             @shape_response_timeout
+           )
+  end
+
+  defp prime_replication_relations(ctx) do
+    # Publication catalog changes become visible before the replication stream
+    # has necessarily delivered its Relation messages. Updates that cannot
+    # enter either test shape establish that both relations are routable without
+    # adding semantic events to the response under test.
+    Postgrex.query!(ctx.db_conn, "UPDATE parent SET value = value WHERE id = 2")
+    Postgrex.query!(ctx.db_conn, "UPDATE child SET value = value WHERE id = 2")
+
+    await_replication_relations(ctx.stack_id, [
+      {"public", "parent"},
+      {"public", "child"}
+    ])
   end
 
   defp live_shape_req(base, router_opts, opts \\ []) do

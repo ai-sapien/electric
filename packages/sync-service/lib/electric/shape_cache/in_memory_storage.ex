@@ -16,6 +16,7 @@ defmodule Electric.ShapeCache.InMemoryStorage do
   @snapshot_end_index :end
   @pg_snapshot_key :pg_snapshot
   @move_positions_key :move_positions
+  @root_delivery_tx_offset_key :root_delivery_tx_offset
   @latest_offset_key :latest_offset
 
   defstruct [
@@ -24,7 +25,9 @@ defmodule Electric.ShapeCache.InMemoryStorage do
     :log_table,
     :chunk_checkpoint_table,
     :shape_handle,
-    :stack_id
+    :stack_id,
+    :move_transaction_ref,
+    :move_transaction_offset
   ]
 
   @impl Electric.ShapeCache.Storage
@@ -94,7 +97,15 @@ defmodule Electric.ShapeCache.InMemoryStorage do
   end
 
   @impl Electric.ShapeCache.Storage
-  def init_writer!(%MS{} = opts, _shape_definition), do: opts
+  def init_writer!(%MS{} = opts, _shape_definition) do
+    # A writer can die after promoting only part of a dependency move but
+    # before publishing the new boundary/cursors. Those rows are invisible
+    # while the boundary is old; trim them before this writer can append a
+    # later ordinary transaction that would otherwise expose the abandoned
+    # prefix. Hidden staging rows are likewise owned by the dead writer.
+    trim_unpublished_move_rows!(opts)
+    %{opts | move_transaction_ref: nil, move_transaction_offset: nil}
+  end
 
   @impl Electric.ShapeCache.Storage
   def fetch_latest_offset(%MS{} = opts) do
@@ -130,7 +141,13 @@ defmodule Electric.ShapeCache.InMemoryStorage do
 
   @impl Electric.ShapeCache.Storage
   def set_move_positions!(move_positions, %MS{} = opts) do
+    existing_positions? = :ets.member(opts.snapshot_table, @move_positions_key)
     :ets.insert(opts.snapshot_table, {@move_positions_key, move_positions})
+
+    if not existing_positions? do
+      :ets.insert_new(opts.snapshot_table, {@root_delivery_tx_offset_key, 0})
+    end
+
     :ok
   end
 
@@ -140,6 +157,148 @@ defmodule Electric.ShapeCache.InMemoryStorage do
       [{@move_positions_key, move_positions}] -> {:ok, move_positions}
       [] -> {:ok, %{}}
     end
+  end
+
+  @impl Electric.ShapeCache.Storage
+  def fetch_root_delivery_tx_offset(%MS{} = opts) do
+    case :ets.lookup(opts.snapshot_table, @root_delivery_tx_offset_key) do
+      [{@root_delivery_tx_offset_key, offset}] -> {:ok, offset}
+      [] -> {:ok, nil}
+    end
+  end
+
+  @impl Electric.ShapeCache.Storage
+  def get_log_replay_safe_cursor(%MS{}), do: LogOffset.before_all()
+
+  @impl Electric.ShapeCache.Storage
+  def begin_move_transaction!(%MS{move_transaction_ref: nil, log_table: log_table} = opts) do
+    # A prior writer may have disappeared without committing. Hidden move rows
+    # are never readable, and a new writer can discard them before starting.
+    :ets.match_delete(log_table, {{:move_offset, :_, :_}, :_})
+    trim_unpublished_move_rows!(opts)
+
+    %{
+      opts
+      | move_transaction_ref: make_ref(),
+        move_transaction_offset: current_offset(opts)
+    }
+  end
+
+  def begin_move_transaction!(%MS{}) do
+    raise Storage.Error, "dependency-move transaction is already open"
+  end
+
+  @impl Electric.ShapeCache.Storage
+  def commit_move_transaction!(
+        move_positions,
+        root_delivery_tx_offset,
+        %MS{
+          move_transaction_ref: ref,
+          move_transaction_offset: offset,
+          log_table: log_table,
+          snapshot_table: snapshot_table
+        } = opts
+      )
+      when is_reference(ref) and is_integer(root_delivery_tx_offset) and
+             root_delivery_tx_offset >= 0 do
+    ensure_root_delivery_frontier_monotonic!(snapshot_table, root_delivery_tx_offset)
+    promote_move_rows_in_bounded_batches!(log_table, ref)
+
+    :ets.match_delete(log_table, {{:move_offset, ref, :_}, :_})
+
+    # One ETS insert publishes the readable boundary and its source cursors.
+    # Readers clamp the promoted rows above to that boundary, so they cannot
+    # observe the rows without the matching cursor state.
+    :ets.insert(snapshot_table, [
+      {@latest_offset_key, offset},
+      {@move_positions_key, move_positions},
+      {@root_delivery_tx_offset_key, root_delivery_tx_offset}
+    ])
+
+    %{opts | move_transaction_ref: nil, move_transaction_offset: nil}
+  end
+
+  def commit_move_transaction!(_move_positions, _root_delivery_tx_offset, %MS{}) do
+    raise Storage.Error, "no dependency-move transaction is open"
+  end
+
+  defp ensure_root_delivery_frontier_monotonic!(snapshot_table, new_offset) do
+    case :ets.lookup(snapshot_table, @root_delivery_tx_offset_key) do
+      [{@root_delivery_tx_offset_key, current_offset}] when current_offset > new_offset ->
+        raise Storage.Error,
+          message: "cannot regress root-delivery frontier from #{current_offset} to #{new_offset}"
+
+      _ ->
+        :ok
+    end
+  end
+
+  @move_promotion_batch_size 500
+
+  defp promote_move_rows_in_bounded_batches!(log_table, ref) do
+    promote_next_move_row_batch(log_table, ref, {:move_offset, ref, -1})
+  end
+
+  defp promote_next_move_row_batch(log_table, ref, cursor) do
+    {rows, next_cursor} =
+      take_move_row_batch(log_table, ref, cursor, @move_promotion_batch_size, [])
+
+    case rows do
+      [] ->
+        :ok
+
+      rows ->
+        :ets.insert(
+          log_table,
+          Enum.map(rows, fn {{:move_offset, ^ref, item_offset}, json} ->
+            {{:offset, item_offset}, json}
+          end)
+        )
+
+        # Once a batch has a public copy, its staging rows are no longer
+        # needed. If the writer dies before publishing the boundary, startup
+        # trims those public rows again. Removing each staged batch here keeps
+        # peak ETS usage bounded instead of retaining a full second copy of a
+        # large move until the very end.
+        Enum.each(rows, fn {key, _json} ->
+          :ets.delete(log_table, key)
+        end)
+
+        # Continue from the last deleted staging key. Newly inserted public
+        # keys are 2-tuples and sort before this 3-tuple cursor, so traversal
+        # remains linear without relying on an ETS continuation across writes.
+        promote_next_move_row_batch(log_table, ref, next_cursor)
+    end
+  end
+
+  defp take_move_row_batch(_log_table, _ref, cursor, 0, rows) do
+    {Enum.reverse(rows), cursor}
+  end
+
+  defp take_move_row_batch(log_table, ref, cursor, remaining, rows) do
+    case :ets.next_lookup(log_table, cursor) do
+      {{:move_offset, ^ref, _item_offset} = key, [{_key, json}]} ->
+        take_move_row_batch(log_table, ref, key, remaining - 1, [{key, json} | rows])
+
+      _end_or_different_move ->
+        {Enum.reverse(rows), cursor}
+    end
+  end
+
+  defp trim_unpublished_move_rows!(%MS{} = opts) do
+    boundary = opts |> current_offset() |> storage_offset()
+
+    :ets.match_delete(opts.log_table, {{:move_offset, :_, :_}, :_})
+
+    :ets.select_delete(opts.log_table, [
+      {{{:offset, :"$1"}, :_}, [{:>, :"$1", {:const, boundary}}], [true]}
+    ])
+
+    :ets.select_delete(opts.chunk_checkpoint_table, [
+      {{:"$1", :_}, [{:>, :"$1", {:const, boundary}}], [true]}
+    ])
+
+    :ok
   end
 
   @impl Electric.ShapeCache.Storage
@@ -174,18 +333,32 @@ defmodule Electric.ShapeCache.InMemoryStorage do
     offset = storage_offset(offset)
     max_offset = storage_offset(max_offset)
 
-    Stream.unfold(offset, fn offset ->
-      case :ets.next_lookup(offset_indexed_table, {:offset, offset}) do
-        :"$end_of_table" ->
-          nil
-
-        {{:offset, position}, _} when position > max_offset ->
-          nil
-
-        {{:offset, position}, [{_, item}]} ->
-          {project_item.(LogOffset.new(position), item), position}
-      end
+    Stream.unfold({:offset, offset}, fn cursor ->
+      next_visible_log_item(offset_indexed_table, cursor, max_offset, project_item)
     end)
+  end
+
+  defp next_visible_log_item(table, cursor, max_offset, project_item) do
+    case :ets.next_lookup(table, cursor) do
+      :"$end_of_table" ->
+        nil
+
+      {{:offset, position}, _} when position > max_offset ->
+        nil
+
+      {{:offset, position} = key, [{_, item}]} ->
+        {project_item.(LogOffset.new(position), item), key}
+
+      {{:move_offset, _ref, _position}, _items} ->
+        # Public offset keys are 2-tuples while staging keys are 3-tuples, so
+        # ordered_set places the complete staging suffix after every public
+        # log row. Stop at its first key instead of walking a potentially huge
+        # unpublished move merely to discover that none of it is readable.
+        nil
+
+      {hidden_key, _items} ->
+        next_visible_log_item(table, hidden_key, max_offset, project_item)
+    end
   end
 
   defp get_offset_indexed_stream(offset, max_offset, offset_indexed_table) do
@@ -199,12 +372,12 @@ defmodule Electric.ShapeCache.InMemoryStorage do
     case :ets.lookup_element(opts.snapshot_table, snapshot_end(), 2, nil) do
       nil -> stream_from_snapshot(offset, max_offset, opts)
       max when is_log_offset_lt(offset, max) -> stream_from_snapshot(offset, max_offset, opts)
-      _ -> get_offset_indexed_stream(offset, max_offset, opts.log_table)
+      _ -> get_visible_log_stream(offset, max_offset, opts)
     end
   end
 
   def get_log_stream(offset, max_offset, %MS{} = opts) do
-    get_offset_indexed_stream(offset, max_offset, opts.log_table)
+    get_visible_log_stream(offset, max_offset, opts)
   end
 
   @impl Electric.ShapeCache.Storage
@@ -218,12 +391,28 @@ defmodule Electric.ShapeCache.InMemoryStorage do
         stream_from_snapshot_with_offsets(offset, max_offset, opts)
 
       _ ->
-        get_offset_indexed_stream_with_offsets(offset, max_offset, opts.log_table)
+        get_visible_log_stream_with_offsets(offset, max_offset, opts)
     end
   end
 
   def get_log_stream_with_offsets(offset, max_offset, %MS{} = opts) do
-    get_offset_indexed_stream_with_offsets(offset, max_offset, opts.log_table)
+    get_visible_log_stream_with_offsets(offset, max_offset, opts)
+  end
+
+  defp get_visible_log_stream(offset, max_offset, %MS{} = opts) do
+    get_offset_indexed_stream(
+      offset,
+      LogOffset.min(max_offset, current_offset(opts)),
+      opts.log_table
+    )
+  end
+
+  defp get_visible_log_stream_with_offsets(offset, max_offset, %MS{} = opts) do
+    get_offset_indexed_stream_with_offsets(
+      offset,
+      LogOffset.min(max_offset, current_offset(opts)),
+      opts.log_table
+    )
   end
 
   defp get_offset_indexed_stream_with_offsets(offset, max_offset, offset_indexed_table) do
@@ -272,7 +461,11 @@ defmodule Electric.ShapeCache.InMemoryStorage do
         nil
 
       {chunk_offset, _} ->
-        LogOffset.new(chunk_offset)
+        chunk_offset = LogOffset.new(chunk_offset)
+
+        if LogOffset.is_log_offset_lte(chunk_offset, current_offset(opts)),
+          do: chunk_offset,
+          else: nil
     end
   end
 
@@ -346,7 +539,8 @@ defmodule Electric.ShapeCache.InMemoryStorage do
           {{storage_offset(offset), :checkpoint}, curr}
 
         {offset, _key, _op_type, json_log_item}, _ ->
-          {{{:offset, storage_offset(offset)}, json_log_item}, offset}
+          key = log_item_key(opts, offset)
+          {{key, json_log_item}, offset}
       end)
 
     processed_log_items
@@ -354,12 +548,17 @@ defmodule Electric.ShapeCache.InMemoryStorage do
     |> then(fn {checkpoints, log_items} ->
       :ets.insert(chunk_checkpoint_table, checkpoints)
       :ets.insert(log_table, log_items)
-      :ets.insert(opts.snapshot_table, {@latest_offset_key, last_offset})
+
+      if is_nil(opts.move_transaction_ref) do
+        publish_log_offset!(opts, last_offset)
+      end
     end)
 
-    send(self(), {Storage, :flushed, elem(List.last(log_items), 0)})
+    if is_nil(opts.move_transaction_ref) do
+      send(self(), {Storage, :flushed, elem(List.last(log_items), 0)})
+    end
 
-    opts
+    update_move_transaction_offset(opts, last_offset)
   end
 
   @impl Electric.ShapeCache.Storage
@@ -388,18 +587,21 @@ defmodule Electric.ShapeCache.InMemoryStorage do
 
   @impl Electric.ShapeCache.Storage
   def append_control_message!(control_message, %MS{log_table: log_table} = opts) do
-    initial_offset = current_offset(opts)
+    initial_offset = writer_offset(opts)
     new_offset = LogOffset.increment(initial_offset)
 
-    :ets.insert(log_table, {{:offset, storage_offset(new_offset)}, control_message})
-    :ets.insert(opts.snapshot_table, {@latest_offset_key, new_offset})
+    :ets.insert(log_table, {log_item_key(opts, new_offset), control_message})
 
-    {{initial_offset, new_offset}, opts}
+    if is_nil(opts.move_transaction_ref) do
+      publish_log_offset!(opts, new_offset)
+    end
+
+    {{initial_offset, new_offset}, update_move_transaction_offset(opts, new_offset)}
   end
 
   @impl Electric.ShapeCache.Storage
   def append_move_in_snapshot_to_log!(name, %MS{log_table: log_table} = opts, skip_row?) do
-    initial_offset = current_offset(opts)
+    initial_offset = writer_offset(opts)
     ref = make_ref()
 
     Stream.unfold({initial_offset, {:movein, {name, nil}}}, fn {offset, last_key} ->
@@ -409,7 +611,7 @@ defmodule Electric.ShapeCache.InMemoryStorage do
             {[], {offset, ets_key}}
           else
             offset = LogOffset.increment(offset)
-            {{{:offset, storage_offset(offset)}, json}, {offset, ets_key}}
+            {{log_item_key(opts, offset), json}, {offset, ets_key}}
           end
 
         _ ->
@@ -426,8 +628,32 @@ defmodule Electric.ShapeCache.InMemoryStorage do
 
     resulting_offset = receive(do: ({^ref, offset} -> offset))
 
-    {{initial_offset, resulting_offset}, opts}
+    if is_nil(opts.move_transaction_ref) do
+      # Standalone move-in appends were historically readable immediately.
+      # Keep the published boundary aligned with those visible rows now that
+      # readers clamp streams to the latest committed offset.
+      publish_log_offset!(opts, resulting_offset)
+    end
+
+    {{initial_offset, resulting_offset}, update_move_transaction_offset(opts, resulting_offset)}
   end
+
+  defp writer_offset(%MS{move_transaction_offset: %LogOffset{} = offset}), do: offset
+  defp writer_offset(%MS{} = opts), do: current_offset(opts)
+
+  defp log_item_key(%MS{move_transaction_ref: ref}, offset) when is_reference(ref),
+    do: {:move_offset, ref, storage_offset(offset)}
+
+  defp log_item_key(%MS{}, offset), do: {:offset, storage_offset(offset)}
+
+  defp update_move_transaction_offset(%MS{move_transaction_ref: ref} = opts, offset)
+       when is_reference(ref),
+       do: %{opts | move_transaction_offset: offset}
+
+  defp update_move_transaction_offset(%MS{} = opts, _offset), do: opts
+
+  defp publish_log_offset!(opts, offset),
+    do: :ets.insert(opts.snapshot_table, {@latest_offset_key, offset})
 
   @impl Electric.ShapeCache.Storage
   def cleanup!(%MS{} = opts) do

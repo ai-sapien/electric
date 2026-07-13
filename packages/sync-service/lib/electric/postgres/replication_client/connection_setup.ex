@@ -8,6 +8,7 @@ defmodule Electric.Postgres.ReplicationClient.ConnectionSetup do
   module focused on the handling of logical messages.
   """
   alias Electric.Utils
+  alias Electric.Postgres.CausalMarker
   alias Electric.Postgres.ReplicationClient.State
   alias Electric.Postgres.Lsn
 
@@ -49,8 +50,8 @@ defmodule Electric.Postgres.ReplicationClient.ConnectionSetup do
   # streaming mode.
   @spec start_streaming(state) :: callback_return
   def start_streaming(%{step: :ready_to_stream} = state) do
-    Logger.debug("ReplicationClient step: start_streaming")
-    query_for_step(:start_streaming, %{state | step: :start_streaming})
+    Logger.debug("ReplicationClient step: refresh_wal_target")
+    query_for_step(:refresh_wal_target, %{state | step: :refresh_wal_target})
   end
 
   ###
@@ -73,7 +74,38 @@ defmodule Electric.Postgres.ReplicationClient.ConnectionSetup do
        system_identifier: systemid,
        timeline_id: timeline,
        current_wal_flush_lsn: xlogpos
-     }, state}
+     },
+     %{
+       state
+       | startup_wal_flush_lsn: xlogpos |> Lsn.from_string() |> Lsn.to_integer(),
+         replication_caught_up?: false
+     }}
+  end
+
+  defp refresh_wal_target_query(state) do
+    Logger.debug("ReplicationClient step: emit_causal_marker")
+    {:query, CausalMarker.emit_query(), state}
+  end
+
+  # The initial IDENTIFY_SYSTEM position is not a causal boundary: the server
+  # may report WAL that logical decoding has not delivered yet. Emit an explicit
+  # pgoutput message immediately before START_REPLICATION and wait until that
+  # exact logical record is observed in the stream.
+  defp refresh_wal_target_result(
+         [%Postgrex.Result{command: :select, rows: [[marker_lsn]]}],
+         state
+       ) do
+    %{
+      state
+      | startup_wal_flush_lsn: marker_lsn |> Lsn.from_string() |> Lsn.to_integer(),
+        replication_caught_up?: false,
+        causal_catch_up_task: nil,
+        pending_causal_marker_lsn: nil,
+        pending_causal_marker_xid: nil,
+        event_causal_marker_lsn: nil,
+        event_causal_marker_xid: nil,
+        last_processed_causal_marker_lsn: 0
+    }
   end
 
   ###
@@ -352,7 +384,7 @@ defmodule Electric.Postgres.ReplicationClient.ConnectionSetup do
     Logger.debug("ReplicationClient step: start_replication_slot")
 
     query =
-      "START_REPLICATION SLOT #{Utils.quote_name(state.slot_name)} LOGICAL 0/0 (proto_version '1', publication_names '#{state.publication_name}')"
+      "START_REPLICATION SLOT #{Utils.quote_name(state.slot_name)} LOGICAL 0/0 (proto_version '1', publication_names '#{state.publication_name}', messages 'true')"
 
     {:stream, query, [], state}
   end
@@ -411,10 +443,13 @@ defmodule Electric.Postgres.ReplicationClient.ConnectionSetup do
     do: :set_display_setting
 
   defp next_step(%{step: :set_display_setting, start_streaming?: true}),
-    do: :start_streaming
+    do: :refresh_wal_target
 
   defp next_step(%{step: :set_display_setting}),
     do: :ready_to_stream
+
+  defp next_step(%{step: :refresh_wal_target}),
+    do: :start_streaming
 
   ###
 
@@ -436,6 +471,7 @@ defmodule Electric.Postgres.ReplicationClient.ConnectionSetup do
   defp query_for_step(:query_slot_flushed_lsn, state), do: query_slot_flushed_lsn_query(state)
   defp query_for_step(:set_display_setting, state), do: set_display_setting_query(state)
   defp query_for_step(:ready_to_stream, state), do: ready_to_stream(state)
+  defp query_for_step(:refresh_wal_target, state), do: refresh_wal_target_query(state)
   defp query_for_step(:start_streaming, state), do: start_replication_slot_query(state)
 
   ###
@@ -471,4 +507,7 @@ defmodule Electric.Postgres.ReplicationClient.ConnectionSetup do
 
   defp dispatch_query_result(:set_display_setting, result, state),
     do: set_display_setting_result(result, state)
+
+  defp dispatch_query_result(:refresh_wal_target, result, state),
+    do: refresh_wal_target_result(result, state)
 end

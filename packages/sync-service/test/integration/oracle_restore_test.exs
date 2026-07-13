@@ -184,6 +184,7 @@ defmodule Electric.Integration.OracleRestoreTest do
   # under a small `chunk_bytes_threshold` so its log spans many chunks. After the
   # restart the persistent replication slot has to replay that backlog.
   @tag chunk_bytes_threshold: 200
+  @tag stack_restart_timeout_ms: 30_000
   test "optimized subquery shape must-refetches after restart during slot catch-up replay",
        ctx do
     # Two `optimized: true` subquery shapes over the same `projects` source.
@@ -242,6 +243,12 @@ defmodule Electric.Integration.OracleRestoreTest do
 
     batches = [toggles, batch_2]
 
-    OracleHarness.test_against_oracle(ctx, shapes, batches, restart_server_every: 1)
+    try do
+      OracleHarness.test_against_oracle(ctx, shapes, batches, restart_server_every: 1)
+    after
+      # This case leaves a large persistent-slot replay behind. Stop the
+      # restarted stack before after-suite cleanup attempts to drop its test DB.
+      stop_supervised(Electric.StackSupervisor)
+    end
   end
 end

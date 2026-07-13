@@ -6,6 +6,53 @@ defmodule Electric.StackSupervisorTest do
 
   import Support.ComponentSetup
 
+  describe "initialization" do
+    test "seeds subquery safety limits before starting the replay coordinator" do
+      overrides = [
+        materializer_replay_memory_limit_bytes: 2_001,
+        materializer_replay_max_pending: 202,
+        materializer_replay_idle_timeout_ms: 2_003,
+        materializer_live_max_subscribers: 204,
+        materializer_live_backlog_memory_limit_bytes: 2_005,
+        materializer_causal_call_timeout_ms: 2_006,
+        causal_drain_max_concurrency: 207,
+        causal_drain_timeout_ms: 2_008,
+        subquery_buffer_max_transactions: 209,
+        subquery_deferred_event_memory_limit_bytes: 2_010
+      ]
+
+      opts =
+        Electric.Application.configuration(
+          [
+            stack_id: "stack-supervisor-wiring-#{System.unique_integer([:positive])}",
+            persistent_kv: Electric.PersistentKV.Memory.new!()
+          ] ++ overrides
+        )
+
+      assert {:ok, config} =
+               NimbleOptions.validate(Map.new(opts), StackSupervisor.opts_schema())
+
+      assert {:ok, {_supervisor_flags, children}} = StackSupervisor.init(config)
+
+      stack_config_index = Enum.find_index(children, &(&1.id == Electric.StackConfig))
+
+      replay_coordinator_index =
+        Enum.find_index(
+          children,
+          &(&1.id == Electric.Shapes.Consumer.Materializer.ReplayCoordinator)
+        )
+
+      assert replay_coordinator_index == stack_config_index + 1
+
+      stack_config_child = Enum.at(children, stack_config_index)
+
+      assert {Electric.StackConfig, :start_link, [stack_config_opts]} = stack_config_child.start
+      seed_config = Keyword.fetch!(stack_config_opts, :seed_config)
+
+      assert Keyword.take(seed_config, Keyword.keys(overrides)) == overrides
+    end
+  end
+
   describe "Telemetry" do
     setup [:with_stack_id_from_test]
 

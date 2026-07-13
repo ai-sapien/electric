@@ -840,6 +840,76 @@ defmodule Electric.Shapes.ApiTest do
       assert [] == Registry.lookup(ctx.registry, @test_shape_handle)
     end
 
+    test "one SSE notification drains every committed chunk through its final delimiter", ctx do
+      patch_shape_cache(
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          {@test_shape_handle, @test_offset}
+        end,
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end
+      )
+
+      test_pid = self()
+      intermediate_offset = LogOffset.increment(@test_offset)
+      final_offset = LogOffset.increment(intermediate_offset)
+
+      patch_storage(for_shape: fn @test_shape_handle, _opts -> @test_opts end)
+
+      expect_storage(
+        get_chunk_end_log_offset: fn @test_offset, _ -> @test_offset end,
+        get_log_stream: fn @test_offset, @test_offset, @test_opts ->
+          send(test_pid, :sse_waiting)
+          []
+        end,
+        get_log_stream: fn @test_offset, ^final_offset, @test_opts ->
+          [
+            Jason.encode!(%{
+              key: "row",
+              value: %{"id" => "1"},
+              headers: %{operation: "insert"},
+              offset: intermediate_offset
+            }),
+            Jason.encode!(%{
+              headers: %{event: "move-out", patterns: [], txids: [], last: true},
+              offset: final_offset
+            })
+          ]
+        end
+      )
+
+      task =
+        Task.async(fn ->
+          assert {:ok, request} =
+                   Api.validate(
+                     ctx.api,
+                     %{
+                       table: "public.users",
+                       offset: "#{@test_offset}",
+                       handle: @test_shape_handle,
+                       live: true,
+                       live_sse: true
+                     }
+                   )
+
+          response = Api.serve_shape_response(request)
+          {response, Enum.take(response.body, 9) |> IO.iodata_to_binary()}
+        end)
+
+      assert_receive :sse_waiting, @receive_timeout
+
+      Registry.dispatch(ctx.registry, @test_shape_handle, fn [{pid, ref}] ->
+        send(pid, {ref, :new_changes, final_offset})
+      end)
+
+      assert {response, sse_body} = Task.await(task)
+      assert response.status == 200
+      assert response.chunked
+      assert sse_body =~ ~S|"key":"row"|
+      assert sse_body =~ ~S|"event":"move-out"|
+      assert sse_body =~ ~S|"last":true|
+      assert sse_body =~ ~S|"control":"up-to-date"|
+    end
+
     test "raises if body is read from a different process", ctx do
       patch_shape_cache(
         resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->

@@ -29,7 +29,22 @@ defmodule Support.OracleHarness.ShapeChecker do
   alias Electric.Client.ShapeDefinition
   alias Electric.Client.ShapeState
 
+  @diagnostic_max_nodes 32
+  @diagnostic_max_depth 6
+  @diagnostic_max_dependencies_per_node 8
+  @diagnostic_total_timeout_ms 250
+  @diagnostic_inspect_limit 256
+  @diagnostic_printable_limit 2_048
+  @diagnostic_error_max_bytes 512
+  @mismatch_sample_limit 5
+  @mismatch_max_columns_per_sample 16
+  @mismatch_inspect_limit 64
+  @mismatch_printable_limit 512
+
   defstruct [
+    :stack_id,
+    :stack_supervisor,
+    :component_pids,
     :name,
     :table,
     :where,
@@ -91,6 +106,9 @@ defmodule Support.OracleHarness.ShapeChecker do
     timeout_ms = Keyword.fetch!(opts, :timeout_ms)
 
     state = %__MODULE__{
+      stack_id: ctx.stack_id,
+      stack_supervisor: ctx.stack_supervisor,
+      component_pids: component_pids(ctx.stack_id),
       name: shape.name,
       table: shape.table,
       where: shape.where,
@@ -148,45 +166,217 @@ defmodule Support.OracleHarness.ShapeChecker do
   # ---------------------------------------------------------------------------
 
   defp await_up_to_date(state) do
-    do_await(state, System.monotonic_time(:millisecond))
+    started_at_ms = System.monotonic_time(:millisecond)
+    deadline_ms = started_at_ms + state.timeout_ms
+    do_await(state, started_at_ms, deadline_ms)
   end
 
-  defp do_await(state, start_ms) do
-    elapsed = System.monotonic_time(:millisecond) - start_ms
+  defp do_await(state, started_at_ms, deadline_ms) do
+    remaining_ms = deadline_ms - System.monotonic_time(:millisecond)
 
-    if elapsed >= state.timeout_ms do
-      # Timed out — return state and let assert_consistent! report the mismatch
-      state
+    if remaining_ms <= 0 do
+      convergence_timeout!(state, started_at_ms)
     else
-      case Client.poll(state.client, state.shape_def, state.poll_state, replica: :full) do
+      poll_result =
+        Client.poll(state.client, state.shape_def, state.poll_state,
+          replica: :full,
+          timeout: remaining_ms
+        )
+
+      if System.monotonic_time(:millisecond) >= deadline_ms do
+        convergence_timeout!(state, started_at_ms)
+      end
+
+      case poll_result do
         {:ok, messages, new_state} ->
           state = %{state | poll_state: new_state}
           state = apply_messages(state, messages)
 
           if new_state.up_to_date? do
-            handle_up_to_date(state, start_ms)
+            handle_up_to_date(state, started_at_ms, deadline_ms)
           else
-            do_await(state, start_ms)
+            do_await(state, started_at_ms, deadline_ms)
           end
 
         {:must_refetch, messages, new_state} ->
           if state.optimized do
+            diagnostics = must_refetch_diagnostics(state, new_state)
+
             flunk(
-              "Unexpected 409 (must-refetch) in optimized shape=#{state.name} where=#{state.where}"
+              "Unexpected 409 (must-refetch) in optimized shape=#{state.name} where=#{state.where}; " <>
+                "diagnostics=#{inspect(diagnostics, pretty: true, limit: :infinity)}"
             )
           end
 
           state = %{state | poll_state: new_state, rows: %{}}
           state = apply_messages(state, messages)
-          do_await(state, start_ms)
+          do_await(state, started_at_ms, deadline_ms)
+
+        {:error, %Client.Error{resp: {Electric.Client.Fetch.Pool, :request_timeout}}} ->
+          convergence_timeout!(state, started_at_ms)
 
         {:error, error} ->
-          flunk("Poll error for shape=#{state.name} where=#{state.where}: #{inspect(error)}")
+          diagnostics = poll_error_diagnostics(state)
+
+          flunk(
+            "Poll error for shape=#{state.name} where=#{state.where}: #{inspect(error)}; " <>
+              "diagnostics=#{inspect(diagnostics, pretty: true, limit: :infinity)}"
+          )
       end
     end
   end
 
-  defp handle_up_to_date(state, start_ms) do
+  defp convergence_timeout!(state, started_at_ms) do
+    elapsed_ms = System.monotonic_time(:millisecond) - started_at_ms
+
+    diagnostics =
+      Map.merge(timeout_diagnostics(state), %{
+        poll_state:
+          Map.take(state.poll_state, [:shape_handle, :offset, :next_cursor, :up_to_date?]),
+        materialized_row_count: map_size(state.rows)
+      })
+
+    flunk(
+      "Shape convergence timeout for shape=#{state.name} where=#{state.where} " <>
+        "after #{elapsed_ms}ms (limit=#{state.timeout_ms}ms); " <>
+        "diagnostics=#{inspect(diagnostics, pretty: true, limit: :infinity)}"
+    )
+  end
+
+  defp must_refetch_diagnostics(state, new_poll_state) do
+    handles =
+      [state.poll_state.shape_handle, new_poll_state.shape_handle]
+      |> Enum.filter(&is_binary/1)
+      |> Enum.uniq()
+
+    %{
+      old_poll_state:
+        Map.take(state.poll_state, [:shape_handle, :offset, :next_cursor, :up_to_date?]),
+      new_poll_state:
+        Map.take(new_poll_state, [:shape_handle, :offset, :next_cursor, :up_to_date?]),
+      handles: Map.new(handles, &{&1, handle_diagnostics(state.stack_id, &1)})
+    }
+  end
+
+  defp handle_diagnostics(stack_id, handle) do
+    consumer = Electric.Shapes.Consumer.whereis(stack_id, handle)
+
+    shape =
+      case Electric.ShapeCache.ShapeStatus.fetch_shape_by_handle(stack_id, handle) do
+        {:ok, shape} ->
+          %{
+            root_table: shape.root_table,
+            dependency_handles: shape.shape_dependencies_handles
+          }
+
+        :error ->
+          nil
+      end
+
+    %{
+      shape_status_present?: Electric.ShapeCache.ShapeStatus.has_shape_handle?(stack_id, handle),
+      shape_status_activated?:
+        Electric.ShapeCache.ShapeStatus.shape_has_been_activated?(stack_id, handle),
+      snapshot_started?: Electric.ShapeCache.ShapeStatus.snapshot_started?(stack_id, handle),
+      shape: shape,
+      consumer: inspect(consumer),
+      consumer_alive?: is_pid(consumer) and Process.alive?(consumer)
+    }
+  rescue
+    error -> %{diagnostic_error: Exception.message(error)}
+  catch
+    :exit, reason -> %{diagnostic_exit: inspect(reason)}
+  end
+
+  defp poll_error_diagnostics(state) do
+    current_component_pids = component_pids(state.stack_id)
+    consumer_snapshot = Electric.Shapes.ConsumerRegistry.consumer_snapshot(state.stack_id)
+    service_status = Electric.StatusMonitor.service_status(state.stack_id)
+
+    %{
+      service_status: service_status,
+      status: Electric.StatusMonitor.status(state.stack_id),
+      timeout_message:
+        if(service_status == :active,
+          do: nil,
+          else: Electric.StatusMonitor.timeout_message(state.stack_id)
+        ),
+      initial_component_pids: state.component_pids,
+      current_component_pids: current_component_pids,
+      components_replaced?: current_component_pids != state.component_pids,
+      stack_supervisor: pid_diagnostics(state.stack_supervisor),
+      consumer_count: map_size(consumer_snapshot),
+      current_handle:
+        case state.poll_state.shape_handle do
+          handle when is_binary(handle) -> handle_diagnostics(state.stack_id, handle)
+          nil -> nil
+        end
+    }
+  rescue
+    error -> %{diagnostic_error: Exception.message(error)}
+  catch
+    :exit, reason -> %{diagnostic_exit: inspect(reason)}
+  end
+
+  # Timeout reporting runs after the convergence budget has already expired,
+  # so it must only use local, non-blocking process and ETS lookups. In
+  # particular, the ShapeStatus helpers used by poll_error_diagnostics/1 may
+  # reach the shape metadata database and must not extend a 50ms deadline by
+  # seconds when that subsystem is unhealthy.
+  defp timeout_diagnostics(state) do
+    current_component_pids = component_pids(state.stack_id)
+    service_status = Electric.StatusMonitor.service_status(state.stack_id)
+
+    %{
+      service_status: service_status,
+      status: Electric.StatusMonitor.status(state.stack_id),
+      timeout_message:
+        if(service_status == :active,
+          do: nil,
+          else: Electric.StatusMonitor.timeout_message(state.stack_id)
+        ),
+      initial_component_pids: state.component_pids,
+      current_component_pids: current_component_pids,
+      components_replaced?: current_component_pids != state.component_pids,
+      stack_supervisor: pid_diagnostics(state.stack_supervisor),
+      consumer_count: Electric.Shapes.ConsumerRegistry.active_consumer_count(state.stack_id),
+      current_handle: timeout_handle_diagnostics(state.stack_id, state.poll_state.shape_handle)
+    }
+  rescue
+    error -> %{diagnostic_error: Exception.message(error)}
+  catch
+    :exit, reason -> %{diagnostic_exit: inspect(reason)}
+  end
+
+  defp timeout_handle_diagnostics(stack_id, handle) when is_binary(handle) do
+    consumer = Electric.Shapes.Consumer.whereis(stack_id, handle)
+
+    %{
+      consumer: inspect(consumer),
+      consumer_alive?: is_pid(consumer) and Process.alive?(consumer)
+    }
+  end
+
+  defp timeout_handle_diagnostics(_stack_id, nil), do: nil
+
+  defp component_pids(stack_id) do
+    %{
+      status_monitor: named_pid(Electric.StatusMonitor.name(stack_id)),
+      shape_log_collector: named_pid(Electric.Replication.ShapeLogCollector.name(stack_id)),
+      request_batcher:
+        named_pid(Electric.Replication.ShapeLogCollector.RequestBatcher.name(stack_id)),
+      shape_cache: named_pid(Electric.ShapeCache.name(stack_id))
+    }
+  end
+
+  defp named_pid(name), do: name |> GenServer.whereis() |> pid_diagnostics()
+
+  defp pid_diagnostics(pid) when is_pid(pid),
+    do: %{pid: inspect(pid), alive?: Process.alive?(pid)}
+
+  defp pid_diagnostics(nil), do: nil
+
+  defp handle_up_to_date(state, started_at_ms, deadline_ms) do
     oracle_rows = query_oracle(state)
     materialized = materialized_rows(state)
 
@@ -194,7 +384,7 @@ defmodule Support.OracleHarness.ShapeChecker do
       state
     else
       # Electric reported up_to_date but data doesn't match yet - keep polling
-      do_await(state, start_ms)
+      do_await(state, started_at_ms, deadline_ms)
     end
   end
 
@@ -278,11 +468,23 @@ defmodule Support.OracleHarness.ShapeChecker do
     materialized = materialized_rows(state)
 
     if materialized != oracle_after do
+      mismatch_summary = bounded_row_mismatch_summary(state, materialized, oracle_after)
+
       IO.puts(
         "[oracle] View mismatch in step=#{step_name} shape=#{state.name} where=#{state.where} view_changed?=#{view_changed?}"
       )
 
-      assert materialized == oracle_after
+      IO.puts(
+        "[oracle] Shape diagnostics: " <>
+          inspect(bounded_shape_tree_diagnostics(state),
+            pretty: true,
+            limit: @diagnostic_inspect_limit,
+            printable_limit: @diagnostic_printable_limit,
+            width: 120
+          )
+      )
+
+      raise_bounded_row_mismatch!(state, step_name, view_changed?, mismatch_summary)
     end
 
     view_status = if view_changed?, do: "changed", else: "unchanged"
@@ -295,6 +497,364 @@ defmodule Support.OracleHarness.ShapeChecker do
     state.rows
     |> Map.values()
     |> Enum.sort_by(&key_from_value(state.pk, &1))
+  end
+
+  @doc false
+  def bounded_row_mismatch_summary(state, materialized_rows, oracle_rows)
+      when is_list(materialized_rows) and is_list(oracle_rows) do
+    accumulator = %{
+      materialized_row_count: 0,
+      oracle_row_count: 0,
+      missing_row_count: 0,
+      unexpected_row_count: 0,
+      missing_rows_sample: [],
+      unexpected_rows_sample: []
+    }
+
+    materialized_rows
+    |> merge_row_mismatches(oracle_rows, state, accumulator)
+    |> Map.update!(:missing_rows_sample, &Enum.reverse/1)
+    |> Map.update!(:unexpected_rows_sample, &Enum.reverse/1)
+    |> Map.put(:sample_limit, @mismatch_sample_limit)
+  end
+
+  @doc false
+  def raise_bounded_row_mismatch!(state, step_name, view_changed?, summary) do
+    flunk(
+      "View mismatch in step=#{step_name} shape=#{Map.get(state, :name)} " <>
+        "where=#{Map.get(state, :where)} view_changed?=#{view_changed?}; " <>
+        "row_summary=#{inspect(summary, pretty: true, limit: @mismatch_inspect_limit, printable_limit: @mismatch_printable_limit, width: 120)}"
+    )
+  end
+
+  defp merge_row_mismatches([], [], _state, accumulator), do: accumulator
+
+  defp merge_row_mismatches([materialized | rest], [], state, accumulator) do
+    merge_row_mismatches(rest, [], state, record_unexpected(accumulator, state, materialized))
+  end
+
+  defp merge_row_mismatches([], [oracle | rest], state, accumulator) do
+    merge_row_mismatches([], rest, state, record_missing(accumulator, state, oracle))
+  end
+
+  defp merge_row_mismatches(
+         [materialized | materialized_rest] = materialized_rows,
+         [oracle | oracle_rest] = oracle_rows,
+         state,
+         accumulator
+       ) do
+    materialized_key = key_from_value(state.pk, materialized)
+    oracle_key = key_from_value(state.pk, oracle)
+
+    cond do
+      materialized_key == oracle_key and materialized == oracle ->
+        accumulator = %{
+          accumulator
+          | materialized_row_count: accumulator.materialized_row_count + 1,
+            oracle_row_count: accumulator.oracle_row_count + 1
+        }
+
+        merge_row_mismatches(materialized_rest, oracle_rest, state, accumulator)
+
+      materialized_key == oracle_key ->
+        accumulator =
+          accumulator
+          |> record_unexpected(state, materialized)
+          |> record_missing(state, oracle)
+
+        merge_row_mismatches(materialized_rest, oracle_rest, state, accumulator)
+
+      materialized_key < oracle_key ->
+        accumulator = record_unexpected(accumulator, state, materialized)
+        merge_row_mismatches(materialized_rest, oracle_rows, state, accumulator)
+
+      true ->
+        accumulator = record_missing(accumulator, state, oracle)
+        merge_row_mismatches(materialized_rows, oracle_rest, state, accumulator)
+    end
+  end
+
+  defp record_missing(accumulator, state, row) do
+    %{
+      accumulator
+      | oracle_row_count: accumulator.oracle_row_count + 1,
+        missing_row_count: accumulator.missing_row_count + 1,
+        missing_rows_sample: maybe_add_row_sample(accumulator.missing_rows_sample, state, row)
+    }
+  end
+
+  defp record_unexpected(accumulator, state, row) do
+    %{
+      accumulator
+      | materialized_row_count: accumulator.materialized_row_count + 1,
+        unexpected_row_count: accumulator.unexpected_row_count + 1,
+        unexpected_rows_sample:
+          maybe_add_row_sample(accumulator.unexpected_rows_sample, state, row)
+    }
+  end
+
+  defp maybe_add_row_sample(samples, state, row) do
+    if length(samples) < @mismatch_sample_limit do
+      [bounded_row_sample(state, row) | samples]
+    else
+      samples
+    end
+  end
+
+  defp bounded_row_sample(state, row) do
+    sampled_columns =
+      state.pk
+      |> Kernel.++(state.columns)
+      |> Enum.uniq()
+      |> Enum.take(@mismatch_max_columns_per_sample)
+
+    sampled_values = Map.take(row, sampled_columns)
+
+    %{
+      key: key_from_value(state.pk, row),
+      values: sampled_values,
+      row_column_count: map_size(row),
+      omitted_column_count: max(map_size(row) - map_size(sampled_values), 0)
+    }
+  end
+
+  @doc false
+  def bounded_shape_tree_diagnostics(%{
+        stack_id: stack_id,
+        poll_state: %{shape_handle: handle}
+      })
+      when is_binary(handle) do
+    limits = diagnostic_limits()
+
+    task =
+      Task.async(fn ->
+        try do
+          context = %{
+            deadline_ms: System.monotonic_time(:millisecond) + @diagnostic_total_timeout_ms,
+            node_count: 0,
+            seen: MapSet.new(),
+            truncated?: false
+          }
+
+          case collect_shape_diagnostics(stack_id, handle, 0, context) do
+            {:ok, diagnostics, context} -> {:ok, diagnostics, context}
+            {:omitted, context} -> {:ok, %{shape_handle: handle}, context}
+          end
+        rescue
+          error -> {:error, bounded_error(Exception.message(error))}
+        catch
+          kind, reason -> {:error, bounded_error("#{kind}: #{safe_inspect(reason)}")}
+        end
+      end)
+
+    case Task.yield(task, @diagnostic_total_timeout_ms) do
+      {:ok, {:ok, diagnostics, context}} ->
+        Map.merge(diagnostics, %{
+          diagnostic_limits: limits,
+          truncated?: context.truncated?
+        })
+
+      {:ok, {:error, error}} ->
+        %{
+          shape_handle: handle,
+          diagnostic_error: error,
+          diagnostic_limits: limits,
+          truncated?: true
+        }
+
+      {:exit, reason} ->
+        %{
+          shape_handle: handle,
+          diagnostic_exit: bounded_error(safe_inspect(reason)),
+          diagnostic_limits: limits,
+          truncated?: true
+        }
+
+      nil ->
+        Task.shutdown(task, :brutal_kill)
+
+        %{
+          shape_handle: handle,
+          diagnostic_timeout?: true,
+          diagnostic_limits: limits,
+          truncated?: true
+        }
+    end
+  end
+
+  def bounded_shape_tree_diagnostics(_state) do
+    %{
+      shape_handle: nil,
+      diagnostic_limits: diagnostic_limits(),
+      truncated?: false
+    }
+  end
+
+  defp diagnostic_limits do
+    %{
+      max_nodes: @diagnostic_max_nodes,
+      max_depth: @diagnostic_max_depth,
+      max_dependencies_per_node: @diagnostic_max_dependencies_per_node,
+      total_timeout_ms: @diagnostic_total_timeout_ms
+    }
+  end
+
+  defp collect_shape_diagnostics(stack_id, handle, depth, context) do
+    cond do
+      diagnostic_budget_expired?(context) ->
+        {:omitted, %{context | truncated?: true}}
+
+      context.node_count >= @diagnostic_max_nodes ->
+        {:omitted, %{context | truncated?: true}}
+
+      MapSet.member?(context.seen, handle) ->
+        {:ok, %{shape_handle: handle, repeated?: true}, context}
+
+      true ->
+        context = %{
+          context
+          | node_count: context.node_count + 1,
+            seen: MapSet.put(context.seen, handle)
+        }
+
+        {shape, shape_error} = fetch_shape_for_diagnostics(stack_id, handle)
+        context = if shape_error, do: %{context | truncated?: true}, else: context
+        dependency_handles = if shape, do: shape.shape_dependencies_handles, else: []
+        dependency_count = Enum.count(dependency_handles)
+
+        dependency_sample =
+          dependency_handles
+          |> Enum.take(@diagnostic_max_dependencies_per_node)
+          |> Enum.sort()
+
+        {dependencies, context} =
+          collect_dependency_diagnostics(
+            stack_id,
+            dependency_sample,
+            depth,
+            dependency_count,
+            context
+          )
+
+        omitted_dependency_count = max(dependency_count - length(dependencies), 0)
+
+        context =
+          if omitted_dependency_count > 0,
+            do: %{context | truncated?: true},
+            else: context
+
+        diagnostics = %{
+          shape_handle: handle,
+          root_table: shape && shape.root_table,
+          dependency_count: dependency_count,
+          dependency_handles_sample: dependency_sample,
+          omitted_dependency_count: omitted_dependency_count,
+          consumer: consumer_diagnostics(stack_id, handle),
+          materializer: materializer_diagnostics(stack_id, handle),
+          dependencies: dependencies
+        }
+
+        diagnostics =
+          if shape_error, do: Map.put(diagnostics, :shape_error, shape_error), else: diagnostics
+
+        {:ok, diagnostics, context}
+    end
+  end
+
+  defp collect_dependency_diagnostics(
+         _stack_id,
+         _dependency_sample,
+         depth,
+         dependency_count,
+         context
+       )
+       when depth >= @diagnostic_max_depth do
+    context = if dependency_count > 0, do: %{context | truncated?: true}, else: context
+    {[], context}
+  end
+
+  defp collect_dependency_diagnostics(
+         stack_id,
+         dependency_sample,
+         depth,
+         _dependency_count,
+         context
+       ) do
+    Enum.reduce_while(dependency_sample, {[], context}, fn dependency_handle,
+                                                           {diagnostics, context} ->
+      case collect_shape_diagnostics(stack_id, dependency_handle, depth + 1, context) do
+        {:ok, dependency_diagnostics, context} ->
+          {:cont, {[dependency_diagnostics | diagnostics], context}}
+
+        {:omitted, context} ->
+          {:halt, {diagnostics, context}}
+      end
+    end)
+    |> then(fn {diagnostics, context} -> {Enum.reverse(diagnostics), context} end)
+  end
+
+  defp fetch_shape_for_diagnostics(stack_id, handle) do
+    case Electric.ShapeCache.ShapeStatus.fetch_shape_by_handle(stack_id, handle) do
+      {:ok, shape} -> {shape, nil}
+      :error -> {nil, nil}
+      other -> {nil, bounded_error("unexpected shape lookup result: #{safe_inspect(other)}")}
+    end
+  rescue
+    error -> {nil, bounded_error(Exception.message(error))}
+  catch
+    :exit, reason -> {nil, bounded_error("exit: #{safe_inspect(reason)}")}
+  end
+
+  defp diagnostic_budget_expired?(context) do
+    System.monotonic_time(:millisecond) >= context.deadline_ms
+  end
+
+  defp consumer_diagnostics(stack_id, handle) do
+    stack_id
+    |> Electric.Shapes.Consumer.whereis(handle)
+    |> process_diagnostics()
+  end
+
+  defp materializer_diagnostics(stack_id, handle) do
+    stack_id
+    |> Electric.Shapes.Consumer.Materializer.whereis(handle)
+    |> process_diagnostics()
+  end
+
+  defp process_diagnostics(pid) when is_pid(pid) do
+    details =
+      case Process.info(pid, [
+             :message_queue_len,
+             :status,
+             :current_function,
+             :memory,
+             :heap_size,
+             :total_heap_size,
+             :stack_size,
+             :reductions,
+             :garbage_collection
+           ]) do
+        nil -> %{}
+        details -> Map.new(details)
+      end
+
+    details
+    |> Map.put(:pid, inspect(pid))
+    |> Map.put(:alive?, Process.alive?(pid))
+  end
+
+  defp process_diagnostics(nil), do: %{pid: nil, alive?: false}
+
+  defp bounded_error(message) when is_binary(message) do
+    if byte_size(message) <= @diagnostic_error_max_bytes do
+      message
+    else
+      binary_part(message, 0, @diagnostic_error_max_bytes) <> "…"
+    end
+  end
+
+  defp safe_inspect(value) do
+    inspect(value, limit: 20, printable_limit: @diagnostic_error_max_bytes)
   end
 
   # ---------------------------------------------------------------------------

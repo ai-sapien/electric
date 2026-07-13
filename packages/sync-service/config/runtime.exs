@@ -273,6 +273,8 @@ config :electric,
   service_port: env!("ELECTRIC_PORT", :integer, nil),
   subquery_buffer_max_transactions:
     env!("ELECTRIC_SUBQUERY_BUFFER_MAX_TRANSACTIONS", :integer, nil),
+  subquery_deferred_event_memory_limit_bytes:
+    env!("ELECTRIC_SUBQUERY_DEFERRED_EVENT_MEMORY_LIMIT_BYTES", :integer, nil),
   shape_hibernate_after: shape_hibernate_after,
   shape_enable_suspend?: shape_enable_suspend?,
   shape_suspend_after: shape_suspend_after,
@@ -294,6 +296,20 @@ config :electric,
   process_spawn_opts:
     env!("ELECTRIC_PROCESS_SPAWN_OPTS", &Electric.Config.parse_spawn_opts!/1, %{}),
   consumer_gc_heap_threshold: env!("ELECTRIC_CONSUMER_GC_HEAP_THRESHOLD", :integer, nil),
+  materializer_replay_memory_limit_bytes:
+    env!("ELECTRIC_MATERIALIZER_REPLAY_MEMORY_LIMIT_BYTES", :integer, nil),
+  materializer_replay_max_pending:
+    env!("ELECTRIC_MATERIALIZER_REPLAY_MAX_PENDING", :integer, nil),
+  materializer_replay_idle_timeout_ms:
+    env!("ELECTRIC_MATERIALIZER_REPLAY_IDLE_TIMEOUT_MS", :integer, nil),
+  materializer_live_max_subscribers:
+    env!("ELECTRIC_MATERIALIZER_LIVE_MAX_SUBSCRIBERS", :integer, nil),
+  materializer_live_backlog_memory_limit_bytes:
+    env!("ELECTRIC_MATERIALIZER_LIVE_BACKLOG_MEMORY_LIMIT_BYTES", :integer, nil),
+  materializer_causal_call_timeout_ms:
+    env!("ELECTRIC_MATERIALIZER_CAUSAL_CALL_TIMEOUT_MS", :integer, nil),
+  causal_drain_max_concurrency: env!("ELECTRIC_CAUSAL_DRAIN_MAX_CONCURRENCY", :integer, nil),
+  causal_drain_timeout_ms: env!("ELECTRIC_CAUSAL_DRAIN_TIMEOUT_MS", :integer, nil),
   http_api_num_acceptors: env!("ELECTRIC_TWEAKS_HTTP_API_NUM_ACCEPTORS", :integer, 100),
   conn_max_requests: env!("ELECTRIC_TWEAKS_CONN_MAX_REQUESTS", :integer, nil),
   handler_fullsweep_after: env!("ELECTRIC_TWEAKS_HANDLER_FULLSWEEP_AFTER", :integer, nil),

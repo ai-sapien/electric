@@ -34,7 +34,24 @@ defmodule Electric.StackConfig do
       chunk_bytes_threshold: Electric.ShapeCache.LogChunker.default_chunk_size_threshold(),
       feature_flags: [],
       process_spawn_opts: %{},
-      consumer_gc_heap_threshold: Electric.Config.default(:consumer_gc_heap_threshold)
+      consumer_gc_heap_threshold: Electric.Config.default(:consumer_gc_heap_threshold),
+      materializer_replay_memory_limit_bytes:
+        Electric.Config.default(:materializer_replay_memory_limit_bytes),
+      materializer_replay_max_pending: Electric.Config.default(:materializer_replay_max_pending),
+      materializer_replay_idle_timeout_ms:
+        Electric.Config.default(:materializer_replay_idle_timeout_ms),
+      materializer_live_max_subscribers:
+        Electric.Config.default(:materializer_live_max_subscribers),
+      materializer_live_backlog_memory_limit_bytes:
+        Electric.Config.default(:materializer_live_backlog_memory_limit_bytes),
+      materializer_causal_call_timeout_ms:
+        Electric.Config.default(:materializer_causal_call_timeout_ms),
+      causal_drain_max_concurrency: Electric.Config.default(:causal_drain_max_concurrency),
+      causal_drain_timeout_ms: Electric.Config.default(:causal_drain_timeout_ms),
+      subquery_buffer_max_transactions:
+        Electric.Config.default(:subquery_buffer_max_transactions),
+      subquery_deferred_event_memory_limit_bytes:
+        Electric.Config.default(:subquery_deferred_event_memory_limit_bytes)
     ]
   end
 

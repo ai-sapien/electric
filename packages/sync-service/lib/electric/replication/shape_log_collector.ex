@@ -66,8 +66,21 @@ defmodule Electric.Replication.ShapeLogCollector do
   end
 
   @doc """
-  Marks the collector as ready to process operations from
-  the replication stream.
+  Allows the collector to process operations from the replication stream
+  without advertising the stack as ready to serve shapes yet.
+
+  Restore uses this intermediate phase so persisted consumers can finish
+  replaying dependency moves that rely on the replication frontier. Once the
+  consumers have finished replay, call `mark_as_ready/1` to publish readiness.
+  """
+  @spec start_processing(Electric.stack_id()) :: :ok
+  def start_processing(stack_id) do
+    GenServer.call(name(stack_id), :start_processing, :infinity)
+  end
+
+  @doc """
+  Marks the collector as ready to process operations from the replication
+  stream and advertises shape readiness to the status monitor.
 
   This is typically called after the initial shape registrations
   have been processed.
@@ -367,18 +380,19 @@ defmodule Electric.Replication.ShapeLogCollector do
     end
   end
 
-  def handle_call(:mark_as_ready, _from, state) do
-    offset =
-      case LsnTracker.get_last_processed_lsn(state.stack_id) do
-        %Lsn{} = lsn ->
-          LogOffset.new(Lsn.to_integer(lsn), :infinity)
+  def handle_call(:start_processing, _from, state) do
+    {state, _started?} = ensure_processing_started(state)
+    ReplicationClient.notify_shape_log_collector_processing_started(state.stack_id, self())
 
-        nil ->
-          raise "LsnTracker must be populated before marking shape_log_collector as ready"
-      end
+    {:reply, :ok, state}
+  end
+
+  def handle_call(:mark_as_ready, _from, state) do
+    {state, _started?} = ensure_processing_started(state)
+    ReplicationClient.notify_shape_log_collector_processing_started(state.stack_id, self())
 
     Electric.StatusMonitor.mark_shape_log_collector_ready(state.stack_id, self())
-    {:reply, :ok, Map.put(state, :last_processed_offset, offset)}
+    {:reply, :ok, state}
   end
 
   def handle_call({:handle_event, _, _}, _from, state)
@@ -410,6 +424,23 @@ defmodule Electric.Replication.ShapeLogCollector do
       end)
 
     {:reply, {:ok, [settings: settings, invalid: invalid]}, state}
+  end
+
+  defp ensure_processing_started(state) do
+    if is_ready_to_process(state) do
+      {state, false}
+    else
+      offset =
+        case LsnTracker.get_last_processed_lsn(state.stack_id) do
+          %Lsn{} = lsn ->
+            LogOffset.new(Lsn.to_integer(lsn), :infinity)
+
+          nil ->
+            raise "LsnTracker must be populated before starting shape_log_collector processing"
+        end
+
+      {Map.put(state, :last_processed_offset, offset), true}
+    end
   end
 
   def handle_cast({:writer_flushed, shape_id, offset}, state) do
@@ -679,6 +710,7 @@ defmodule Electric.Replication.ShapeLogCollector do
       case event do
         %TransactionFragment{commit: commit} when not is_nil(commit) ->
           LsnTracker.broadcast_last_seen_lsn(state.stack_id, lsn)
+
           FlushTracker.handle_txn_fragment(flush_tracker, event, delivered_shapes)
 
         _ ->

@@ -14,9 +14,20 @@ defmodule Electric.Shapes.Consumer.PendingTxn do
   transaction after seeing a Commit.
   """
 
+  alias Electric.Replication.Changes
+
   defstruct [
     :xid,
     consider_flushed?: false,
+    # Keep only the latest shape-visible change in memory until commit. This
+    # lets an empty/filtered commit fragment mark the real final row `last=true`
+    # without buffering the transaction or manufacturing a public no-op row.
+    pending_changes: [],
+    # The final shape-visible row is intentionally held back, so the storage
+    # cursor can lag behind the last fragment we accepted. Track source
+    # progress independently to keep duplicate non-commit fragments
+    # idempotent while a transaction is still open.
+    last_fragment_offset: nil,
     storage_duration: 0,
     num_changes: 0,
     total_bytes: 0
@@ -25,6 +36,8 @@ defmodule Electric.Shapes.Consumer.PendingTxn do
   @type t :: %__MODULE__{
           xid: pos_integer(),
           consider_flushed?: boolean(),
+          pending_changes: [Changes.change()],
+          last_fragment_offset: Electric.Replication.LogOffset.t() | nil,
           num_changes: non_neg_integer(),
           total_bytes: non_neg_integer()
         }

@@ -98,6 +98,15 @@ defmodule Electric.Shapes.Consumer.EventHandler.Subqueries.Buffering do
     |> maybe_splice()
   end
 
+  def handle_event(%__MODULE__{} = state, {:deferred_root_post_snapshot, xid}) do
+    state
+    |> Map.put(
+      :active_move,
+      ActiveMove.record_post_snapshot_root!(state.active_move, xid)
+    )
+    |> maybe_splice()
+  end
+
   def handle_event(
         %__MODULE__{} = state,
         {:query_move_in_complete, snapshot_name, row_count, row_bytes, move_in_lsn}

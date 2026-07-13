@@ -7,13 +7,13 @@ on:
     paths:
       - .github/workflows/sapien-sync-service.yml
       - packages/electric-telemetry/**
+      - packages/elixir-client/**
       - packages/sync-service/**
       - scripts/ci/test-sapien-sync-service.sh
   workflow_dispatch:
 
 permissions:
   contents: read
-  packages: write
 
 env:
   IMAGE: ghcr.io/ai-sapien/electric
@@ -23,6 +23,8 @@ jobs:
     name: Test Sapien sync-service changes
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      ERL_FLAGS: "+S 4:4"
     steps:
       - uses: actions/checkout@v4
 
@@ -48,6 +50,11 @@ jobs:
     needs: test
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
@@ -90,9 +97,18 @@ jobs:
           push: true
           provenance: mode=max
           sbom: true
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
           tags: ${{ steps.image.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Attest published image
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
       - name: Summarize immutable image
         run: echo "${IMAGE}@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"

@@ -168,5 +168,30 @@ defmodule Electric.ConfigTest do
 
       assert Keyword.fetch!(config[:tweaks], :consumer_gc_heap_threshold) == nil
     end
+
+    test "subquery replay and causal safety overrides are threaded into tweaks", ctx do
+      overrides = [
+        materializer_replay_memory_limit_bytes: 1_001,
+        materializer_replay_max_pending: 102,
+        materializer_replay_idle_timeout_ms: 1_003,
+        materializer_live_max_subscribers: 104,
+        materializer_live_backlog_memory_limit_bytes: 1_005,
+        materializer_causal_call_timeout_ms: 1_006,
+        causal_drain_max_concurrency: 107,
+        causal_drain_timeout_ms: 1_008,
+        subquery_buffer_max_transactions: 109,
+        subquery_deferred_event_memory_limit_bytes: 1_010
+      ]
+
+      config =
+        Electric.Application.configuration(
+          Keyword.merge(
+            Keyword.take(ctx.initial_config, [:replication_connection_opts]),
+            overrides
+          )
+        )
+
+      assert Keyword.take(config[:tweaks], Keyword.keys(overrides)) == overrides
+    end
   end
 end

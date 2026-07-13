@@ -63,10 +63,16 @@ defmodule Electric.Postgres.ReplicationClient.MessageConverterTest do
        }, _converter} = MessageConverter.convert(new_relation, converter)
     end
 
-    test "logs information when receiving a generic message", %{converter: converter} do
-      message = %LR.Message{prefix: "test", content: "hello world"}
-      log = capture_log(fn -> MessageConverter.convert(message, converter) end)
-      assert log =~ "Got a message from PG via logical replication"
+    test "ignores a generic message without logging its content", %{converter: converter} do
+      secret = "secret-canary-#{System.unique_integer([:positive])}"
+      message = %LR.Message{prefix: "test", content: secret}
+
+      log =
+        capture_log(fn ->
+          assert {:buffering, ^converter} = MessageConverter.convert(message, converter)
+        end)
+
+      refute log =~ secret
     end
 
     test "skips origin & type messages", %{converter: converter} do

@@ -55,7 +55,7 @@ defmodule Electric.ShapeCache.PureFileStorage.ChunkIndex do
           normal_n not in 0..max//1 ->
             :error
 
-          normal_n == max and has_incomplete_chunk? ->
+          normal_n == max and has_incomplete_chunk? and not only_complete? ->
             read_incomplete_chunk(path, normal_n)
 
           true ->
