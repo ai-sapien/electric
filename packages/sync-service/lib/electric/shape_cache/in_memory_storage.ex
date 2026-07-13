@@ -15,6 +15,7 @@ defmodule Electric.ShapeCache.InMemoryStorage do
   @snapshot_start_index 0
   @snapshot_end_index :end
   @pg_snapshot_key :pg_snapshot
+  @move_positions_key :move_positions
   @latest_offset_key :latest_offset
 
   defstruct [
@@ -128,6 +129,20 @@ defmodule Electric.ShapeCache.InMemoryStorage do
   end
 
   @impl Electric.ShapeCache.Storage
+  def set_move_positions!(move_positions, %MS{} = opts) do
+    :ets.insert(opts.snapshot_table, {@move_positions_key, move_positions})
+    :ok
+  end
+
+  @impl Electric.ShapeCache.Storage
+  def fetch_move_positions(%MS{} = opts) do
+    case :ets.lookup(opts.snapshot_table, @move_positions_key) do
+      [{@move_positions_key, move_positions}] -> {:ok, move_positions}
+      [] -> {:ok, %{}}
+    end
+  end
+
+  @impl Electric.ShapeCache.Storage
   def get_all_stored_shape_handles(_opts), do: {:ok, MapSet.new()}
 
   @impl Electric.ShapeCache.Storage
@@ -155,7 +170,7 @@ defmodule Electric.ShapeCache.InMemoryStorage do
   defp snapshot_end(),
     do: snapshot_chunk_end(storage_offset(LogOffset.last_before_real_offsets()))
 
-  defp get_offset_indexed_stream(offset, max_offset, offset_indexed_table) do
+  defp get_offset_indexed_stream(offset, max_offset, offset_indexed_table, project_item) do
     offset = storage_offset(offset)
     max_offset = storage_offset(max_offset)
 
@@ -168,9 +183,13 @@ defmodule Electric.ShapeCache.InMemoryStorage do
           nil
 
         {{:offset, position}, [{_, item}]} ->
-          {item, position}
+          {project_item.(LogOffset.new(position), item), position}
       end
     end)
+  end
+
+  defp get_offset_indexed_stream(offset, max_offset, offset_indexed_table) do
+    get_offset_indexed_stream(offset, max_offset, offset_indexed_table, fn _, item -> item end)
   end
 
   @snapshot_boundary_offset LogOffset.last_before_real_offsets()
@@ -186,6 +205,37 @@ defmodule Electric.ShapeCache.InMemoryStorage do
 
   def get_log_stream(offset, max_offset, %MS{} = opts) do
     get_offset_indexed_stream(offset, max_offset, opts.log_table)
+  end
+
+  @impl Electric.ShapeCache.Storage
+  def get_log_stream_with_offsets(offset, max_offset, %MS{} = opts)
+      when is_log_offset_lt(offset, @snapshot_boundary_offset) do
+    case :ets.lookup_element(opts.snapshot_table, snapshot_end(), 2, nil) do
+      nil ->
+        stream_from_snapshot_with_offsets(offset, max_offset, opts)
+
+      max when is_log_offset_lt(offset, max) ->
+        stream_from_snapshot_with_offsets(offset, max_offset, opts)
+
+      _ ->
+        get_offset_indexed_stream_with_offsets(offset, max_offset, opts.log_table)
+    end
+  end
+
+  def get_log_stream_with_offsets(offset, max_offset, %MS{} = opts) do
+    get_offset_indexed_stream_with_offsets(offset, max_offset, opts.log_table)
+  end
+
+  defp get_offset_indexed_stream_with_offsets(offset, max_offset, offset_indexed_table) do
+    get_offset_indexed_stream(offset, max_offset, offset_indexed_table, fn offset, item ->
+      {offset, item}
+    end)
+  end
+
+  defp stream_from_snapshot_with_offsets(offset, max_offset, opts) do
+    offset
+    |> stream_from_snapshot(max_offset, opts)
+    |> Stream.map(&{nil, &1})
   end
 
   defp stream_from_snapshot(offset, max_offset, %MS{} = opts) do

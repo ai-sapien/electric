@@ -103,11 +103,29 @@ defmodule Electric.Shapes.Consumer.Materializer do
     end)
   end
 
-  def subscribe(pid) when is_pid(pid), do: GenServer.call(pid, :subscribe, :infinity)
+  @doc """
+  Subscribe `pid` to this materializer's move events.
 
-  def subscribe(opts) when is_map(opts), do: GenServer.call(name(opts), :subscribe, :infinity)
+  `from_lsn` is the source LSN (LogOffset) up to which the subscribing outer
+  consumer has already applied moves from this dependency, or `nil` for a fresh
+  subscription. When `from_lsn` is behind the materializer's applied position,
+  the moves in `(from_lsn, applied_offset]` are replayed to `pid` so it can
+  catch up after a restart.
 
-  def subscribe(stack_id, shape_handle),
+  Returns `{:ok, seed_link_values, applied_offset}` where `seed_link_values` is
+  the set of link values as of `from_lsn` (used to seed the outer consumer's
+  dependency view so replayed moves are not redundancy-eliminated), and
+  `applied_offset` is the materializer's current applied source LSN.
+  """
+  def subscribe(pid, from_lsn \\ nil)
+
+  def subscribe(pid, from_lsn) when is_pid(pid),
+    do: GenServer.call(pid, {:subscribe, from_lsn}, :infinity)
+
+  def subscribe(opts, from_lsn) when is_map(opts),
+    do: GenServer.call(name(opts), {:subscribe, from_lsn}, :infinity)
+
+  def subscribe(stack_id, shape_handle) when is_stack_id(stack_id),
     do: subscribe(%{stack_id: stack_id, shape_handle: shape_handle})
 
   def start_link(opts) do
@@ -132,6 +150,10 @@ defmodule Electric.Shapes.Consumer.Materializer do
         value_counts: %{},
         pending_events: %{},
         offset: LogOffset.before_all(),
+        # The highest source LSN (LogOffset) up to which changes have been
+        # applied to `value_counts`. Used to tag emitted moves with their
+        # source LSN and to bound move replay on subscribe.
+        applied_offset: LogOffset.before_all(),
         subscribed_offset: nil,
         ref: nil,
         subscribers: MapSet.new()
@@ -172,6 +194,14 @@ defmodule Electric.Shapes.Consumer.Materializer do
 
   def handle_continue({:read_stream, storage}, state) do
     state = read_history_up_to_subscribed(state, storage)
+    # After the startup replay, everything up to `subscribed_offset` has been
+    # applied; seed `applied_offset` accordingly so live moves and replay are
+    # tagged/bounded from the right position.
+    state =
+      if is_nil(state.subscribed_offset),
+        do: state,
+        else: %{state | applied_offset: state.subscribed_offset}
+
     write_link_values(state)
     {:noreply, state}
   end
@@ -195,7 +225,7 @@ defmodule Electric.Shapes.Consumer.Materializer do
   changes after this offset will be delivered via new_changes messages
   from the Consumer.
   """
-  def read_history_up_to_subscribed(state, storage) do
+  def read_history_up_to_subscribed(state, storage, apply_fun \\ &default_history_apply/2) do
     cond do
       is_nil(state.subscribed_offset) ->
         state
@@ -205,7 +235,7 @@ defmodule Electric.Shapes.Consumer.Materializer do
 
       true ->
         stream = Storage.get_log_stream(state.offset, state.subscribed_offset, storage)
-        {state, _} = stream |> decode_json_stream() |> apply_changes(state)
+        state = apply_fun.(stream, state)
 
         # If the read just covered the main log (because either the
         # current offset is already past the snapshot or the next chunk
@@ -246,10 +276,201 @@ defmodule Electric.Shapes.Consumer.Materializer do
               %{state | offset: state.subscribed_offset}
 
             true ->
-              read_history_up_to_subscribed(%{state | offset: next_offset}, storage)
+              read_history_up_to_subscribed(%{state | offset: next_offset}, storage, apply_fun)
           end
         end
     end
+  end
+
+  # Default apply function for `read_history_up_to_subscribed/3`: apply the
+  # decoded stream to `value_counts`, discarding the emitted move events (the
+  # startup replay only needs the resulting state).
+  defp default_history_apply(stream, state) do
+    {state, _events} = stream |> decode_json_stream() |> apply_changes(state)
+    state
+  end
+
+  # Replay the moves in `(from_lsn, applied_offset]` to `pid`, returning the set
+  # of link values as of `from_lsn` (the seed view for the outer consumer).
+  #
+  # When `from_lsn` is nil (fresh subscription) or is already at/after the
+  # materializer's applied position, there is nothing to replay and the current
+  # link values are returned as the seed.
+  defp maybe_replay_moves(state, _pid, nil), do: link_values_from_counts(state.value_counts)
+
+  defp maybe_replay_moves(state, pid, from_lsn) do
+    if is_log_offset_lte(state.applied_offset, from_lsn) do
+      link_values_from_counts(state.value_counts)
+    else
+      replay_moves(state, pid, from_lsn)
+    end
+  end
+
+  defp replay_moves(state, pid, from_lsn) do
+    stack_storage = Storage.for_stack(state.stack_id)
+    storage = Storage.for_shape(state.shape_handle, stack_storage)
+
+    seed_state = replay_seed_at(state, from_lsn, storage)
+    seed = link_values_from_counts(seed_state.value_counts)
+
+    # Replay only the missing tail using storage's authoritative offsets.
+    # Move controls, snapshot-end controls, and spliced move-in rows do not
+    # encode Postgres offsets in their JSON, so JSON headers are not a safe
+    # replay cursor.
+    replay0 = %{
+      seed_state
+      | offset: from_lsn,
+        subscribed_offset: state.applied_offset,
+        pending_events: %{pid: pid}
+    }
+
+    Storage.get_log_stream_with_offsets(from_lsn, state.applied_offset, storage)
+    |> apply_replay_stream(replay0)
+
+    seed
+  end
+
+  # Reconstruct the exact dependency view at the persisted subscriber cursor.
+  # Initial snapshot entries have virtual chunk offsets rather than per-row
+  # offsets, so replay that section with the existing snapshot iterator. Read
+  # the main-log section separately through the strictly bounded offset-aware
+  # storage API; ordinary get_log_stream/3 reads whole storage chunks and may
+  # intentionally include entries past its requested max offset.
+  defp replay_seed_at(state, from_lsn, storage) do
+    snapshot_end = LogOffset.min(from_lsn, LogOffset.last_before_real_offsets())
+
+    seed0 = %{
+      state
+      | index: %{},
+        tag_indices: %{},
+        value_counts: %{},
+        offset: LogOffset.before_all(),
+        subscribed_offset: snapshot_end,
+        pending_events: %{}
+    }
+
+    seed_state = read_history_up_to_subscribed(seed0, storage)
+
+    if is_log_offset_lt(snapshot_end, from_lsn) do
+      {seed_state, _events} =
+        Storage.get_log_stream_with_offsets(snapshot_end, from_lsn, storage)
+        |> Stream.map(fn {_offset, item} -> item end)
+        |> decode_json_stream()
+        |> apply_changes(seed_state)
+
+      %{seed_state | offset: from_lsn, subscribed_offset: from_lsn}
+    else
+      seed_state
+    end
+  end
+
+  # Apply function used during move replay. The supplied stream is the missing
+  # tail `(from_lsn, applied_offset]`, paired with authoritative storage
+  # offsets. Group each transaction, apply it to the throwaway seed state, and
+  # emit its net moves at the persisted offset.
+  defp apply_replay_stream(stream, acc) do
+    %{pid: pid} = acc.pending_events
+    handle = acc.shape_handle
+
+    stream
+    |> decode_json_stream_with_offsets()
+    |> chunk_by_txn()
+    |> Enum.reduce(acc, fn {txn_offset, changes, txids}, acc ->
+      {acc, events} = apply_changes(changes, acc)
+
+      events =
+        case events do
+          empty when empty == %{} -> %{}
+          events -> Map.put(events, :txids, MapSet.new(txids))
+        end
+        |> cancel_matching_move_events()
+
+      if events != %{} do
+        payload =
+          events
+          |> finalize_txids()
+          |> Map.put(:lsn, txn_offset)
+
+        send(pid, {:materializer_changes, handle, payload})
+      end
+
+      acc
+    end)
+  end
+
+  # Decode a raw JSON log stream into `{log_offset, txids, change}` tuples,
+  # preserving the authoritative per-item storage offset so replay can delimit
+  # transactions and tag emitted moves.
+  defp decode_json_stream_with_offsets(stream) do
+    stream
+    |> Stream.map(fn {offset, item} -> {offset, Jason.decode!(item)} end)
+    |> Stream.filter(fn {_offset, decoded} ->
+      Map.has_key?(decoded, "key") || Map.has_key?(decoded["headers"], "event")
+    end)
+    |> Stream.map(fn {offset, decoded} ->
+      headers = decoded["headers"]
+      {offset, decode_txids(headers), decode_change(decoded)}
+    end)
+  end
+
+  defp decode_txids(%{"txids" => txids}) when is_list(txids), do: txids
+  defp decode_txids(_headers), do: []
+
+  defp decode_change(%{
+         "key" => key,
+         "value" => value,
+         "headers" => %{"operation" => operation} = headers
+       }) do
+    case operation do
+      "insert" ->
+        %Changes.NewRecord{
+          key: key,
+          record: value,
+          move_tags: Map.get(headers, "tags", []),
+          active_conditions: Map.get(headers, "active_conditions", [])
+        }
+
+      "update" ->
+        %Changes.UpdatedRecord{
+          key: key,
+          record: value,
+          move_tags: Map.get(headers, "tags", []),
+          removed_move_tags: Map.get(headers, "removed_tags", []),
+          active_conditions: Map.get(headers, "active_conditions", [])
+        }
+
+      "delete" ->
+        %Changes.DeletedRecord{
+          key: key,
+          old_record: value,
+          move_tags: Map.get(headers, "tags", []),
+          active_conditions: Map.get(headers, "active_conditions", [])
+        }
+    end
+  end
+
+  defp decode_change(%{"headers" => %{"event" => event, "patterns" => patterns} = headers})
+       when event in ["move-out", "move-in"] do
+    patterns =
+      Enum.map(patterns, fn %{"pos" => pos, "value" => value} ->
+        %{pos: pos, value: value}
+      end)
+
+    %{headers: %{event: event, patterns: patterns, txids: Map.get(headers, "txids", [])}}
+  end
+
+  # Group consecutive decoded items into per-transaction batches. Items sharing a
+  # `tx_offset` belong to the same source transaction; each batch is tagged with
+  # the batch's last (largest) offset as its source LSN.
+  defp chunk_by_txn(items) do
+    items
+    |> Stream.chunk_by(fn {offset, _txids, _change} -> offset.tx_offset end)
+    |> Stream.map(fn batch ->
+      {offset, _, _} = List.last(batch)
+      changes = Enum.map(batch, fn {_o, _t, change} -> change end)
+      txids = batch |> Enum.flat_map(fn {_o, t, _c} -> t end) |> Enum.uniq()
+      {offset, changes, txids}
+    end)
   end
 
   def handle_call(:get_link_values, _from, %{value_counts: value_counts} = state) do
@@ -260,9 +481,27 @@ defmodule Electric.Shapes.Consumer.Materializer do
     {:reply, :ok, state}
   end
 
+  def handle_call(
+        {:new_changes, {_range_start, range_end}, _xid, _commit?},
+        _from,
+        %{applied_offset: applied_offset} = state
+      )
+      when is_log_offset_lte(range_end, applied_offset) do
+    # This range has already been applied — either during the startup history
+    # replay (`read_history_up_to_subscribed`) or a previous `new_changes` call.
+    # This happens on restart when the persistent replication slot re-delivers
+    # already-persisted transactions. Re-applying them would raise
+    # "Key already exists" in `apply_changes/2`, so skip the range entirely.
+    {:reply, :ok, state}
+  end
+
   def handle_call({:new_changes, {range_start, range_end}, xid, commit?}, _from, state) do
     stack_storage = Storage.for_stack(state.stack_id)
     storage = Storage.for_shape(state.shape_handle, stack_storage)
+
+    # Track the source LSN of this batch so emitted moves can be tagged with it
+    # (used by outer consumers to dedup/replay moves across a restart).
+    state = %{state | applied_offset: range_end}
 
     state =
       Storage.get_log_stream(range_start, range_end, storage)
@@ -282,10 +521,18 @@ defmodule Electric.Shapes.Consumer.Materializer do
     {:reply, :ok, state}
   end
 
-  def handle_call(:subscribe, {pid, _ref} = _from, state) do
+  def handle_call({:subscribe, from_lsn}, {pid, _ref} = _from, state) do
     Process.monitor(pid)
 
-    {:reply, :ok, %{state | subscribers: MapSet.put(state.subscribers, pid)}}
+    # Register the subscriber *before* replaying so that any live move flushed
+    # after this call is delivered to `pid` and interleaves correctly after the
+    # replayed tail (replay covers up to `applied_offset`; live moves are
+    # strictly beyond it).
+    state = %{state | subscribers: MapSet.put(state.subscribers, pid)}
+
+    seed_link_values = maybe_replay_moves(state, pid, from_lsn)
+
+    {:reply, {:ok, seed_link_values, state.applied_offset}, state}
   end
 
   # if the supervisor is going down then this process will also be taken down
@@ -465,7 +712,10 @@ defmodule Electric.Shapes.Consumer.Materializer do
       cancel_matching_move_events(state.pending_events)
 
     if events != %{} do
-      events = finalize_txids(events)
+      events =
+        events
+        |> finalize_txids()
+        |> Map.put(:lsn, state.applied_offset)
 
       for pid <- state.subscribers do
         send(pid, {:materializer_changes, state.shape_handle, events})
