@@ -87,15 +87,19 @@ defmodule Electric.Shapes.Consumer.Snapshotter do
                 end
               rescue
                 error ->
-                  GenServer.cast(
+                  report_snapshot_failure(
                     consumer,
-                    {:snapshot_failed, shape_handle, SnapshotError.from_error(error)}
+                    shape_handle,
+                    SnapshotError.from_error(error),
+                    Exception.format(:error, error, __STACKTRACE__)
                   )
               catch
-                :exit, {:timeout, {GenServer, :call, _}} ->
-                  GenServer.cast(
+                :exit, {:timeout, {GenServer, :call, _}} = reason ->
+                  report_snapshot_failure(
                     consumer,
-                    {:snapshot_failed, shape_handle, SnapshotError.table_lock_timeout()}
+                    shape_handle,
+                    SnapshotError.table_lock_timeout(),
+                    Exception.format(:exit, reason, __STACKTRACE__)
                   )
               end
             end
@@ -112,6 +116,15 @@ defmodule Electric.Shapes.Consumer.Snapshotter do
       end
 
     result
+  end
+
+  defp report_snapshot_failure(consumer, shape_handle, snapshot_error, formatted_error) do
+    Logger.error(
+      "Snapshot creation failed for #{shape_handle}: #{formatted_error}",
+      snapshot_error_type: snapshot_error.type
+    )
+
+    GenServer.cast(consumer, {:snapshot_failed, shape_handle, snapshot_error})
   end
 
   @doc false

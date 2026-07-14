@@ -577,6 +577,28 @@ defmodule Electric.ShapeCacheTest do
       assert {:error, %Electric.SnapshotError{type: :slow_snapshot_query}} =
                ShapeCache.await_snapshot_start(shape_handle, stack_id)
     end
+
+    test "logs the original error when initial snapshot creation fails", %{
+      shape: shape,
+      stack_id: stack_id
+    } do
+      Electric.StackConfig.put(stack_id, :create_snapshot_fn, fn _, _, _, _, _ ->
+        raise "diagnostic snapshot failure"
+      end)
+
+      {shape_handle, log} =
+        with_log(fn ->
+          {shape_handle, _} = ShapeCache.get_or_create_shape_handle(shape, stack_id)
+
+          assert {:error, %Electric.SnapshotError{type: :unknown}} =
+                   ShapeCache.await_snapshot_start(shape_handle, stack_id)
+
+          shape_handle
+        end)
+
+      assert log =~ "Snapshot creation failed for #{shape_handle}"
+      assert log =~ "** (RuntimeError) diagnostic snapshot failure"
+    end
   end
 
   describe "list_shapes/1" do
