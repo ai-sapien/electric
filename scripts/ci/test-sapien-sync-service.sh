@@ -32,9 +32,8 @@ cd "${sync_service_dir}"
 
 mix deps.get
 ./scripts/apply-bandit-http1-max-requests-close.sh
-mix deps.compile bandit --force
-
 mix compile --warnings-as-errors
+mix deps.compile bandit --force
 
 mix format --check-formatted \
   config/runtime.exs \
