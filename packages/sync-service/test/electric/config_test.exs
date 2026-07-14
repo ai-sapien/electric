@@ -51,6 +51,29 @@ defmodule Electric.ConfigTest do
       Electric.Application.api_server()
     end
 
+    @tag skip: System.get_env("SAPIEN_BANDIT_HTTP1_CLOSE_PATCH") != "true"
+    test "api server advertises the configured final HTTP/1 response" do
+      [{Bandit, bandit_opts}] =
+        Electric.Application.api_server(Bandit,
+          service_port: 0,
+          tweaks: [conn_max_requests: 1]
+        )
+
+      {:ok, server_pid} = start_supervised({Bandit, bandit_opts})
+      {:ok, {_ip, port}} = ThousandIsland.listener_info(server_pid)
+      {:ok, socket} = :gen_tcp.connect(~c"localhost", port, [:binary, active: false])
+      on_exit(fn -> :gen_tcp.close(socket) end)
+
+      :ok =
+        :gen_tcp.send(
+          socket,
+          "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+
+      response = receive_until_closed(socket)
+      assert response =~ "\r\nconnection: close\r\n"
+    end
+
     test "configuration/1", ctx do
       Electric.Application.configuration(
         Keyword.take(ctx.initial_config, [:replication_connection_opts])
@@ -200,6 +223,13 @@ defmodule Electric.ConfigTest do
           storage: {Electric.ShapeCache.FileStorage, storage_dir: "./persistent"}
         )
       end
+    end
+  end
+
+  defp receive_until_closed(socket, buffer \\ "") do
+    case :gen_tcp.recv(socket, 0, 1_000) do
+      {:ok, bytes} -> receive_until_closed(socket, buffer <> bytes)
+      {:error, :closed} -> buffer
     end
   end
 

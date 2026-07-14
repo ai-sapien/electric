@@ -10,7 +10,7 @@ FROM ${BUILDER_IMAGE} AS builder
 LABEL maintainer="info@electric-sql.com"
 
 RUN apt-get update -y && \
-  apt-get install -y build-essential git curl && \
+  apt-get install -y build-essential git curl patch && \
   apt-get clean && \
   rm -f /var/lib/apt/lists/*_*
 
@@ -18,13 +18,19 @@ RUN mix local.hex --force && mix local.rebar --force
 
 ARG MIX_ENV=prod
 ARG MIX_TARGET
+ARG SAPIEN_BANDIT_HTTP1_CLOSE_PATCH=false
 
 WORKDIR /builder/electric
 
 COPY --from=electric-telemetry / /builder/electric-telemetry
 
 COPY mix.* /builder/electric/
-RUN mix deps.get
+COPY patches/bandit-http1-max-requests-close.patch /builder/electric/patches/
+COPY scripts/apply-bandit-http1-max-requests-close.sh /builder/electric/scripts/
+RUN mix deps.get && \
+  if [ "${SAPIEN_BANDIT_HTTP1_CLOSE_PATCH}" = "true" ]; then \
+    ./scripts/apply-bandit-http1-max-requests-close.sh; \
+  fi
 RUN MIX_OS_DEPS_COMPILE_PARTITION_COUNT=4 mix deps.compile
 
 # These are ordered by change frequency, with the least frequently changing dir first.
@@ -82,4 +88,3 @@ HEALTHCHECK --start-period=10s CMD curl --fail http://localhost:${ELECTRIC_PORT-
 ENTRYPOINT ["/app/bin/entrypoint"]
 
 CMD ["start"]
-

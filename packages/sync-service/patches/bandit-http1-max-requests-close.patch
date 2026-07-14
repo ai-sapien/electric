@@ -1,0 +1,35 @@
+diff --git a/lib/bandit/http1/handler.ex b/lib/bandit/http1/handler.ex
+index 8b053eb..961e99b 100644
+--- a/lib/bandit/http1/handler.ex
++++ b/lib/bandit/http1/handler.ex
+@@ -9 +9,7 @@ defmodule Bandit.HTTP1.Handler do
+-    transport = %Bandit.HTTP1.Socket{socket: socket, buffer: data, opts: state.opts}
++    transport = %Bandit.HTTP1.Socket{
++      socket: socket,
++      buffer: data,
++      opts: state.opts,
++      close_after_response: request_limit_reached?(state)
++    }
++
+@@ -43,0 +50,6 @@ defmodule Bandit.HTTP1.Handler do
++  defp request_limit_reached?(state) do
++    requests_processed = Map.get(state, :requests_processed, 0) + 1
++    request_limit = Keyword.get(state.opts.http_1, :max_requests, 0)
++    request_limit != 0 && requests_processed >= request_limit
++  end
++
+diff --git a/lib/bandit/http1/socket.ex b/lib/bandit/http1/socket.ex
+index 27565b6..ae6b48d 100644
+--- a/lib/bandit/http1/socket.ex
++++ b/lib/bandit/http1/socket.ex
+@@ -19,0 +20 @@ defmodule Bandit.HTTP1.Socket do
++            close_after_response: false,
+@@ -39,0 +41 @@ defmodule Bandit.HTTP1.Socket do
++          close_after_response: boolean(),
+@@ -430,0 +433,6 @@ defmodule Bandit.HTTP1.Socket do
++        socket.close_after_response ->
++          headers =
++            [{"connection", "close"} | Enum.reject(headers, &(elem(&1, 0) == "connection"))]
++
++          {headers, %{socket | keepalive: false}}
++

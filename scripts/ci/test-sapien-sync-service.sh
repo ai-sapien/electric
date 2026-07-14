@@ -7,6 +7,7 @@ sync_service_dir="${repo_root}/packages/sync-service"
 elixir_client_dir="${repo_root}/packages/elixir-client"
 
 export MIX_ENV=test
+export SAPIEN_BANDIT_HTTP1_CLOSE_PATCH=true
 
 (
   cd "${elixir_client_dir}"
@@ -30,6 +31,8 @@ export MIX_ENV=test
 cd "${sync_service_dir}"
 
 mix deps.get
+./scripts/apply-bandit-http1-max-requests-close.sh
+mix deps.compile bandit --force
 
 mix compile --warnings-as-errors
 

@@ -93,6 +93,7 @@ jobs:
             electric-telemetry=packages/electric-telemetry
           build-args: |
             ELECTRIC_VERSION=${{ steps.image.outputs.version }}
+            SAPIEN_BANDIT_HTTP1_CLOSE_PATCH=true
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: mode=max
