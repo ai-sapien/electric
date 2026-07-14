@@ -1669,6 +1669,170 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
 
       assert Materializer.get_link_values(ctx) == MapSet.new()
     end
+
+    @tag snapshot_data: [
+           %Changes.NewRecord{
+             record: %{"id" => "1", "value" => "10"},
+             move_tags: ["nested-tag"],
+             active_conditions: [true]
+           }
+         ]
+    test "storage-range move controls retain their persisted txids", ctx do
+      ctx = with_materializer(ctx)
+
+      {{range_start, range_end}, writer} =
+        append_move_control(ctx.writer, "move-out", "nested-tag", [42])
+
+      writer = Storage.hibernate(writer)
+      Materializer.new_changes(ctx, {range_start, range_end}, xid: 41)
+
+      assert_receive {:materializer_changes, _,
+                      %{move_out: [{10, "10"}], txids: [41, 42], lsn: ^range_end}}
+
+      move_in_item =
+        Jason.encode!(%{
+          key: ~s|"public"."test_table"/"1"|,
+          value: %{id: "1", value: "10"},
+          headers: %{
+            operation: "insert",
+            tags: ["nested-tag"],
+            active_conditions: [true]
+          }
+        })
+
+      Storage.write_move_in_snapshot!(
+        [[~s|"public"."test_table"/"1"|, ["nested-tag"], move_in_item]],
+        "txid-move-in",
+        ctx.shape_storage
+      )
+
+      {{^range_end, move_in_control_end}, writer} =
+        append_move_control(writer, "move-in", "nested-tag", [43])
+
+      {{^move_in_control_end, move_in_end}, writer} =
+        Storage.append_move_in_snapshot_to_log!("txid-move-in", writer)
+
+      writer = Storage.hibernate(writer)
+      Materializer.new_changes(ctx, {range_end, move_in_end})
+
+      assert_receive {:materializer_changes, _,
+                      %{move_in: [{10, "10"}], txids: [43], lsn: ^move_in_end}}
+
+      {{^move_in_end, no_op_end}, writer} =
+        append_move_control(writer, "move-out", "unmatched-tag", [44])
+
+      _writer = Storage.hibernate(writer)
+      Materializer.new_changes(ctx, {move_in_end, no_op_end}, xid: 45)
+
+      assert_receive {:materializer_changes, _,
+                      %{move_in: [], move_out: [], txids: [], lsn: ^no_op_end}}
+    end
+
+    test "storage-range rows retain their persisted txids without a notification xid", ctx do
+      ctx = with_materializer(ctx)
+      row_offset = LogOffset.new(100, 0)
+
+      writer =
+        Storage.append_to_log!(
+          main_log_insert_with_txids(row_offset, "1", "10", [46]),
+          ctx.writer
+        )
+
+      _writer = Storage.hibernate(writer)
+
+      Materializer.new_changes(
+        ctx,
+        {LogOffset.last_before_real_offsets(), row_offset}
+      )
+
+      assert_receive {:materializer_changes, _,
+                      %{move_in: [{10, "10"}], txids: [46], lsn: ^row_offset}}
+    end
+
+    @tag snapshot_data: [
+           %Changes.NewRecord{
+             record: %{"id" => "1", "value" => "10"},
+             move_tags: ["nested-tag"],
+             active_conditions: [true]
+           }
+         ]
+    test "storage ranges union persisted row and move-control txids", ctx do
+      ctx = with_materializer(ctx)
+      range_start = LogOffset.last_before_real_offsets()
+      first_row_offset = LogOffset.new(100, 0)
+
+      writer =
+        Storage.append_to_log!(
+          main_log_insert_with_txids(first_row_offset, "2", "20", [46]),
+          ctx.writer
+        )
+
+      {{^first_row_offset, control_offset}, writer} =
+        append_move_control(writer, "move-out", "nested-tag", [47])
+
+      final_row_offset = LogOffset.increment(control_offset)
+
+      writer =
+        Storage.append_to_log!(
+          main_log_insert_with_txids(final_row_offset, "3", "30", [48]),
+          writer
+        )
+
+      _writer = Storage.hibernate(writer)
+      Materializer.new_changes(ctx, {range_start, final_row_offset})
+
+      assert_receive {:materializer_changes, _, payload}
+      assert payload.txids == [46, 47, 48]
+      assert payload.lsn == final_row_offset
+      assert Enum.sort(payload.move_in) == [{20, "20"}, {30, "30"}]
+      assert payload.move_out == [{10, "10"}]
+    end
+
+    @tag snapshot_data: [
+           %Changes.NewRecord{record: %{"id" => "1", "value" => "10"}}
+         ]
+    test "storage-range row txids are discarded when the row produces no move", ctx do
+      ctx = with_materializer(ctx)
+      row_offset = LogOffset.new(100, 0)
+
+      writer =
+        Storage.append_to_log!(
+          main_log_no_op_update_with_txids(row_offset, "1", [49]),
+          ctx.writer
+        )
+
+      _writer = Storage.hibernate(writer)
+
+      Materializer.new_changes(
+        ctx,
+        {LogOffset.last_before_real_offsets(), row_offset}
+      )
+
+      assert_receive {:materializer_changes, _, payload}
+
+      assert payload == %{
+               move_in: [],
+               move_out: [],
+               txids: [],
+               lsn: row_offset
+             }
+    end
+
+    test "storage-range move controls reject malformed txid containers", ctx do
+      assert_invalid_persisted_move_txids(ctx, 42)
+    end
+
+    test "storage-range move controls reject non-positive txids", ctx do
+      assert_invalid_persisted_move_txids(ctx, [0])
+    end
+
+    test "storage-range rows reject malformed txid containers", ctx do
+      assert_invalid_persisted_row_txids(ctx, 42)
+    end
+
+    test "storage-range rows reject non-positive txids", ctx do
+      assert_invalid_persisted_row_txids(ctx, [0])
+    end
   end
 
   describe "DNF: multiple tags per row with active_conditions" do
@@ -1945,6 +2109,10 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
   # encoded the same way the source consumer would write it (headers carry the
   # `lsn`/`op_position` used to reconstruct the offset during replay).
   defp main_log_insert(offset, id, value, last? \\ true) do
+    main_log_insert_with_txids(offset, id, value, [1], last?)
+  end
+
+  defp main_log_insert_with_txids(offset, id, value, txids, last? \\ true) do
     change =
       %Changes.NewRecord{
         relation: {"public", "test_table"},
@@ -1959,13 +2127,85 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
     change
     |> then(&LogItems.from_change(&1, 1, ["id"], :default))
     |> Enum.map(fn {item_offset, item} ->
+      item = put_in(item, [:headers, :txids], txids)
       {item_offset, change.key, :insert, Jason.encode!(item)}
+    end)
+  end
+
+  defp main_log_no_op_update_with_txids(offset, id, txids) do
+    change = %Changes.UpdatedRecord{
+      relation: {"public", "test_table"},
+      key: ~s|"public"."test_table"/"#{id}"|,
+      record: %{"id" => id},
+      log_offset: offset,
+      last?: true
+    }
+
+    change
+    |> then(&LogItems.from_change(&1, 1, ["id"], :default))
+    |> Enum.map(fn {item_offset, item} ->
+      item = put_in(item, [:headers, :txids], txids)
+      {item_offset, change.key, :update, Jason.encode!(item)}
     end)
   end
 
   defp main_log_control(offset) do
     json = Jason.encode!(%{headers: %{control: "up_to_date", last: true}})
     [{offset, 0, "", ?c, 0, byte_size(json), json}]
+  end
+
+  defp append_move_control(writer, event, pattern_value, txids) do
+    Storage.append_control_message!(
+      Jason.encode!(%{
+        headers: %{
+          event: event,
+          patterns: [%{pos: 0, value: pattern_value}],
+          txids: txids,
+          last: true
+        }
+      }),
+      writer
+    )
+  end
+
+  defp assert_invalid_persisted_move_txids(ctx, txids) do
+    ctx = with_materializer(ctx)
+    materializer = Materializer.whereis(ctx)
+    Process.unlink(materializer)
+    materializer_ref = Process.monitor(materializer)
+
+    {{range_start, range_end}, writer} =
+      append_move_control(ctx.writer, "move-out", "nested-tag", txids)
+
+    _writer = Storage.hibernate(writer)
+
+    assert catch_exit(Materializer.new_changes(ctx, {range_start, range_end}))
+    assert_receive {:DOWN, ^materializer_ref, :process, ^materializer, _reason}
+  end
+
+  defp assert_invalid_persisted_row_txids(ctx, txids) do
+    ctx = with_materializer(ctx)
+    materializer = Materializer.whereis(ctx)
+    Process.unlink(materializer)
+    materializer_ref = Process.monitor(materializer)
+    row_offset = LogOffset.new(100, 0)
+
+    writer =
+      Storage.append_to_log!(
+        main_log_insert_with_txids(row_offset, "1", "10", txids),
+        ctx.writer
+      )
+
+    _writer = Storage.hibernate(writer)
+
+    assert catch_exit(
+             Materializer.new_changes(
+               ctx,
+               {LogOffset.last_before_real_offsets(), row_offset}
+             )
+           )
+
+    assert_receive {:DOWN, ^materializer_ref, :process, ^materializer, _reason}
   end
 
   defp main_log_delete(offset, id, value) do

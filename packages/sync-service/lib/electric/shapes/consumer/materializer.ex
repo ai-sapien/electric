@@ -669,8 +669,20 @@ defmodule Electric.Shapes.Consumer.Materializer do
     |> Stream.map(fn {_offset, item} -> item end)
   end
 
-  defp decode_txids(%{"txids" => txids}) when is_list(txids), do: txids
+  defp decode_txids(%{"txids" => txids}), do: validate_txids!(txids)
   defp decode_txids(_headers), do: []
+
+  defp validate_txids!(txids) when is_list(txids) do
+    if Enum.all?(txids, &(is_integer(&1) and &1 > 0)) do
+      txids
+    else
+      raise ArgumentError, "persisted txids must be a list of positive integers"
+    end
+  end
+
+  defp validate_txids!(_txids) do
+    raise ArgumentError, "persisted txids must be a list of positive integers"
+  end
 
   defp decode_change(%{
          "key" => key,
@@ -705,14 +717,14 @@ defmodule Electric.Shapes.Consumer.Materializer do
     end
   end
 
-  defp decode_change(%{"headers" => %{"event" => event, "patterns" => patterns} = headers})
+  defp decode_change(%{"headers" => %{"event" => event, "patterns" => patterns}})
        when event in ["move-out", "move-in"] do
     patterns =
       Enum.map(patterns, fn %{"pos" => pos, "value" => value} ->
         %{pos: pos, value: value}
       end)
 
-    %{headers: %{event: event, patterns: patterns, txids: Map.get(headers, "txids", [])}}
+    %{headers: %{event: event, patterns: patterns}}
   end
 
   defp pull_next_replay_payload(
@@ -949,7 +961,7 @@ defmodule Electric.Shapes.Consumer.Materializer do
 
     state =
       exact_history_stream(range_start, range_end, storage)
-      |> decode_json_stream()
+      |> decode_json_stream_with_txids()
       |> apply_and_accumulate_events(xid, state)
       |> maybe_flush_pending_events(commit?, defer_until_durable?, causal_token)
 
@@ -2151,58 +2163,23 @@ defmodule Electric.Shapes.Consumer.Materializer do
 
   defp decode_json_stream(stream) do
     stream
+    |> decode_json_items()
+    |> Stream.map(&decode_change/1)
+  end
+
+  defp decode_json_stream_with_txids(stream) do
+    stream
+    |> decode_json_items()
+    |> Stream.map(fn %{"headers" => headers} = decoded ->
+      {decode_change(decoded), decode_txids(headers)}
+    end)
+  end
+
+  defp decode_json_items(stream) do
+    stream
     |> Stream.map(&Jason.decode!/1)
     |> Stream.filter(fn decoded ->
       Map.has_key?(decoded, "key") || Map.has_key?(decoded["headers"], "event")
-    end)
-    |> Stream.map(fn
-      %{
-        "key" => key,
-        "value" => value,
-        "headers" => %{"operation" => operation} = headers
-      } ->
-        case operation do
-          "insert" ->
-            %Changes.NewRecord{
-              key: key,
-              record: value,
-              move_tags: Map.get(headers, "tags", []),
-              active_conditions: Map.get(headers, "active_conditions", [])
-            }
-
-          "update" ->
-            %Changes.UpdatedRecord{
-              key: key,
-              record: value,
-              move_tags: Map.get(headers, "tags", []),
-              removed_move_tags: Map.get(headers, "removed_tags", []),
-              active_conditions: Map.get(headers, "active_conditions", [])
-            }
-
-          "delete" ->
-            %Changes.DeletedRecord{
-              key: key,
-              old_record: value,
-              move_tags: Map.get(headers, "tags", []),
-              active_conditions: Map.get(headers, "active_conditions", [])
-            }
-        end
-
-      %{"headers" => %{"event" => "move-out", "patterns" => patterns} = headers} ->
-        patterns =
-          Enum.map(patterns, fn %{"pos" => pos, "value" => value} ->
-            %{pos: pos, value: value}
-          end)
-
-        %{headers: %{event: "move-out", patterns: patterns, txids: Map.get(headers, "txids", [])}}
-
-      %{"headers" => %{"event" => "move-in", "patterns" => patterns} = headers} ->
-        patterns =
-          Enum.map(patterns, fn %{"pos" => pos, "value" => value} ->
-            %{pos: pos, value: value}
-          end)
-
-        %{headers: %{event: "move-in", patterns: patterns, txids: Map.get(headers, "txids", [])}}
     end)
   end
 
@@ -2236,13 +2213,15 @@ defmodule Electric.Shapes.Consumer.Materializer do
   end
 
   defp apply_and_accumulate_events(changes, xid, state) do
-    Enum.reduce(changes, state, fn change, state ->
-      change_bytes = :erlang.external_size(change)
+    Enum.reduce(changes, state, fn persisted_change, state ->
+      change_bytes = :erlang.external_size(persisted_change)
       ensure_pending_transaction_capacity!(state, change_bytes, 0, :changes)
       attempted_change_bytes = state.pending_change_bytes + change_bytes
+      {change, persisted_txids} = split_persisted_txids(persisted_change)
+      persisted_txids = MapSet.new(persisted_txids)
 
       {state, events} = apply_changes([change], state)
-      events = with_txids(events, xid)
+      events = with_txids(events, xid, persisted_txids)
       event_bytes = :erlang.external_size(events)
       state = %{state | pending_change_bytes: attempted_change_bytes}
 
@@ -2283,10 +2262,26 @@ defmodule Electric.Shapes.Consumer.Materializer do
             "(#{kind}=#{attempted_bytes}/#{state.live_backlog_memory_limit_bytes})"
   end
 
-  defp with_txids(events, _xid) when events == %{}, do: events
+  defp split_persisted_txids({change, txids}), do: {change, txids}
 
-  defp with_txids(events, xid) do
-    Map.put(events, :txids, xid_set(xid))
+  defp split_persisted_txids(%{headers: %{txids: txids}} = change),
+    do: {change, validate_txids!(txids)}
+
+  defp split_persisted_txids(change), do: {change, []}
+
+  defp with_txids(events, xid, persisted_txids) when events == %{} do
+    if MapSet.size(persisted_txids) == 0 do
+      events
+    else
+      # A move-in control precedes the rows from its snapshot. Keep its txids in
+      # the pending batch so those rows inherit the attribution; finalization
+      # still drops this txid-only map when the whole batch produces no moves.
+      %{txids: MapSet.union(xid_set(xid), persisted_txids)}
+    end
+  end
+
+  defp with_txids(events, xid, persisted_txids) do
+    Map.put(events, :txids, MapSet.union(xid_set(xid), persisted_txids))
   end
 
   defp xid_set(nil), do: MapSet.new()

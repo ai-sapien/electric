@@ -22,6 +22,11 @@ Dependency logs now keep uncompacted history, and storage compaction is part of
 shape identity so a compacted shape cannot be reused as a replay dependency.
 The persistent shape-cache version is now 11; caches written with the previous
 identity are discarded and rebuilt instead of restoring incompatible history.
+Generated-shape storage-range handoffs also retain the transaction ids already
+persisted on rows and move controls, including move-in controls whose snapshot
+rows are appended later in the same logical batch. Persisted transaction
+metadata is validated and unioned with any live notification xid instead of
+being replaced by an empty generated-move xid.
 
 Startup now emits an exact transactional logical marker immediately before
 replication begins and publishes external readiness only after that marker's
