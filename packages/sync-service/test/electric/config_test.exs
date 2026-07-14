@@ -57,6 +57,78 @@ defmodule Electric.ConfigTest do
       )
     end
 
+    test "preserves short default replication identifiers", ctx do
+      replication_stream_id = "short_stream"
+
+      config =
+        Electric.Application.configuration(
+          Keyword.merge(
+            Keyword.take(ctx.initial_config, [:replication_connection_opts]),
+            replication_stream_id: replication_stream_id
+          )
+        )
+
+      assert config[:replication_opts][:publication_name] ==
+               "electric_publication_#{replication_stream_id}"
+
+      assert config[:replication_opts][:slot_name] == "electric_slot_#{replication_stream_id}"
+    end
+
+    test "deterministically bounds overlong default replication identifiers", ctx do
+      replication_stream_id = "stream_" <> String.duplicate("é", 30)
+
+      opts =
+        Keyword.merge(
+          Keyword.take(ctx.initial_config, [:replication_connection_opts]),
+          replication_stream_id: replication_stream_id
+        )
+
+      first = Electric.Application.configuration(opts)
+      second = Electric.Application.configuration(opts)
+
+      for key <- [:publication_name, :slot_name] do
+        identifier = first[:replication_opts][key]
+
+        assert byte_size(identifier) <= 63
+        assert String.valid?(identifier)
+        assert identifier =~ ~r/_[0-9a-f]{16}$/
+        assert identifier == second[:replication_opts][key]
+      end
+    end
+
+    test "bounds the publication name from the failing replay run without changing its slot",
+         ctx do
+      replication_stream_id = "sapien_replay_frontier_small_ordering_5c46_02"
+
+      config =
+        Electric.Application.configuration(
+          Keyword.merge(
+            Keyword.take(ctx.initial_config, [:replication_connection_opts]),
+            replication_stream_id: replication_stream_id
+          )
+        )
+
+      publication_name = config[:replication_opts][:publication_name]
+
+      assert byte_size(publication_name) == 63
+      assert publication_name =~ ~r/^electric_publication_sapien_replay_frontier/
+      assert publication_name =~ ~r/_[0-9a-f]{16}$/
+      assert config[:replication_opts][:slot_name] == "electric_slot_#{replication_stream_id}"
+    end
+
+    test "rejects explicit replication identifiers over PostgreSQL's byte limit", ctx do
+      base_opts = Keyword.take(ctx.initial_config, [:replication_connection_opts])
+      overlong = String.duplicate("é", 32)
+
+      assert_raise ArgumentError, ~r/publication_name.*63 bytes/, fn ->
+        Electric.Application.configuration(Keyword.put(base_opts, :publication_name, overlong))
+      end
+
+      assert_raise ArgumentError, ~r/slot_name.*63 bytes/, fn ->
+        Electric.Application.configuration(Keyword.put(base_opts, :slot_name, overlong))
+      end
+    end
+
     test "configuration/1 exposes the curated stack metrics to Prometheus", ctx do
       config =
         Electric.Application.configuration(

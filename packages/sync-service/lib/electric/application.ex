@@ -2,6 +2,8 @@ defmodule Electric.Application do
   use Application
   require Logger
 
+  alias Electric.Postgres.Identifiers
+
   @impl true
   def start(_type, _args) do
     supervisor_opts = [strategy: :one_for_one, name: Electric.Supervisor]
@@ -98,7 +100,11 @@ defmodule Electric.Application do
     replication_stream_id = get_env(opts, :replication_stream_id)
 
     publication_name =
-      Keyword.get(opts, :publication_name, "electric_publication_#{replication_stream_id}")
+      configured_replication_identifier(
+        opts,
+        :publication_name,
+        "electric_publication_#{replication_stream_id}"
+      )
 
     slot_temporary? = get_env(opts, :replication_slot_temporary?)
     slot_temporary_random_name? = get_env(opts, :replication_slot_temporary_random_name?)
@@ -113,7 +119,11 @@ defmodule Electric.Application do
 
         name
       else
-        Keyword.get(opts, :slot_name, "electric_slot_#{replication_stream_id}")
+        configured_replication_identifier(
+          opts,
+          :slot_name,
+          "electric_slot_#{replication_stream_id}"
+        )
       end
 
     replication_connection_opts = get_env!(opts, :replication_connection_opts)
@@ -183,6 +193,22 @@ defmodule Electric.Application do
         cache_size: get_env(opts, :shape_db_cache_size)
       ]
     )
+  end
+
+  defp configured_replication_identifier(opts, key, default) do
+    case Keyword.fetch(opts, key) do
+      {:ok, identifier} when is_binary(identifier) ->
+        case Identifiers.validate_length(identifier) do
+          :ok -> identifier
+          {:error, reason} -> raise ArgumentError, "Invalid #{key}: #{reason}"
+        end
+
+      {:ok, identifier} ->
+        raise ArgumentError, "Invalid #{key}: expected a string, got: #{inspect(identifier)}"
+
+      :error ->
+        Identifiers.shorten(default)
+    end
   end
 
   # Gets the API-side configuration based on the same opts + application config
