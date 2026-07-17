@@ -74,6 +74,49 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
     assert Materializer.wait_until_ready(ctx) == :ok
   end
 
+  # Regression for the 2026-07-17 incident (SAP-8006): a restart replayed a
+  # shape cache whose persisted history contained a duplicate insert for one
+  # key. apply_changes/2 raised "Key ... already exists" mid-replay and the
+  # materializer died with an opaque RuntimeError. Corrupt persisted history
+  # must instead stop the materializer with an attributable :corrupt_replay
+  # reason (still abnormal, so the owning consumer purges the shape and
+  # clients refetch a fresh snapshot).
+  @tag snapshot_data: [
+         %Changes.NewRecord{record: %{"id" => "1", "value" => "10"}},
+         %Changes.NewRecord{record: %{"id" => "1", "value" => "10"}}
+       ]
+  test "corrupt persisted history stops replay with an attributable reason",
+       %{storage: storage, stack_id: stack_id, shape_handle: shape_handle} do
+    Process.flag(:trap_exit, true)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        {:ok, pid} =
+          Materializer.start_link(%{
+            stack_id: stack_id,
+            shape_handle: shape_handle,
+            storage: storage,
+            columns: ["value"],
+            materialized_type: {:array, :int8}
+          })
+
+        ref = Process.monitor(pid)
+
+        respond_to_call(:await_snapshot_start, :started)
+
+        respond_to_call(
+          :subscribe_materializer,
+          {:ok, LogOffset.last_before_real_offsets()}
+        )
+
+        assert_receive {:DOWN, ^ref, :process, ^pid, {:corrupt_replay, message}}, 5000
+        assert message =~ "already exists"
+      end)
+
+    assert log =~ "materializer_corrupt_replay"
+    assert log =~ shape_handle
+  end
+
   test "subscribe waits for a materializer that is still initializing" do
     materializer =
       spawn(fn ->

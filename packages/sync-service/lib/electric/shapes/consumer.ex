@@ -306,7 +306,7 @@ defmodule Electric.Shapes.Consumer do
         %State{pending_global_last_seen_lsn: lsn} = state
       )
       when is_integer(lsn) do
-    if root_replication_pending?(state) do
+    if root_replication_pending?(state) or not is_nil(state.pending_initialization) do
       {:noreply, state, next_after_move(state)}
     else
       state = %{state | pending_global_last_seen_lsn: nil}
@@ -627,7 +627,11 @@ defmodule Electric.Shapes.Consumer do
       | last_observed_global_lsn: max(state.last_observed_global_lsn, lsn)
     }
 
-    if root_replication_pending?(state) do
+    # The registry broadcast can reach this consumer before initialization has
+    # built the event handler; applying then crashes the consumer mid-startup
+    # (the 2026-07-17 recreate-storm, SAP-8006), so the LSN is stashed and
+    # drained by :process_pending_global_lsn once initialization completes.
+    if root_replication_pending?(state) or not is_nil(state.pending_initialization) do
       pending_lsn = max(state.pending_global_last_seen_lsn || 0, lsn)
       state = %{state | pending_global_last_seen_lsn: pending_lsn}
       {:noreply, state, next_after_move(state)}
@@ -2502,7 +2506,8 @@ defmodule Electric.Shapes.Consumer do
          %State{
            pending_global_last_seen_lsn: lsn,
            deferred_replication_event_count: 0,
-           pending_txn: nil
+           pending_txn: nil,
+           pending_initialization: nil
          },
          _fallback
        )
@@ -2842,6 +2847,18 @@ defmodule Electric.Shapes.Consumer do
     end
   end
 
+  # Belt-and-braces for any event path not deferred during initialization: a
+  # nil handler must invalidate this one shape through the standard cleanup,
+  # never crash the consumer with {:badmap, nil} (SAP-8006).
+  defp apply_event(%State{event_handler: nil}, event) do
+    {:error, {:event_before_initialization, event_tag(event)}}
+  end
+
+  defp event_tag(event) when is_tuple(event), do: elem(event, 0)
+  defp event_tag(%struct{}), do: struct
+  defp event_tag(event) when is_atom(event), do: event
+  defp event_tag(_event), do: :unknown
+
   defp apply_event(state, event) do
     case EventHandler.handle_event(state.event_handler, event) do
       {:error, reason} ->
@@ -3156,6 +3173,16 @@ defmodule Electric.Shapes.Consumer do
 
   defp handle_event_error(state, {:truncate, xid}) do
     handle_txn_with_truncate(xid, state)
+  end
+
+  defp handle_event_error(state, {:event_before_initialization, event_tag}) do
+    Logger.error(
+      "event_before_initialization: consumer received #{inspect(event_tag)} " <>
+        "before its event handler was built - terminating shape",
+      shape_handle: state.shape_handle
+    )
+
+    mark_for_removal(state)
   end
 
   defp handle_event_error(state, :unsupported_subquery) do

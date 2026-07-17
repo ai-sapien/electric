@@ -456,6 +456,20 @@ defmodule Electric.Shapes.Consumer.Materializer do
 
     write_link_values(state)
     {:noreply, state}
+  rescue
+    # Corrupt persisted history (e.g. a duplicate insert left behind by a hard
+    # crash) must cost exactly this shape: stop with an attributable reason so
+    # the owning consumer's materializer-down handling purges the shape and
+    # clients refetch a fresh snapshot, instead of dying as an opaque
+    # RuntimeError mid-replay (2026-07-17 incident, SAP-8006).
+    error ->
+      Logger.error(
+        "materializer_corrupt_replay shape_handle=#{state.shape_handle}: " <>
+          "persisted history failed to replay, invalidating shape: " <>
+          Exception.message(error)
+      )
+
+      {:stop, {:corrupt_replay, Exception.message(error)}, state}
   end
 
   @doc """
