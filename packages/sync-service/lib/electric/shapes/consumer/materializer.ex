@@ -469,7 +469,15 @@ defmodule Electric.Shapes.Consumer.Materializer do
           Exception.message(error)
       )
 
-      {:stop, {:corrupt_replay, Exception.message(error)}, state}
+      reason = {:corrupt_replay, Exception.message(error)}
+
+      Electric.StatusMonitor.report_materializer_failure(
+        state.stack_id,
+        state.shape_handle,
+        reason
+      )
+
+      {:stop, reason, state}
   end
 
   @doc """

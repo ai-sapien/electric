@@ -17,8 +17,9 @@ defmodule Electric.Plug.HealthCheckPlug do
     {status_code, status_text} =
       case StatusMonitor.service_status(config[:stack_id]) do
         :active -> {200, "active"}
-        :waiting -> {202, "waiting"}
-        :starting -> {202, "starting"}
+        :waiting -> {503, "waiting"}
+        :starting -> {503, "starting"}
+        :unhealthy -> {503, "unhealthy"}
         # when Electric is in the scaled-down mode (all database connections are closed),
         # report its status as active because for any incoming shape request it will
         # transparently restore the connection subsystem before processing the request

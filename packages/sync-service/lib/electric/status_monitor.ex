@@ -6,7 +6,7 @@ defmodule Electric.StatusMonitor do
 
   @type status() :: %{
           conn: :waiting_on_lock | :starting | :up | :sleeping,
-          shape: :starting | :read_only | :up
+          shape: :starting | :read_only | :up | :degraded
         }
 
   @conditions [
@@ -20,7 +20,13 @@ defmodule Electric.StatusMonitor do
     :shape_metadata_ready
   ]
 
-  @default_results for condition <- @conditions, into: %{}, do: {condition, {false, %{}}}
+  @materializer_health_key :materializer_health
+  @materializer_failure_threshold 3
+  @materializer_failure_window_ms :timer.seconds(60)
+
+  @default_results @conditions
+                   |> Map.new(&{&1, {false, %{}}})
+                   |> Map.put(@materializer_health_key, {true, %{}})
 
   @db_state_key :db_state
   @spin_prevention_delay 10
@@ -36,7 +42,13 @@ defmodule Electric.StatusMonitor do
 
     :ets.new(ets_table(stack_id), [:named_table, :protected, read_concurrency: true])
 
-    {:ok, %{stack_id: stack_id, waiters: MapSet.new()}}
+    {:ok,
+     %{
+       stack_id: stack_id,
+       waiters: MapSet.new(),
+       materializer_failures: [],
+       materializer_health_degraded?: false
+     }}
   end
 
   @doc """
@@ -46,10 +58,12 @@ defmodule Electric.StatusMonitor do
   - `:waiting` — waiting on advisory lock, shape metadata loaded (can serve existing shapes read-only)
   - `:starting` — system is initializing (metadata not yet loaded or connection progressing)
   - `:sleeping` — connections scaled down
+  - `:unhealthy` — the shape pipeline crossed a latched failure threshold
   """
-  @spec service_status(String.t()) :: :active | :waiting | :starting | :sleeping
+  @spec service_status(String.t()) :: :active | :waiting | :starting | :sleeping | :unhealthy
   def service_status(stack_id) do
     case status(stack_id) do
+      %{shape: :degraded} -> :unhealthy
       %{conn: :up, shape: :up} -> :active
       %{conn: :waiting_on_lock, shape: :read_only} -> :waiting
       %{conn: :sleeping} -> :sleeping
@@ -85,6 +99,8 @@ defmodule Electric.StatusMonitor do
        do: :up
 
   defp conn_status_from_results(_), do: :starting
+
+  defp shape_status_from_results(%{@materializer_health_key => {false, _}}), do: :degraded
 
   defp shape_status_from_results(%{
          shape_metadata_ready: {true, _},
@@ -135,6 +151,21 @@ defmodule Electric.StatusMonitor do
 
   def mark_integrety_checks_passed(stack_id, connection_manager_pid) do
     mark_condition_met(stack_id, :integrety_checks_passed, connection_manager_pid)
+  end
+
+  @doc false
+  @spec report_materializer_failure(String.t(), String.t(), term(), integer()) :: :ok
+  def report_materializer_failure(
+        stack_id,
+        shape_handle,
+        reason,
+        observed_at_ms \\ System.monotonic_time(:millisecond)
+      )
+      when is_binary(stack_id) and is_binary(shape_handle) and is_integer(observed_at_ms) do
+    GenServer.cast(
+      name(stack_id),
+      {:materializer_failure, shape_handle, reason, observed_at_ms}
+    )
   end
 
   def mark_pg_lock_as_errored(stack_id, message) when is_binary(message) do
@@ -293,6 +324,60 @@ defmodule Electric.StatusMonitor do
     {:noreply, maybe_reply_to_waiters(state)}
   end
 
+  def handle_cast(
+        {:materializer_failure, _shape_handle, _reason, _observed_at_ms},
+        %{materializer_health_degraded?: true} = state
+      ) do
+    {:noreply, state}
+  end
+
+  def handle_cast(
+        {:materializer_failure, shape_handle, reason, observed_at_ms},
+        state
+      ) do
+    cutoff = observed_at_ms - @materializer_failure_window_ms
+
+    recent_failures =
+      [observed_at_ms | Enum.filter(state.materializer_failures, &(&1 >= cutoff))]
+      |> Enum.take(@materializer_failure_threshold)
+
+    if length(recent_failures) >= @materializer_failure_threshold do
+      # Keep this failure latched until the stack restarts. A repeated corrupt
+      # replay means the persisted cache is not trustworthy; briefly recovering
+      # after purging one shape must not make the pod ready again before the
+      # controller has had a chance to replace its storage.
+      message =
+        "Materializer crash storm detected: " <>
+          "#{@materializer_failure_threshold} failures within " <>
+          "#{@materializer_failure_window_ms}ms"
+
+      :ets.insert(
+        ets_table(state.stack_id),
+        {@materializer_health_key,
+         {false,
+          %{
+            error: message,
+            failure_count: length(recent_failures),
+            window_ms: @materializer_failure_window_ms
+          }}}
+      )
+
+      Logger.error(message,
+        shape_handle: shape_handle,
+        last_failure: inspect(reason, limit: 20, printable_limit: 200)
+      )
+
+      {:noreply,
+       %{
+         state
+         | materializer_failures: recent_failures,
+           materializer_health_degraded?: true
+       }}
+    else
+      {:noreply, %{state | materializer_failures: recent_failures}}
+    end
+  end
+
   def handle_cast({:condition_errored, condition, error}, state) do
     :ets.insert(ets_table(state.stack_id), {condition, {false, %{error: error}}})
     {:noreply, state}
@@ -399,6 +484,9 @@ defmodule Electric.StatusMonitor do
 
   def timeout_message(stack_id) do
     case stack_id |> ets_table() |> results() do
+      %{@materializer_health_key => {false, details}} ->
+        "Timeout waiting for materializer health" <> format_details(details)
+
       %{timeout_message: message} when is_binary(message) ->
         message
 

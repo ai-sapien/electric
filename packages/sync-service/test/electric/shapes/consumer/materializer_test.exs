@@ -2,6 +2,7 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
   use ExUnit.Case, async: true
   import ExUnit.CaptureLog
   import Support.ComponentSetup
+  import Support.TestUtils, only: [set_status_to_active: 1, wait_until: 1]
   use Repatch.ExUnit
 
   alias Electric.Shapes.Shape
@@ -12,6 +13,7 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
   alias Electric.Replication.LogOffset
   alias Electric.Shapes.Consumer.Materializer
   alias Electric.Shapes.Consumer.Materializer.ReplayCoordinator
+  alias Electric.StatusMonitor
 
   @moduletag :tmp_dir
 
@@ -88,6 +90,13 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
   test "corrupt persisted history stops replay with an attributable reason",
        %{storage: storage, stack_id: stack_id, shape_handle: shape_handle} do
     Process.flag(:trap_exit, true)
+    start_link_supervised!({StatusMonitor, stack_id: stack_id})
+    set_status_to_active(%{stack_id: stack_id})
+
+    now = System.monotonic_time(:millisecond)
+    StatusMonitor.report_materializer_failure(stack_id, "earlier-shape-1", :boom, now - 2)
+    StatusMonitor.report_materializer_failure(stack_id, "earlier-shape-2", :boom, now - 1)
+    StatusMonitor.wait_for_messages_to_be_processed(stack_id)
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
@@ -111,6 +120,7 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
 
         assert_receive {:DOWN, ^ref, :process, ^pid, {:corrupt_replay, message}}, 5000
         assert message =~ "already exists"
+        assert wait_until(fn -> StatusMonitor.service_status(stack_id) == :unhealthy end)
       end)
 
     assert log =~ "materializer_corrupt_replay"
