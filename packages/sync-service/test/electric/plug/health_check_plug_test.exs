@@ -38,43 +38,53 @@ defmodule Electric.Plug.HealthCheckPlugTest do
     end
 
     @tag connection_status: %{conn: :waiting_on_lock, shape: :starting}
-    test "returns 202 starting when waiting on lock but shapes not loaded", ctx do
+    test "returns 503 starting when waiting on lock but shapes not loaded", ctx do
       conn =
         conn(ctx)
         |> HealthCheckPlug.call([])
 
-      assert conn.status == 202
+      assert conn.status == 503
       assert Jason.decode!(conn.resp_body) == %{"status" => "starting"}
     end
 
     @tag connection_status: %{conn: :waiting_on_lock, shape: :read_only}
-    test "returns 202 waiting when waiting on lock with shapes loaded", ctx do
+    test "returns 503 waiting when waiting on lock with shapes loaded", ctx do
       conn =
         conn(ctx)
         |> HealthCheckPlug.call([])
 
-      assert conn.status == 202
+      assert conn.status == 503
       assert Jason.decode!(conn.resp_body) == %{"status" => "waiting"}
     end
 
     @tag connection_status: %{conn: :starting, shape: :starting}
-    test "returns 202 when conn is starting", ctx do
+    test "returns 503 when conn is starting", ctx do
       conn =
         conn(ctx)
         |> HealthCheckPlug.call([])
 
-      assert conn.status == 202
+      assert conn.status == 503
       assert Jason.decode!(conn.resp_body) == %{"status" => "starting"}
     end
 
     @tag connection_status: %{conn: :up, shape: :starting}
-    test "returns 202 when shape is starting", ctx do
+    test "returns 503 when shape is starting", ctx do
       conn =
         conn(ctx)
         |> HealthCheckPlug.call([])
 
-      assert conn.status == 202
+      assert conn.status == 503
       assert Jason.decode!(conn.resp_body) == %{"status" => "starting"}
+    end
+
+    @tag connection_status: %{conn: :up, shape: :degraded}
+    test "returns 503 when materializer failures degrade the shape pipeline", ctx do
+      conn =
+        conn(ctx)
+        |> HealthCheckPlug.call([])
+
+      assert conn.status == 503
+      assert Jason.decode!(conn.resp_body) == %{"status" => "unhealthy"}
     end
 
     @tag connection_status: %{conn: :up, shape: :up}

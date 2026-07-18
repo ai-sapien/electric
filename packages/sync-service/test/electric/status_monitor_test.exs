@@ -207,6 +207,41 @@ defmodule Electric.StatusMonitorTest do
       StatusMonitor.wait_for_messages_to_be_processed(stack_id)
       assert StatusMonitor.status(stack_id) == %{conn: :up, shape: :up}
     end
+
+    test "a burst of materializer failures latches shape health degraded", %{
+      stack_id: stack_id
+    } do
+      start_link_supervised!({StatusMonitor, stack_id: stack_id})
+      set_status_to_active(%{stack_id: stack_id})
+
+      StatusMonitor.report_materializer_failure(stack_id, "shape-1", :boom, 1_000)
+      StatusMonitor.report_materializer_failure(stack_id, "shape-2", :boom, 1_001)
+      StatusMonitor.wait_for_messages_to_be_processed(stack_id)
+
+      assert StatusMonitor.status(stack_id) == %{conn: :up, shape: :up}
+
+      StatusMonitor.report_materializer_failure(stack_id, "shape-3", :boom, 1_002)
+      StatusMonitor.wait_for_messages_to_be_processed(stack_id)
+
+      assert StatusMonitor.status(stack_id) == %{conn: :up, shape: :degraded}
+      assert StatusMonitor.service_status(stack_id) == :unhealthy
+      assert StatusMonitor.timeout_message(stack_id) =~ "Materializer crash storm"
+    end
+
+    test "sporadic materializer failures outside the detection window do not accumulate", %{
+      stack_id: stack_id
+    } do
+      start_link_supervised!({StatusMonitor, stack_id: stack_id})
+      set_status_to_active(%{stack_id: stack_id})
+
+      StatusMonitor.report_materializer_failure(stack_id, "shape-1", :boom, 1)
+      StatusMonitor.report_materializer_failure(stack_id, "shape-2", :boom, 60_002)
+      StatusMonitor.report_materializer_failure(stack_id, "shape-3", :boom, 120_003)
+      StatusMonitor.wait_for_messages_to_be_processed(stack_id)
+
+      assert StatusMonitor.status(stack_id) == %{conn: :up, shape: :up}
+      assert StatusMonitor.service_status(stack_id) == :active
+    end
   end
 
   describe "wait_until_active/2" do
