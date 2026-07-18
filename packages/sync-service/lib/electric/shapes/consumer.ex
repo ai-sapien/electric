@@ -2854,11 +2854,6 @@ defmodule Electric.Shapes.Consumer do
     {:error, {:event_before_initialization, event_tag(event)}}
   end
 
-  defp event_tag(event) when is_tuple(event), do: elem(event, 0)
-  defp event_tag(%struct{}), do: struct
-  defp event_tag(event) when is_atom(event), do: event
-  defp event_tag(_event), do: :unknown
-
   defp apply_event(state, event) do
     case EventHandler.handle_event(state.event_handler, event) do
       {:error, reason} ->
@@ -2876,6 +2871,11 @@ defmodule Electric.Shapes.Consumer do
         {final_state, notification, result.num_changes, result.total_size}
     end
   end
+
+  defp event_tag(event) when is_tuple(event), do: elem(event, 0)
+  defp event_tag(%struct{}), do: struct
+  defp event_tag(event) when is_atom(event), do: event
+  defp event_tag(_event), do: :unknown
 
   defp apply_global_lsn(state, lsn) do
     state = %{
