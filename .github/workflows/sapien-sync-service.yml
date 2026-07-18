@@ -9,8 +9,15 @@ on:
       - packages/electric-telemetry/**
       - packages/elixir-client/**
       - packages/sync-service/**
+      - scripts/ci/derive-sapien-image-metadata.sh
       - scripts/ci/test-sapien-sync-service.sh
+      - scripts/ci/test-sapien-image-metadata.sh
   workflow_dispatch:
+    inputs:
+      candidate:
+        description: Candidate identifier; must be pr-<number>
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -24,14 +31,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      ERL_FLAGS: "+S 4:4"
+      ERL_FLAGS: '+S 4:4'
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test image metadata safety
+        run: scripts/ci/test-sapien-image-metadata.sh
+
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.20.2"
-          otp-version: "29.0.2"
+          elixir-version: '1.20.2'
+          otp-version: '29.0.2'
 
       - name: Start Postgres test services
         working-directory: packages/sync-service/dev
@@ -73,15 +83,13 @@ jobs:
       - name: Derive image tags
         id: image
         shell: bash
-        run: |
-          short_sha="${GITHUB_SHA:0:12}"
-          echo "version=1.7.7-sapien.${short_sha}" >> "$GITHUB_OUTPUT"
-          {
-            echo "tags<<EOF"
-            echo "${IMAGE}:sapien-${short_sha}"
-            echo "${IMAGE}:sapien-latest"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+        env:
+          CANDIDATE: ${{ inputs.candidate || '' }}
+        run: >-
+          scripts/ci/derive-sapien-image-metadata.sh
+          "$GITHUB_EVENT_NAME"
+          "$GITHUB_SHA"
+          "$CANDIDATE"
 
       - name: Build and publish image
         id: build
