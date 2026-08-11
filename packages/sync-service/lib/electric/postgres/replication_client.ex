@@ -995,6 +995,11 @@ defmodule Electric.Postgres.ReplicationClient do
          deadline,
          timeout_ms
        ) do
+    Logger.notice(
+      "Starting causal consumer drain for WAL target #{Lsn.from_integer(target)} " <>
+        "with timeout #{timeout_ms}ms"
+    )
+
     token =
       case ConsumerRegistry.activate_causal_drain(stack_id, target) do
         {:ok, token} -> token
@@ -1020,6 +1025,12 @@ defmodule Electric.Postgres.ReplicationClient do
         {^result_ref, result} ->
           Process.demonitor(worker_ref, [:flush])
           Process.demonitor(owner_ref, [:flush])
+
+          Logger.notice(
+            "Causal consumer drain finished for WAL target #{Lsn.from_integer(target)}: " <>
+              inspect(result)
+          )
+
           result
 
         {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
@@ -1033,6 +1044,12 @@ defmodule Electric.Postgres.ReplicationClient do
         remaining ->
           terminate_causal_frontier_worker(worker_pid, worker_ref)
           Process.demonitor(owner_ref, [:flush])
+
+          Logger.error(
+            "Causal consumer drain timed out for WAL target #{Lsn.from_integer(target)} " <>
+              "after #{timeout_ms}ms"
+          )
+
           {:error, {:causal_frontier_timeout, stack_id, target, timeout_ms}}
       end
     after
@@ -1056,6 +1073,10 @@ defmodule Electric.Postgres.ReplicationClient do
   # restore during the first pass. Raw registry entries are intentional: a
   # dead/stale consumer must be removed or replaced, never mistaken for drained.
   defp await_consumer_causal_frontier(stack_id, target, token) do
+    await_consumer_causal_frontier(stack_id, target, token, 0)
+  end
+
+  defp await_consumer_causal_frontier(stack_id, target, token, attempt) do
     generation = ConsumerRegistry.causal_generation(stack_id)
     snapshot = ConsumerRegistry.consumer_snapshot(stack_id)
 
@@ -1077,19 +1098,37 @@ defmodule Electric.Postgres.ReplicationClient do
 
     final_snapshot = ConsumerRegistry.consumer_snapshot(stack_id)
     final_generation = ConsumerRegistry.causal_generation(stack_id)
+    snapshot_stable? = final_snapshot == snapshot and final_generation == generation
+    drain_pending? = not all_drained? or not snapshot_stable?
 
-    if all_drained? and final_snapshot == snapshot and final_generation == generation do
+    if drain_pending? and (attempt == 0 or rem(attempt, 100) == 0) do
+      dead_handles =
+        for {shape_handle, consumer_pid} <- snapshot,
+            not Process.alive?(consumer_pid),
+            do: shape_handle
+
+      Logger.warning(
+        "Causal consumer drain is still blocked " <>
+          "(attempt=#{attempt}, target=#{Lsn.from_integer(target)}, " <>
+          "consumers=#{map_size(snapshot)}, all_drained=#{all_drained?}, " <>
+          "dead=#{length(dead_handles)}, generation=#{generation}, " <>
+          "final_generation=#{final_generation}, snapshot_stable=#{snapshot_stable?}, " <>
+          "dead_handles=#{inspect(Enum.take(dead_handles, 20))})"
+      )
+    end
+
+    if not drain_pending? do
       case ConsumerRegistry.close_causal_drain(stack_id, target, generation, token) do
         :ok ->
           :ok
 
         :retry ->
           Process.sleep(10)
-          await_consumer_causal_frontier(stack_id, target, token)
+          await_consumer_causal_frontier(stack_id, target, token, attempt + 1)
       end
     else
       Process.sleep(10)
-      await_consumer_causal_frontier(stack_id, target, token)
+      await_consumer_causal_frontier(stack_id, target, token, attempt + 1)
     end
   end
 

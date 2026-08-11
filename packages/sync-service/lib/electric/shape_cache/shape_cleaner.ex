@@ -113,8 +113,17 @@ defmodule Electric.ShapeCache.ShapeCleaner do
     Electric.Shapes.ConsumerRegistry.remove_consumer(shape_handle, stack_id)
   end
 
+  def handle_writer_termination(stack_id, shape_handle, :killed) do
+    Logger.warning(
+      "Consumer for shape #{shape_handle} in stack #{stack_id} was killed; " <>
+        "the shape and registry entry are being retained"
+    )
+
+    :ok
+  end
+
   def handle_writer_termination(_stack_id, _shape_handle, reason)
-      when reason in [:normal, :killed, :shutdown] or
+      when reason in [:normal, :shutdown] or
              (is_tuple(reason) and elem(reason, 0) == :shutdown) do
     :ok
   end

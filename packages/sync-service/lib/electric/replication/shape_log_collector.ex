@@ -701,6 +701,19 @@ defmodule Electric.Replication.ShapeLogCollector do
     # Remove shapes from FlushTracker that were already tracked in earlier
     # fragments but are now undeliverable. This prevents stuck flush when
     # a consumer processes fragment 1 but crashes on fragment 2.
+    if MapSet.size(undeliverable_set) > 0 do
+      tracked_undeliverable =
+        Enum.filter(undeliverable_set, &is_map_key(state.flush_tracker.last_flushed, &1))
+
+      Logger.warning(
+        "Shape delivery left undeliverable consumers " <>
+          "(affected=#{affected_shape_count}, undeliverable=#{MapSet.size(undeliverable_set)}, " <>
+          "tracked_by_flush_boundary=#{length(tracked_undeliverable)}, " <>
+          "handles=#{inspect(Enum.take(undeliverable_set, 20))}, " <>
+          "tracked_handles=#{inspect(Enum.take(tracked_undeliverable, 20))})"
+      )
+    end
+
     flush_tracker =
       Enum.reduce(undeliverable_set, state.flush_tracker, fn shape_handle, tracker ->
         FlushTracker.handle_shape_removed(tracker, shape_handle)
