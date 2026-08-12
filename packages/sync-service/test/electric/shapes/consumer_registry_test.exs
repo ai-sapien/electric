@@ -209,7 +209,7 @@ defmodule Electric.Shapes.ConsumerRegistryTest do
             "handle-ok" => {:txn, %{lsn: 1}}
           },
           ctx.registry_state
-      )
+        )
 
       assert_receive {:broadcast, "handle-ok", {:txn, %{lsn: 1}}}
       assert Map.keys(delivered) == ["handle-ok"]
