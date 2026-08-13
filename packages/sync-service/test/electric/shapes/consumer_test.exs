@@ -5610,6 +5610,14 @@ defmodule Electric.Shapes.ConsumerTest do
 
       :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
       shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+      snapshotter_name = Consumer.Snapshotter.name(ctx.stack_id, shape_handle)
+
+      # Snapshot start is reported before the asynchronous snapshot writer has
+      # persisted all files. This restore test needs a completed snapshot.
+      assert Support.TestUtils.wait_until(
+               fn -> is_nil(GenServer.whereis(snapshotter_name)) end,
+               @receive_timeout
+             )
 
       # The frontier proves how a subquery shape evaluated root transactions.
       # An ordinary shape has no dependency-local view that could change across
