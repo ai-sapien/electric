@@ -200,12 +200,7 @@ defmodule Electric.Shapes.Consumer do
       :ok
     end
   catch
-    :exit, _reason ->
-      # The stop call timed out or the consumer exited mid-call. A consumer that is
-      # still alive at this point is wedged and would keep pinning the stack's flush
-      # boundary, so escalate to a kill.
-      Process.exit(pid, :kill)
-      :ok
+    :exit, _reason -> :ok
   end
 
   def stop(stack_id, shape_handle, reason) do
@@ -953,19 +948,6 @@ defmodule Electric.Shapes.Consumer do
         else: state
 
     {:noreply, state, :hibernate}
-  end
-
-  # Stall challenge from the ShapeLogCollector: this shape's flush entry has made
-  # no progress past the grace period. Answer only while in a deliberate deferral
-  # phase — the touch re-arms the entry's grace period. Any other state stays
-  # silent: either flush progress is imminent anyway, or the stall check is right
-  # to invalidate this shape at its next pass.
-  def handle_info(:verify_flush_progress, state) do
-    if deferring_flush_notifications?(state) do
-      ShapeLogCollector.notify_flush_deferred(state.stack_id, state.shape_handle)
-    end
-
-    {:noreply, state, state.hibernate_after}
   end
 
   defp synchronous_materializer_reply({:noreply, state, timeout_or_continue}),
@@ -1830,13 +1812,9 @@ defmodule Electric.Shapes.Consumer do
     Electric.StackConfig.lookup(stack_id, :shape_enable_suspend?, true)
   end
 
-  # A suspending consumer must have flushed and notified everything it has written:
-  # an empty txn_offset_mapping and no deferred flush notification guarantee that the
-  # ShapeLogCollector holds no pending flush entry for this shape.
   defp consumer_can_suspend?(state) do
     is_snapshot_started(state) and not Shape.has_dependencies(state.shape) and
-      not state.materializer_subscribed? and is_nil(state.pending_txn) and
-      state.txn_offset_mapping == [] and is_nil(state.pending_flush_offset)
+      not state.materializer_subscribed? and is_nil(state.pending_txn)
   end
 
   defp schedule_suspend_timer(%{suspend_after: nil} = state), do: state
@@ -1850,16 +1828,6 @@ defmodule Electric.Shapes.Consumer do
     :erlang.cancel_timer(ref)
     %{state | suspend_timer: nil}
   end
-
-  # The two phases in which the consumer deliberately sits on delivered
-  # transactions without producing flush notifications: buffering ahead of PG
-  # snapshot info, and a subquery move-in waiting to be spliced. A deferral
-  # outlasting the stall grace period would read as a wedged writer, so these are
-  # the states in which a :verify_flush_progress challenge is answered.
-  defp deferring_flush_notifications?(%State{buffering?: true}), do: true
-
-  defp deferring_flush_notifications?(%State{event_handler: event_handler}),
-    do: is_struct(event_handler, EventHandler.Subqueries.Buffering)
 
   @impl GenServer
   def terminate(reason, state) do
@@ -3706,28 +3674,12 @@ defmodule Electric.Shapes.Consumer do
     Inspector.clean(table_oid, inspector)
   end
 
-  # Consumers must only ever stop with :normal/:shutdown or one of the two
-  # Electric-tagged shutdown reasons ({:shutdown, :cleanup} | {:shutdown, :suspend}) —
-  # anything else is classified as a crash by the ShapeLogCollector.
   defp handle_materializer_down(reason, state) do
     case {reason, state.terminating?} do
-      {_, true} ->
-        {:noreply, state}
-
-      # A dependency materializer exits with bare :shutdown after its source
-      # consumer suspends. Keep the nested shape data and restore the chain.
-      {:shutdown, false} ->
-        {:stop, ShapeCleaner.consumer_suspend_reason(), state}
-
-      # Sapien uses tagged shutdowns to suspend a nested dependency chain so it
-      # can be restored in order, rather than discarding every dependent shape.
-      {{:shutdown, _}, false} ->
-        {:stop, ShapeCleaner.consumer_suspend_reason(), state}
-
-      # Any other exit is a consumer failure; remove the shape rather than resume
-      # it from storage that may be behind the acknowledged WAL position.
-      _ ->
-        stop_and_clean(state)
+      {_, true} -> {:noreply, state}
+      {{:shutdown, _}, false} -> {:stop, ShapeCleaner.consumer_suspend_reason(), state}
+      {:shutdown, false} -> {:stop, ShapeCleaner.consumer_suspend_reason(), state}
+      _ -> stop_and_clean(state)
     end
   end
 
