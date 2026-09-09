@@ -122,6 +122,9 @@ mix format --check-formatted \
   test/test_helper.exs
 
 sync_test_files=(
+  test/electric/shapes/querying_test.exs
+  test/electric/shapes/dnf_plan_test.exs
+  test/integration/nullable_permission_update_test.exs
   test/electric/config_test.exs
   test/electric/connection/manager/pool_test.exs
   test/electric/connection/manager_test.exs
