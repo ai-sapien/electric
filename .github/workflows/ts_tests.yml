@@ -114,13 +114,6 @@ jobs:
       - name: Build Node dependencies, if any
         run: pnpm -r --filter "$(jq '.name' -r package.json)^..." build
 
-      - name: Authenticate the private Electric image pull
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Run Postgres, Electric and nginx for the subsequent test suite
         working-directory: packages/sync-service/dev
         run: |

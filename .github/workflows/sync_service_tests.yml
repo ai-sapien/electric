@@ -15,7 +15,6 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 jobs:
   build_and_test:
@@ -37,9 +36,6 @@ jobs:
     services:
       postgres:
         image: 'ghcr.io/${{ github.repository }}/postgres:${{ matrix.postgres_version }}-alpine-logical'
-        credentials: &ghcr_credentials
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
         env:
           POSTGRES_PASSWORD: password
         options: &postgres_health_check >-
@@ -152,7 +148,6 @@ jobs:
     services:
       postgres:
         image: 'ghcr.io/${{ github.repository }}/postgres:17-alpine-logical'
-        credentials: *ghcr_credentials
         env:
           POSTGRES_PASSWORD: password
         options: *postgres_health_check
@@ -189,7 +184,6 @@ jobs:
     services:
       postgres:
         image: 'ghcr.io/${{ github.repository }}/postgres:17-alpine-logical'
-        credentials: *ghcr_credentials
         env:
           POSTGRES_PASSWORD: password
         options: *postgres_health_check

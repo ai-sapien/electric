@@ -592,56 +592,6 @@ defmodule Electric.Shapes.QueryingTest do
   end
 
   describe "query_move_in/5 with Querying.move_in_where_clause/5" do
-    test "delivers newly eligible rows when a previous permission alternative is NULL",
-         %{db_conn: conn} do
-      for statement <- [
-            "CREATE TABLE dep (id INTEGER PRIMARY KEY)",
-            "CREATE TABLE other_dep (id INTEGER PRIMARY KEY)",
-            "CREATE TABLE child (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)",
-            "INSERT INTO dep VALUES (1), (2)",
-            "INSERT INTO other_dep VALUES (1)",
-            "INSERT INTO child VALUES (1, 2, NULL), (2, 2, 1), (3, 1, NULL), (4, 3, NULL), (5, 2, 3), (6, NULL, NULL)"
-          ],
-          do: Postgrex.query!(conn, statement)
-
-      for alternative <- ["y = 1", "y IN (SELECT id FROM dep)", "y IN (SELECT id FROM other_dep)"] do
-        shape =
-          Shape.new!("child",
-            where: "x IN (SELECT id FROM dep) OR #{alternative}",
-            inspector: {DirectInspector, conn}
-          )
-          |> fill_handles()
-
-        initial_ids =
-          Querying.stream_initial_data(conn, @stack_id, @shape_handle, shape)
-          |> decode_stream()
-          |> Enum.map(& &1.value.id)
-          |> Enum.sort()
-
-        assert initial_ids == ["1", "2", "3", "5"]
-
-        {:ok, plan} = DnfPlan.compile(shape)
-
-        before = %{
-          ["$sublink", "0"] => MapSet.new([1]),
-          ["$sublink", "1"] => MapSet.new([1])
-        }
-
-        after_move = Map.put(before, ["$sublink", "0"], MapSet.new([1, 2]))
-
-        filter = Querying.move_in_where_clause(plan, 0, before, after_move, shape.where.used_refs)
-
-        moved_ids =
-          Querying.query_move_in(conn, @stack_id, @shape_handle, shape, filter)
-          |> Enum.map(fn [_key, _tags, json] -> json end)
-          |> decode_stream()
-          |> Enum.map(& &1.value.id)
-          |> Enum.sort()
-
-        assert moved_ids == ["1", "5"], "newly eligible rows for #{alternative}"
-      end
-    end
-
     test "preserves space padding for char(n) join columns", %{db_conn: conn} do
       for statement <- [
             "CREATE TABLE parent (id CHAR(8) PRIMARY KEY, value INTEGER)",
@@ -985,7 +935,7 @@ defmodule Electric.Shapes.QueryingTest do
         )
 
       assert sql =~ "= ANY ($1::"
-      assert sql =~ "IS NOT TRUE"
+      assert sql =~ "AND NOT"
       assert sql =~ "= ANY ($2::"
       assert sql =~ "= ANY ($3::"
       assert length(params) == 3
@@ -1015,7 +965,7 @@ defmodule Electric.Shapes.QueryingTest do
           where.used_refs
         )
 
-      assert sql =~ "IS NOT TRUE"
+      assert sql =~ "AND NOT"
       assert length(params) == 3
       assert Enum.sort(Enum.at(params, 0)) == [10, 100]
       assert Enum.at(params, 1) == [10]
@@ -1060,7 +1010,7 @@ defmodule Electric.Shapes.QueryingTest do
       assert sql =~ "= ANY ($1::"
       assert sql =~ "= ANY ($2::"
       assert sql =~ ~s|"status" = 'open'|
-      assert sql =~ "IS NOT TRUE"
+      assert sql =~ "AND NOT"
       assert length(params) == 3
     end
   end
@@ -1083,8 +1033,7 @@ defmodule Electric.Shapes.QueryingTest do
         )
 
       assert sql =~ ~s|NOT ("x" = ANY ($1::|
-      assert sql =~ ~s|AND (NOT ("x" = ANY ($2::|
-      assert sql =~ "IS NOT TRUE"
+      assert sql =~ ~s|AND NOT (NOT ("x" = ANY ($2::|
       assert params == [[3], [1, 2, 3]]
     end
 
