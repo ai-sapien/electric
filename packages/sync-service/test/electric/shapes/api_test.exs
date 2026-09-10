@@ -1003,6 +1003,57 @@ defmodule Electric.Shapes.ApiTest do
       end
     end
 
+    test "does not skip an insert when a chunk boundary precedes log visibility", ctx do
+      visible = LogOffset.increment(@start_offset_50)
+      pending = LogOffset.increment(visible)
+
+      expect_shape_cache(
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _, _ ->
+          {@test_shape_handle, visible}
+        end,
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _, _ ->
+          {@test_shape_handle, pending}
+        end
+      )
+
+      patch_shape_cache(
+        has_shape?: fn @test_shape_handle, _ -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end
+      )
+
+      patch_storage(
+        for_shape: fn @test_shape_handle, _ -> @test_opts end,
+        get_chunk_end_log_offset: fn _, _ -> pending end
+      )
+
+      expect_storage(
+        get_log_stream: fn @start_offset_50, _, @test_opts ->
+          [Jason.encode!(%{headers: %{control: "move-in"}, offset: visible})]
+        end,
+        get_log_stream: fn offset, _, @test_opts ->
+          if LogOffset.compare(offset, pending) == :lt do
+            [Jason.encode!(%{key: "insert", headers: %{operation: "insert"}, offset: pending})]
+          else
+            []
+          end
+        end
+      )
+
+      params = %{table: "public.users", offset: "#{@start_offset_50}", handle: @test_shape_handle}
+      assert {:ok, request} = Api.validate(ctx.api, params)
+      response = Api.serve_shape_response(request)
+      assert [%{"headers" => %{"control" => "move-in"}} | _] = response_body(response)
+
+      assert {:ok, next_request} = Api.validate(ctx.api, %{params | offset: "#{response.offset}"})
+      next_response = Api.serve_shape_response(next_request)
+
+      assert [%{"key" => "insert", "headers" => %{"operation" => "insert"}} | _] =
+               response_body(next_response)
+
+      assert response.offset == visible
+      assert next_response.offset == pending
+    end
+
     test "returns correct global_last_seen_lsn on non-live responses during data race", ctx do
       next_offset = LogOffset.increment(@start_offset_50)
       next_offset_lsn = next_offset.tx_offset

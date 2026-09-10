@@ -15,6 +15,8 @@ upstream tree and reapplying the patches below.
 - Preserve typed publication failures when removing affected shapes.
 - Use `IS NOT TRUE` for the old predicate during move-in selection so NULL to
   authorized transitions are included.
+- Clamp response cursors to the visible log frontier so a newly published chunk
+  boundary cannot skip an insert that storage has not exposed yet.
 - Keep db_connection 2.10.2.
 - Build and attest AMD64 and ARM64 images with the actual package version.
 
