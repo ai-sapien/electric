@@ -382,6 +382,13 @@ defmodule Support.ComponentSetup do
   end
 
   def with_inspector(ctx) do
+    # Match the production sibling supervisor, which survives inspector restarts.
+    task_supervisor_name = EtsInspector.task_supervisor_name(ctx.stack_id)
+
+    if is_nil(GenServer.whereis(task_supervisor_name)) do
+      start_supervised!({Task.Supervisor, name: task_supervisor_name})
+    end
+
     server =
       start_supervised!(
         {EtsInspector,

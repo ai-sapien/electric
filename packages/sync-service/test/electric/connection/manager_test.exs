@@ -178,8 +178,8 @@ defmodule Electric.Connection.ConnectionManagerTest do
     test "reports status=starting once the exclusive connection lock is acquired", %{
       stack_id: stack_id
     } do
-      assert_receive {:stack_status, _, :waiting_for_connection_lock}
-      assert_receive {:stack_status, _, :connection_lock_acquired}
+      assert_receive {:stack_status, _, :waiting_for_connection_lock}, 2000
+      assert_receive {:stack_status, _, :connection_lock_acquired}, 2000
       StatusMonitor.wait_for_messages_to_be_processed(stack_id)
       assert StatusMonitor.status(stack_id).conn == :starting
     end
@@ -822,9 +822,10 @@ defmodule Electric.Connection.ConnectionManagerTest do
   end
 
   defp wait_until_active(stack_id) do
-    assert_receive {:stack_status, _, :waiting_for_connection_lock}
-    assert_receive {:stack_status, _, :connection_lock_acquired}
-    assert_receive {:stack_status, _, :ready}
+    # Match the complete-stack fixture budget; assert every transition in order.
+    assert_receive {:stack_status, _, :waiting_for_connection_lock}, 2000
+    assert_receive {:stack_status, _, :connection_lock_acquired}, 2000
+    assert_receive {:stack_status, _, :ready}, 2000
     StatusMonitor.wait_until_active(stack_id, timeout: 1000)
     assert StatusMonitor.status(stack_id) == %{conn: :up, shape: :up}
   end

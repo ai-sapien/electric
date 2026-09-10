@@ -1,5 +1,6 @@
 defmodule Electric.Postgres.Identifiers do
   @namedatalen 63
+  @hash_suffix_bytes 8
   @ascii_downcase ?a - ?A
 
   defmodule StringSplitter do
@@ -36,7 +37,7 @@ defmodule Electric.Postgres.Identifiers do
   Parse a PostgreSQL identifier, removing quotes if present and escaping internal ones
   and downcasing the identifier otherwise.
 
-  Postgres identifiers are limited to 63 characters - Postgres will truncate them,
+  Postgres identifiers are limited to 63 bytes - Postgres will truncate them,
   but we'll fail if the identifier is too long to avoid api injection issues.
 
   ## Examples
@@ -66,7 +67,10 @@ defmodule Electric.Postgres.Identifiers do
       {:error, "Invalid zero-length delimited identifier"}
 
       iex> Electric.Postgres.Identifiers.parse(for(_ <- 1..64, into: "", do: "a"))
-      {:error, "Identifier is too long (max length is #{@namedatalen})"}
+      {:error, "Identifier is too long (max length is #{@namedatalen} bytes)"}
+
+      iex> Electric.Postgres.Identifiers.parse(String.duplicate("é", 32))
+      {:error, "Identifier is too long (max length is #{@namedatalen} bytes)"}
 
       iex> Electric.Postgres.Identifiers.parse(~S|" "|)
       {:ok, " "}
@@ -77,11 +81,62 @@ defmodule Electric.Postgres.Identifiers do
   @spec parse(binary(), boolean()) :: {:ok, binary()} | {:error, term()}
   def parse(ident, single_byte_encoding \\ false) when is_binary(ident) do
     with {:ok, parsed} <- do_parse(ident, single_byte_encoding) do
-      if String.length(parsed) > @namedatalen do
-        {:error, "Identifier is too long (max length is #{@namedatalen})"}
-      else
-        {:ok, parsed}
+      case validate_length(parsed) do
+        :ok -> {:ok, parsed}
+        {:error, reason} -> {:error, reason}
       end
+    end
+  end
+
+  @doc """
+  Validates that an identifier fits PostgreSQL's 63-byte identifier limit.
+  """
+  @spec validate_length(binary()) :: :ok | {:error, String.t()}
+  def validate_length(identifier) when is_binary(identifier) do
+    if byte_size(identifier) <= @namedatalen,
+      do: :ok,
+      else: {:error, "Identifier is too long (max length is #{@namedatalen} bytes)"}
+  end
+
+  @doc """
+  Returns an identifier that fits PostgreSQL's 63-byte limit.
+
+  Identifiers that already fit are returned unchanged. Overlong identifiers keep
+  the longest valid UTF-8 prefix that leaves room for an underscore and a stable
+  64-bit SHA-256 hash suffix. The suffix prevents different overlong identifiers
+  with the same retained prefix from collapsing to PostgreSQL's same truncated
+  name.
+  """
+  @spec shorten(binary()) :: binary()
+  def shorten(identifier) when byte_size(identifier) <= @namedatalen, do: identifier
+
+  def shorten(identifier) when is_binary(identifier) do
+    hash =
+      identifier
+      |> then(&:crypto.hash(:sha256, &1))
+      |> binary_part(0, @hash_suffix_bytes)
+      |> Base.encode16(case: :lower)
+
+    suffix = "_#{hash}"
+    prefix = take_utf8_prefix(identifier, @namedatalen - byte_size(suffix))
+    prefix <> suffix
+  end
+
+  defp take_utf8_prefix(identifier, maximum_bytes) do
+    take_utf8_prefix(identifier, maximum_bytes, [])
+  end
+
+  defp take_utf8_prefix(<<>>, _remaining_bytes, prefix) do
+    prefix |> Enum.reverse() |> IO.iodata_to_binary()
+  end
+
+  defp take_utf8_prefix(<<codepoint::utf8, rest::binary>>, remaining_bytes, prefix) do
+    encoded = <<codepoint::utf8>>
+
+    if byte_size(encoded) <= remaining_bytes do
+      take_utf8_prefix(rest, remaining_bytes - byte_size(encoded), [encoded | prefix])
+    else
+      prefix |> Enum.reverse() |> IO.iodata_to_binary()
     end
   end
 
