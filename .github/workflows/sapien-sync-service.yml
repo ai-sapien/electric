@@ -27,14 +27,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      ERL_FLAGS: "+S 4:4"
+      ERL_FLAGS: '+S 4:4'
     steps:
       - uses: actions/checkout@v4
 
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.20.2"
-          otp-version: "29.0.2"
+          elixir-version: '1.20.2'
+          otp-version: '29.0.2'
 
       - name: Start Postgres test services
         working-directory: packages/sync-service/dev
