@@ -95,7 +95,7 @@ defmodule Electric.Application do
     core_config = core_configuration(opts)
 
     persistent_kv = Keyword.fetch!(core_config, :persistent_kv)
-    installation_id = Electric.Config.persist_installation_id(persistent_kv, instance_id)
+    Electric.Config.persist_installation_id(persistent_kv, instance_id)
 
     replication_stream_id = get_env(opts, :replication_stream_id)
 
@@ -150,9 +150,9 @@ defmodule Electric.Application do
       ],
       pool_opts:
         get_env_lazy(opts, :pool_opts, fn -> [pool_size: get_env(opts, :db_pool_size)] end),
+      tcp_opts: tcp_opts(opts),
       chunk_bytes_threshold: get_env(opts, :chunk_bytes_threshold),
-      telemetry_opts:
-        telemetry_opts([instance_id: instance_id, installation_id: installation_id] ++ opts),
+      telemetry_opts: telemetry_opts([instance_id: instance_id] ++ opts),
       max_shapes: get_env(opts, :max_shapes),
       tweaks: [
         publication_alter_debounce_ms: get_env(opts, :publication_alter_debounce_ms),
@@ -167,21 +167,9 @@ defmodule Electric.Application do
         flush_stall_grace_period: get_env(opts, :flush_stall_grace_period),
         conn_max_requests: get_env(opts, :conn_max_requests),
         handler_fullsweep_after: get_env(opts, :handler_fullsweep_after),
+        http2_max_reset_stream_rate: get_env(opts, :http2_max_reset_stream_rate),
         process_spawn_opts: get_env(opts, :process_spawn_opts),
-        consumer_gc_heap_threshold: get_env(opts, :consumer_gc_heap_threshold),
-        materializer_replay_memory_limit_bytes:
-          get_env(opts, :materializer_replay_memory_limit_bytes),
-        materializer_replay_max_pending: get_env(opts, :materializer_replay_max_pending),
-        materializer_replay_idle_timeout_ms: get_env(opts, :materializer_replay_idle_timeout_ms),
-        materializer_live_max_subscribers: get_env(opts, :materializer_live_max_subscribers),
-        materializer_live_backlog_memory_limit_bytes:
-          get_env(opts, :materializer_live_backlog_memory_limit_bytes),
-        materializer_causal_call_timeout_ms: get_env(opts, :materializer_causal_call_timeout_ms),
-        causal_drain_max_concurrency: get_env(opts, :causal_drain_max_concurrency),
-        causal_drain_timeout_ms: get_env(opts, :causal_drain_timeout_ms),
-        subquery_buffer_max_transactions: get_env(opts, :subquery_buffer_max_transactions),
-        subquery_deferred_event_memory_limit_bytes:
-          get_env(opts, :subquery_deferred_event_memory_limit_bytes)
+        consumer_gc_heap_threshold: get_env(opts, :consumer_gc_heap_threshold)
       ],
       manual_table_publishing?: get_env(opts, :manual_table_publishing?),
       shape_db_opts: [
@@ -280,6 +268,39 @@ defmodule Electric.Application do
     ]
   end
 
+  # The keepidle, keepintvl, keepcnt and user_timeout socket options are only
+  # compiled into Erlang's inet driver where the OS headers define the
+  # corresponding TCP_* constants. Where they are missing, setting any of them
+  # makes the driver reject the connection with einval. They are all available
+  # on Linux; elsewhere we drop them, so that the database connection still
+  # works, and tell the user.
+  defp tcp_opts(opts) do
+    tcp_opts = [
+      keepalive_idle: get_env(opts, :db_tcp_keepalive_idle),
+      keepalive_interval: get_env(opts, :db_tcp_keepalive_interval),
+      keepalive_count: get_env(opts, :db_tcp_keepalive_count),
+      user_timeout: get_env(opts, :db_tcp_user_timeout)
+    ]
+
+    configured = Enum.reject(tcp_opts, fn {_key, val} -> is_nil(val) end)
+
+    cond do
+      configured == [] ->
+        []
+
+      :os.type() == {:unix, :linux} ->
+        configured
+
+      true ->
+        Logger.warning(
+          "Ignoring database TCP keepalive/user timeout settings " <>
+            "#{inspect(Keyword.keys(configured))}: they are only supported on Linux."
+        )
+
+        []
+    end
+  end
+
   defp get_env(opts, key) do
     get_env(opts, key, key)
   end
@@ -361,11 +382,30 @@ defmodule Electric.Application do
         n -> [{:handler_fullsweep_after, n} | ti_opts]
       end
 
-    shared_http_opts =
+    # `max_requests` is only applied to HTTP/1 connections. There, requests are served
+    # sequentially by a long-lived handler process and the limit recycles that process
+    # (and its accumulated heap) at a request boundary to avoid accumulating garbage memory.
+    #
+    # Under HTTP/2, requests already run in short-lived per-stream processes, and reaching
+    # `max_requests` would make Bandit tear down the whole multiplexed connection close all its
+    # streams.
+    http_1_opts =
       if max_requests = Keyword.get(tweaks, :conn_max_requests) do
         [max_requests: max_requests]
       else
         []
+      end
+
+    # Bandit's reset-stream rate limit (a Rapid Reset mitigation) closes the entire
+    # connection once a client sends too many RST_STREAM frames, killing every stream
+    # on it without running their cleanup. A proxy that multiplexes many end clients
+    # onto one upstream connection trips it with ordinary long-poll cancellations, and
+    # since Bandit leaves `max_concurrent_streams` unbounded the limit does not close
+    # off any attack that opening streams without resetting them wouldn't achieve.
+    http_2_opts =
+      case Keyword.get(tweaks, :http2_max_reset_stream_rate, :disabled) do
+        :disabled -> [max_reset_stream_rate: nil]
+        {count, period_ms} -> [max_reset_stream_rate: {count, period_ms}]
       end
 
     [
@@ -373,8 +413,8 @@ defmodule Electric.Application do
        [
          plug: {Electric.Plug.Router, router_opts},
          port: get_env(opts, :service_port),
-         http_1_options: shared_http_opts,
-         http_2_options: shared_http_opts,
+         http_1_options: http_1_opts,
+         http_2_options: http_2_opts,
          thousand_island_options: thousand_island_options(opts ++ ti_opts)
        ]}
     ]
@@ -406,6 +446,12 @@ defmodule Electric.Application do
         send_timeout -> [send_timeout: send_timeout]
       end
 
+    read_timeout_opts =
+      case get_env(opts, :tcp_read_timeout) do
+        nil -> []
+        read_timeout -> [read_timeout: read_timeout]
+      end
+
     ipv6_opts =
       if get_env(opts, :listen_on_ipv6?) do
         [:inet6]
@@ -423,7 +469,7 @@ defmodule Electric.Application do
         n -> [genserver_options: [spawn_opt: [fullsweep_after: n]]]
       end
 
-    acceptor_opts ++ transport_opts ++ genserver_opts
+    acceptor_opts ++ read_timeout_opts ++ transport_opts ++ genserver_opts
   end
 
   defp cowboy_options(opts) do
@@ -436,7 +482,6 @@ defmodule Electric.Application do
   defp telemetry_opts(opts) do
     [
       instance_id: Keyword.fetch!(opts, :instance_id),
-      installation_id: Keyword.fetch!(opts, :installation_id),
       version: Electric.version(),
       intervals_and_thresholds:
         get_opts(opts,
@@ -451,8 +496,6 @@ defmodule Electric.Application do
       reporters: [
         statsd_host: get_env(opts, :telemetry_statsd_host),
         prometheus?: not is_nil(get_env(opts, :prometheus_port)),
-        call_home_url:
-          if(get_env(opts, :call_home_telemetry?), do: get_env(opts, :telemetry_url)),
         otel_metrics?: not is_nil(Application.get_env(:otel_metric_exporter, :otlp_endpoint))
       ],
       # Export the key stack-level metrics (shapes, replication lag, retained WAL) to the

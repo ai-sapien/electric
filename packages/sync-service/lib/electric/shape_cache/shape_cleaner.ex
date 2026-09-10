@@ -4,7 +4,6 @@ defmodule Electric.ShapeCache.ShapeCleaner do
   """
 
   alias Electric.Shapes.Consumer
-  alias Electric.Shapes.Consumer.Materializer
   alias Electric.ShapeCache.ShapeStatus
   alias Electric.ShapeCache.Storage
   alias Electric.ShapeCache.ShapeCleaner.CleanupTaskSupervisor
@@ -32,7 +31,7 @@ defmodule Electric.ShapeCache.ShapeCleaner do
       fn ->
         valid_handles = remove_shapes_immediate(stack_id, shape_handles, reason)
         remove_shapes_deferred(stack_id, valid_handles)
-        OpenTelemetry.stop_and_save_intervals(total_attribute: "remove_shape.total_duration_µs")
+        OpenTelemetry.stop_and_save_intervals(total_attribute: "remove_shape.total_duration_us")
         :ok
       end
     )
@@ -43,7 +42,7 @@ defmodule Electric.ShapeCache.ShapeCleaner do
     remove_shapes(stack_id, List.wrap(shape_handle), reason)
   end
 
-  @spec remove_shapes_async(stack_id(), [shape_handle()], reason()) :: :ok
+  @spec remove_shapes_async(stack_id(), [shape_handle()], term()) :: :ok
   def remove_shapes_async(stack_id, shape_handles, reason \\ @shutdown_cleanup) do
     CleanupTaskSupervisor.perform_async(stack_id, fn ->
       activate_mocked_functions_from_test_process()
@@ -52,9 +51,9 @@ defmodule Electric.ShapeCache.ShapeCleaner do
     end)
   end
 
-  @spec remove_shape_async(stack_id(), shape_handle(), reason()) :: :ok
-  def remove_shape_async(stack_id, shape_handle, reason \\ @shutdown_cleanup) do
-    remove_shapes_async(stack_id, List.wrap(shape_handle), reason)
+  @spec remove_shape_async(stack_id(), shape_handle()) :: :ok
+  def remove_shape_async(stack_id, shape_handle) do
+    remove_shapes_async(stack_id, List.wrap(shape_handle))
   end
 
   @spec remove_shapes_for_relations(list(Electric.oid_relation()), stack_id(), term()) :: :ok
@@ -156,41 +155,35 @@ defmodule Electric.ShapeCache.ShapeCleaner do
   end
 
   defp remove_shape_immediate(stack_id, shape_handle, reason) do
-    try do
-      OpenTelemetry.start_interval(:"remove_shape.shape_status_remove.duration_µs")
+    OpenTelemetry.start_interval(:"remove_shape.shape_status_remove.duration_us")
 
-      case Electric.ShapeCache.ShapeStatus.remove_shape(stack_id, shape_handle) do
-        :ok ->
-          OpenTelemetry.start_interval(:"remove_shape.shape_consumer_stop.duration_µs")
+    case Electric.ShapeCache.ShapeStatus.remove_shape(stack_id, shape_handle) do
+      :ok ->
+        OpenTelemetry.start_interval(:"remove_shape.shape_consumer_stop.duration_us")
 
-          stack_storage = Storage.for_stack(stack_id)
+        stack_storage = Storage.for_stack(stack_id)
 
-          with :ok <- Consumer.stop(stack_id, shape_handle, reason),
-               OpenTelemetry.start_interval(:"remove_shape.storage_cleanup.duration_µs"),
-               :ok <- Storage.cleanup!(stack_storage, shape_handle),
-               OpenTelemetry.start_interval(
-                 :"remove_shape.shape_log_collector_remove.duration_µs"
-               ),
-               :ok <-
-                 Electric.Replication.ShapeLogCollector.remove_shape(stack_id, shape_handle) do
-            :ok
-          end
+        with :ok <- Consumer.stop(stack_id, shape_handle, reason),
+             OpenTelemetry.start_interval(:"remove_shape.storage_cleanup.duration_us"),
+             :ok <- Storage.cleanup!(stack_storage, shape_handle),
+             OpenTelemetry.start_interval(:"remove_shape.shape_log_collector_remove.duration_us"),
+             :ok <-
+               Electric.Replication.ShapeLogCollector.remove_shape(stack_id, shape_handle) do
+          :ok
+        end
 
-        {:error, _reason} ->
-          # The shape is already gone from ShapeStatus, but an earlier removal chain may
-          # have died between the ShapeStatus removal and the ShapeLogCollector removal,
-          # leaving the shape's flush entry pinned. The SLC removal is idempotent, so
-          # re-issue it instead of assuming it ever completed.
-          :ok = Electric.Replication.ShapeLogCollector.remove_shape(stack_id, shape_handle)
-          {:error, :data_removed}
-      end
-    after
-      Materializer.delete_link_values(stack_id, shape_handle)
+      {:error, _reason} ->
+        # The shape is already gone from ShapeStatus, but an earlier removal chain may
+        # have died between the ShapeStatus removal and the ShapeLogCollector removal,
+        # leaving the shape's flush entry pinned. The SLC removal is idempotent, so
+        # re-issue it instead of assuming it ever completed.
+        :ok = Electric.Replication.ShapeLogCollector.remove_shape(stack_id, shape_handle)
+        {:error, :data_removed}
     end
   end
 
   defp remove_shapes_deferred(stack_id, shape_handles) when is_list(shape_handles) do
-    OpenTelemetry.start_interval(:"remove_shape.remove_shapes_deferred.duration_µs")
+    OpenTelemetry.start_interval(:"remove_shape.remove_shapes_deferred.duration_us")
     :ok = CleanupTaskSupervisor.cleanup_async(stack_id, shape_handles)
   end
 

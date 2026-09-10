@@ -1,7 +1,6 @@
 defmodule Electric.Shapes.Api do
   alias Electric.Postgres.Inspector
   alias Electric.Replication.LogOffset
-  alias Electric.ShapeCache
   alias Electric.Shapes
   alias Electric.DbConnectionError
   alias Electric.SnapshotError
@@ -212,7 +211,7 @@ defmodule Electric.Shapes.Api do
   @spec load_shape_info(Request.t()) :: {:ok, Request.t()} | {:error, Response.t()}
   def load_shape_info(%Request{} = request) do
     with {:ok, request} <- do_load_shape_info(request) do
-      seek(request)
+      {:ok, seek(request)}
     end
   end
 
@@ -278,25 +277,18 @@ defmodule Electric.Shapes.Api do
   defp seek(%Request{params: %{offset: :now}} = request) do
     # For "now" offset, return immediately with up-to-date message
     # and the last_offset from the shape
-    request =
-      request
-      |> determine_global_last_seen_lsn()
-      |> use_last_offset_as_chunk_end()
-      |> set_response_offset_for_now()
-
-    {:ok, request}
+    request
+    |> determine_global_last_seen_lsn()
+    |> use_last_offset_as_chunk_end()
+    |> set_response_offset_for_now()
   end
 
   defp seek(%Request{} = request) do
-    with {:ok, request} <- listen_for_new_changes(request) do
-      request =
-        request
-        |> determine_global_last_seen_lsn()
-        |> determine_log_chunk_offset()
-        |> determine_up_to_date()
-
-      {:ok, request}
-    end
+    request
+    |> listen_for_new_changes()
+    |> determine_global_last_seen_lsn()
+    |> determine_log_chunk_offset()
+    |> determine_up_to_date()
   end
 
   defp set_response_offset_for_now(%Request{} = request) do
@@ -438,7 +430,7 @@ defmodule Electric.Shapes.Api do
   end
 
   defp listen_for_new_changes(%Request{params: %{live: false}} = request) do
-    {:ok, request}
+    request
   end
 
   defp listen_for_new_changes(%Request{params: %{live: true}} = request) do
@@ -457,40 +449,10 @@ defmodule Electric.Shapes.Api do
       ref = Electric.StackSupervisor.subscribe_to_shape_events(stack_id, handle)
       Logger.debug("Client #{inspect(self())} is registered for changes to #{handle}")
 
-      request = %{request | new_changes_pid: self(), new_changes_ref: ref}
-      activate_shape_for_live_request(request)
+      %{request | new_changes_pid: self(), new_changes_ref: ref}
     else
-      {:ok, request}
+      request
     end
-  end
-
-  defp activate_shape_for_live_request(%Request{read_only?: true} = request),
-    do: {:ok, request}
-
-  defp activate_shape_for_live_request(
-         %Request{handle: handle, api: %{stack_id: stack_id}} = request
-       ) do
-    case ShapeCache.start_consumer_for_handle(handle, stack_id,
-           otel_ctx: OpenTelemetry.get_current_context()
-         ) do
-      {:ok, _pid} -> {:ok, request}
-      {:error, reason} -> shape_activation_error(request, reason)
-    end
-  catch
-    :exit, reason -> shape_activation_error(request, reason)
-  end
-
-  defp shape_activation_error(request, reason) do
-    Logger.warning("Failed to activate shape for live request",
-      shape_handle: request.handle,
-      reason: inspect(reason)
-    )
-
-    {:error,
-     Response.error(request, "Failed to activate shape, please retry",
-       status: 503,
-       retry_after: 1
-     )}
   end
 
   # Ensure the request process is subscribed to shape events. This is needed
@@ -551,10 +513,7 @@ defmodule Electric.Shapes.Api do
 
   # For "now" requests, use the last_offset directly as the chunk_end_offset
   defp use_last_offset_as_chunk_end(%Request{} = request) do
-    Request.update_response(
-      %{request | chunk_end_offset: request.last_offset},
-      &%{&1 | offset: request.last_offset}
-    )
+    %{request | chunk_end_offset: request.last_offset}
   end
 
   defp determine_up_to_date(%Request{} = request) do
@@ -927,6 +886,18 @@ defmodule Electric.Shapes.Api do
 
       {^ref, :out_of_bounds_timeout} ->
         :out_of_bounds_timeout
+
+      # Bandit's HTTP/2 connection process forwards a client's RST_STREAM to this handler
+      # process as a plain message (Bandit-private format).
+      #
+      # Matching it here lets us abandon the long poll the moment the client cancels the
+      # request, instead of discovering the reset only when the response send fails after
+      # the full long-poll timeout.
+      #
+      # HTTP/1 has no equivalent early signal; there the reset surfaces as
+      # Bandit.TransportError at send time, handled in Electric.Plug.ServeShapePlug.
+      {:bandit, {:rst_stream, _error_code}} ->
+        :client_disconnect
     after
       long_poll_timeout ->
         :long_poll_timeout
@@ -940,6 +911,12 @@ defmodule Electric.Shapes.Api do
     |> determine_log_chunk_offset()
     |> determine_up_to_date()
     |> do_serve_shape_log()
+  end
+
+  defp handle_live_change_result(:client_disconnect, request) do
+    request
+    |> update_attrs(%{ot_is_client_disconnected: true})
+    |> Response.client_disconnect()
   end
 
   defp handle_live_change_result({:shape_rotation, new_handle}, request) do
@@ -1103,14 +1080,11 @@ defmodule Electric.Shapes.Api do
         updated_request =
           %{request | last_offset: latest_log_offset}
           |> determine_global_last_seen_lsn()
-          # A dependency move can atomically publish several physical chunks
-          # but emits one notification. SSE is already lazy/backpressured, so
-          # drain exactly through that notified boundary in this stream turn;
-          # stopping at the first chunk would strand the final `last=true`
-          # delimiter until an unrelated later write or reconnect.
-          |> use_last_offset_as_chunk_end()
+          |> determine_log_chunk_offset()
           |> determine_up_to_date()
 
+        # This is usually but not always the `latest_log_offset`
+        # as per `determine_log_chunk_offset/1`.
         end_offset = updated_request.chunk_end_offset
 
         case Shapes.get_merged_log_stream(

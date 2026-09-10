@@ -1,5 +1,85 @@
 # @core/sync-service
 
+## 1.8.1
+
+### Patch Changes
+
+- a97590e: Disable Bandit's HTTP/2 reset-stream rate limit by default and expose it as
+  `ELECTRIC_TWEAKS_HTTP2_MAX_RESET_STREAM_RATE`. The limit closes an entire
+  connection once a client sends more than 500 `RST_STREAM` frames in 10 seconds,
+  dropping every request in flight on it. Behind a proxy that multiplexes many end
+  clients onto a few upstream connections, routine client-side cancellations of
+  live requests were enough to trip it, killing the parked long-polls of unrelated
+  clients and leaking their admission permits.
+
+## 1.8.0
+
+### Minor Changes
+
+- 1a50fff: **Breaking change**: renamed several telemetry metric and span attribute names, replacing their non-ASCII `µs`/`μs` microsecond suffix with the plain-ASCII `us`. Some metrics backends (e.g. Mimir/Prometheus) reject metric names containing non-ASCII characters, which previously caused ingestion of the affected metrics to fail. Any dashboards, alerts, or queries referencing the old attribute names (e.g. `shape_db.pool.checkout.queue_time_μs`) need to be updated to the new ASCII names (e.g. `shape_db.pool.checkout.queue_time_us`).
+
+### Patch Changes
+
+- 2e9e9b4: Handle client-cancelled shape requests as disconnects instead of server errors.
+  A live long-poll now aborts as soon as the client resets the HTTP/2 stream,
+  releasing the handler process and its admission permit immediately instead of
+  holding them for the remainder of the long-poll timeout. Transport errors
+  raised when sending a response to a client that already went away are now
+  recorded as status 499 with a `shape_req.client_disconnected` span attribute
+  rather than surfacing as phantom 500s with recorded exceptions.
+- 7b9e9fe: Include the `electric-snapshot` response header in `access-control-expose-headers` so that cross-origin browser clients can read it.
+- f0e1904: Only advance the global last seen LSN on commit-bearing transaction fragments. Large transactions are split into multiple fragments that all carry the transaction's final LSN, so a `up-to-date` response could previously advertise an LSN whose changes were not yet readable in the shape logs, and a later response could then return data at that same LSN.
+- 09c60c6: Promote an already-running standalone shape consumer to whole-transaction writes when a subquery materializer subscribes to it. If a fragmented transaction is already in progress, the subscription is completed at its commit boundary so the materializer never misses the already-written head of that transaction.
+- 5ce464c: Wait for in-flight transactions that have written to a table to finish before committing the table's addition to the publication. Previously, such a transaction's writes were neither emitted by the replication stream (they predate the addition) nor included in the initial snapshot (the transaction was still open), so any shape created on the table right after it was added - e.g. after a `TRUNCATE` invalidated the previous shapes - was silently missing those rows for its whole lifetime.
+- 138039d: Stop applying `ELECTRIC_TWEAKS_CONN_MAX_REQUESTS` to HTTP/2 connections. The limit is only meaningful for HTTP/1, where it recycles long-lived handler processes at a request boundary. Under HTTP/2 it made Bandit tear down the whole multiplexed connection with GOAWAY/REFUSED_STREAM once the cumulative stream count reached the limit (50 by default), disrupting in-flight streams and causing reconnect bursts.
+- ab53baa: Start the consumer of an existing subquery dependency shape if it isn't running when a new parent shape resolves to it. Previously such a parent request failed with a 500 on every retry: the dependency's materializer found no consumer, the parent was invalidated, and the still-registered dependency poisoned the next attempt.
+
+## 1.7.12
+
+### Patch Changes
+
+- 6e917b9: Add `ELECTRIC_DATABASE_TCP_KEEPALIVE_IDLE`, `ELECTRIC_DATABASE_TCP_KEEPALIVE_INTERVAL`, `ELECTRIC_DATABASE_TCP_KEEPALIVE_COUNT` and `ELECTRIC_DATABASE_TCP_USER_TIMEOUT` for configuring TCP keepalive and user timeout on database connections. All of them are opt-in; when unset the OS defaults are kept.
+- c9e8a68: Fix an authentication bypass on `/v1/shape` in secure mode. Authentication now gates on the route resolved by the router rather than on the raw request path, so requests whose target normalizes to `/v1/shape` (e.g. a trailing slash, a doubled slash, or a percent-encoded character) can no longer skip the secret check. CORS headers for shape routes are matched the same way.
+
+## 1.7.11
+
+### Patch Changes
+
+- 2171ca1: Fix `DELETE /v1/shape` so a shape can be deleted by its definition. The delete plug discarded every shape parameter other than `table` and `handle`, so any shape with a `where`, `columns`, `params`, `replica` or `log` could only ever be deleted by handle.
+- 5c5ba9d: Remove the call-home reporter that sent anonymous usage data to checkpoint.electric-sql.com. Electric no longer phones home; the `ELECTRIC_USAGE_REPORTING` and `ELECTRIC_TELEMETRY_URL` environment variables are gone, along with the `call_home_telemetry?` and `telemetry_url` configuration options for embedded use.
+
+## 1.7.10
+
+### Patch Changes
+
+- 9f84e60: Drop shapes that involve subqueries on server restart to prevent consistency issues.
+- fb06dd3: Subqueries in shape WHERE clauses are now generally available and always enabled, including incremental move handling for compound `AND`/`OR`/`NOT` expressions. The `allow_subqueries` and `tagged_subqueries` feature flags have been removed — they no longer need to be set via `ELECTRIC_FEATURE_FLAGS`.
+
+## 1.7.9
+
+### Patch Changes
+
+- ca04983: Prevent a dead or stalled shape consumer from pinning the replication slot's `confirmed_flush_lsn` indefinitely, which caused unbounded WAL retention. The collector now monitors the writer behind every pending flush entry — a crashed writer unpins its entry immediately, and a shape making no flush progress past a grace period is challenged and invalidated if it doesn't respond.
+- bb69764: Fix keepalives acknowledging WAL past small transactions whose storage flush hasn't been confirmed yet. A crash in that window could permanently lose the transaction for all affected shapes, since the replication slot had already advanced past it.
+
+## 1.7.8
+
+### Patch Changes
+
+- 5a298c6: Bound the memory pinned by a shape response served to a slow or stalled client. Two compounding issues let every stalled connection pin its entire in-flight log chunk (~10 MB by default) for as long as the serve lived: the log file was read eagerly as one whole-range binary whose entries were served as sub-binary slices (pinning the full chunk plus the full entry list), and the JSON encoder batched response elements by item count only, so a batch of large rows grew into a multi-megabyte unit held in full by the request process and the socket's driver queue. Accumulated stalled serves could exhaust node memory (observed in production: ~400 stalled serves pinning ~3.9 GB, immune to GC since the references are live). The log is now read lazily in 64 KiB blocks and encoder batches are additionally capped at 256 KiB, bounding the pinned memory per stalled connection to well under 1 MB regardless of chunk size.
+- 7b8fecc: Fix a cold nested subquery shape returning an initial HTTP 500 while its dependency snapshots were still in progress. When an outer shape's consumer initialized, it subscribed to each dependency materializer using `GenServer.call` with the default 5s timeout. A dependency materializer stays blocked in start-up until its own snapshot starts, so if that snapshot took longer than 5s the subscribe timed out, the outer shape was removed, and the client's first request 500'd (a retry succeeded once the snapshot finished). The subscribe now waits with `:infinity`, consistent with the other materializer calls, so a cold nested shape waits for its dependency materializers and completes without an externally visible 500. Liveness is unaffected: the caller already monitors the materializer, so a dead dependency surfaces as a call exit rather than being masked by a short timeout.
+- a1026bd: fix: make call-home telemetry opt-in
+- 4c2498a: Stop subquery shapes from being spuriously removed during a server restart. When
+  a dependency consumer's inline call to its materializer raced the materializer's
+  shutdown, the resulting `:noproc` exit crashed the consumer and removed the shape
+  from disk, causing a `409 must-refetch` after the restart. The consumer now
+  absorbs that exit and lets the monitored `:DOWN` drive a clean stop.
+- b2cf71d: Add `ELECTRIC_TCP_READ_TIMEOUT` to configure the socket read / HTTP keep-alive
+  idle timeout (ThousandIsland's `read_timeout`, default 60s). When Electric runs
+  behind a connection-pooling proxy such as an AWS ALB, this must be set above
+  the proxy's idle timeout — otherwise the proxy races Electric's unannounced
+  idle close when reusing a pooled connection and clients see intermittent 502s.
+
 ## 1.7.7
 
 ### Patch Changes

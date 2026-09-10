@@ -36,15 +36,20 @@ defmodule Electric.Config do
 
   @type instance_id :: String.t()
 
-  @build_env Mix.env()
-
-  @known_feature_flags ~w[allow_subqueries tagged_subqueries]
+  @known_feature_flags ~w[]
   @default_storage_dir "./persistent"
 
   @defaults [
     ## Database
     provided_database_id: "single_stack",
     db_pool_size: 20,
+    # TCP-level liveness detection for database connections. All nil by
+    # default, leaving the OS defaults in place. See
+    # Electric.Connection.Manager.ConnectionResolver for what these do.
+    db_tcp_keepalive_idle: nil,
+    db_tcp_keepalive_interval: nil,
+    db_tcp_keepalive_count: nil,
+    db_tcp_user_timeout: nil,
     replication_stream_id: "default",
     replication_slot_temporary?: false,
     replication_slot_temporary_random_name?: false,
@@ -59,6 +64,13 @@ defmodule Electric.Config do
     long_poll_timeout: 20_000,
     http_api_num_acceptors: nil,
     tcp_send_timeout: :timer.seconds(30),
+    # Socket read/keep-alive timeout (ThousandIsland's read_timeout). Bandit reaps
+    # keep-alive connections that have been idle for this long. When Electric runs
+    # behind a connection-pooling proxy (ALB, nginx, etc.), this MUST exceed the
+    # proxy's idle timeout — otherwise the proxy races Bandit's unannounced close
+    # when reusing a pooled connection and surfaces the reset as a 502.
+    # nil keeps ThousandIsland's default (60s).
+    tcp_read_timeout: nil,
     cache_max_age: 60,
     cache_stale_age: 60 * 5,
     chunk_bytes_threshold: Electric.ShapeCache.LogChunker.default_chunk_size_threshold(),
@@ -79,9 +91,7 @@ defmodule Electric.Config do
     ## Telemetry
     instance_id: nil,
     prometheus_port: nil,
-    call_home_telemetry?: @build_env == :prod,
     telemetry_statsd_host: nil,
-    telemetry_url: URI.new!("https://checkpoint.electric-sql.com"),
     otel_sampling_ratio: 0.01,
     metrics_sampling_ratio: 1,
     # When true, the OTel spans of empty/up-to-date shape-GET responses are tail-dropped
@@ -101,9 +111,9 @@ defmodule Electric.Config do
     # shape is invalidated to unpin the stack-wide flush boundary. The storage
     # contract already says writes slower than this should raise.
     flush_stall_grace_period: :timer.minutes(1),
-    # Sets max_requests for Bandit handler processes:
+    # Sets max_requests for Bandit HTTP/1 handler processes:
     # https://hexdocs.pm/bandit/Bandit.html#t:http_1_options/0
-    # "The maximum number of requests to serve in a single HTTP/{1,2}
+    # "The maximum number of requests to serve in a single HTTP/1
     # connection before closing the connection"
     conn_max_requests: 50,
     # Sets fullsweep_after for Bandit handler processes.
@@ -113,6 +123,14 @@ defmodule Electric.Config do
     # forces a fullsweep after N minor collections to reclaim that memory.
     # See https://www.erlang.org/doc/apps/erts/erlang.html#spawn_opt/4
     handler_fullsweep_after: nil,
+    # Sets max_reset_stream_rate for Bandit HTTP/2 connections: the number of client
+    # RST_STREAM frames tolerated per connection within a time window before Bandit
+    # tears down the whole connection with ENHANCE_YOUR_CALM. Bandit defaults to
+    # {500, 10_000}. Disabled here: tearing down a connection kills every in-flight
+    # stream on it, and behind a proxy that multiplexes many end clients onto a few
+    # upstream connections, ordinary client-side cancellations of long-polls are
+    # enough to trip it. Electric handles cancellations per stream instead.
+    http2_max_reset_stream_rate: :disabled,
     ## Performance tweaks
     publication_alter_debounce_ms: 0,
     # allow for configuring per-process `Process.spawn_opt()`. In the form
@@ -124,39 +142,9 @@ defmodule Electric.Config do
     # Heap-size threshold (in BYTES) above which a consumer runs :erlang.garbage_collect()
     # after processing a transaction fragment.
     consumer_gc_heap_threshold: nil,
-    # Maximum estimated raw log bytes retained/applied by one stale dependency
-    # replay session. Larger histories invalidate and rebuild the outer shape
-    # rather than risking an unbounded materializer heap.
-    materializer_replay_memory_limit_bytes: 8 * 1024 * 1024,
-    # Stale outer Consumers waiting on one source materializer retain only a pid
-    # and cursor, but the queue itself must still be bounded.
-    materializer_replay_max_pending: 100,
-    # One stack-wide replay lease must keep making progress. Seed scans or
-    # subscribers that stop pulling are invalidated instead of retaining the
-    # only replay index indefinitely.
-    materializer_replay_idle_timeout_ms: :timer.seconds(30),
-    # Bound the live monitor/fan-out set independently from stale replay jobs.
-    materializer_live_max_subscribers: 1000,
-    # Maximum serialized payload bytes retained by one live dependency
-    # Materializer while source storage durability catches up. This is a shared
-    # source-side bound, separate from each outer Consumer's deferred queue.
-    materializer_live_backlog_memory_limit_bytes: 8 * 1024 * 1024,
-    # Synchronous causal reservation and delivery cannot block the replication
-    # DAG forever. A timed-out derived shape is invalidated independently.
-    materializer_causal_call_timeout_ms: :timer.seconds(30),
-    # Startup catch-up asks cached Consumers to drain concurrently, but this
-    # fan-out must stay bounded independently of the number of cached shapes.
-    causal_drain_max_concurrency: 32,
-    # A stuck cached Consumer must not hold external stack readiness closed
-    # forever. One absolute deadline covers the complete fixed-point drain.
-    causal_drain_timeout_ms: :timer.minutes(10),
-    # Maximum serialized term bytes retained across one outer Consumer's
-    # deferred dependency-move and root-replication queues. Replay waiters must
-    # not turn a large transaction into an unbounded per-shape heap fan-out.
-    subquery_deferred_event_memory_limit_bytes: 1024 * 1024,
     ## Misc
     process_registry_partitions: &Electric.Config.Defaults.process_registry_partitions/0,
-    feature_flags: if(Mix.env() == :test, do: @known_feature_flags, else: []),
+    feature_flags: [],
     publication_refresh_period: 60_000,
     schema_reconciler_period: 60_000,
     snapshot_timeout_to_first_data: :timer.seconds(30),
@@ -505,21 +493,6 @@ defmodule Electric.Config do
     raise Dotenvy.Error, message: "Must be one of #{inspect(@public_log_levels)}"
   end
 
-  @spec parse_telemetry_url(binary) :: {:ok, binary} | {:error, binary}
-  def parse_telemetry_url(str) do
-    case URI.new(str) do
-      {:ok, %URI{scheme: scheme}} when scheme in ["http", "https"] -> {:ok, str}
-      _ -> {:error, "invalid URL format: \"#{str}\""}
-    end
-  end
-
-  def parse_telemetry_url!(str) do
-    case parse_telemetry_url(str) do
-      {:ok, url} -> url
-      {:error, message} -> raise Dotenvy.Error, message: message
-    end
-  end
-
   @time_units ~w[ms msec s sec m min]
 
   @spec parse_human_readable_time(binary | nil) :: {:ok, pos_integer} | {:error, binary}
@@ -647,6 +620,47 @@ defmodule Electric.Config do
 
   def parse_top_process_limit!(str) do
     case parse_top_process_limit(str) do
+      {:ok, result} -> result
+      {:error, message} -> raise Dotenvy.Error, message: message
+    end
+  end
+
+  @doc """
+  Parse an HTTP/2 reset-stream rate limit of the form `<count>/<duration>` into the
+  `{count, period_ms}` tuple Bandit expects, or `disabled` into `:disabled`.
+
+  ## Examples
+
+    iex> parse_http2_max_reset_stream_rate("500/10s")
+    {:ok, {500, 10000}}
+
+    iex> parse_http2_max_reset_stream_rate("disabled")
+    {:ok, :disabled}
+
+    iex> parse_http2_max_reset_stream_rate("500")
+    {:error, ~S'invalid HTTP/2 reset stream rate: "500". Expected format: <count>/<duration> (e.g. 500/10s) or disabled'}
+  """
+  @spec parse_http2_max_reset_stream_rate(binary) ::
+          {:ok, {pos_integer, pos_integer} | :disabled} | {:error, binary}
+  def parse_http2_max_reset_stream_rate(str) do
+    with false <- String.downcase(str) == "disabled",
+         [count_str, period_str] <- String.split(str, "/"),
+         {count, ""} when count > 0 <- Integer.parse(count_str),
+         {:ok, period_ms} <- parse_human_readable_time(period_str) do
+      {:ok, {count, period_ms}}
+    else
+      true ->
+        {:ok, :disabled}
+
+      _ ->
+        {:error,
+         "invalid HTTP/2 reset stream rate: #{inspect(str)}. " <>
+           "Expected format: <count>/<duration> (e.g. 500/10s) or disabled"}
+    end
+  end
+
+  def parse_http2_max_reset_stream_rate!(str) do
+    case parse_http2_max_reset_stream_rate(str) do
       {:ok, result} -> result
       {:error, message} -> raise Dotenvy.Error, message: message
     end

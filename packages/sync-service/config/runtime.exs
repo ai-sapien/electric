@@ -158,13 +158,6 @@ replication_stream_id =
 prometheus_port = env!("ELECTRIC_PROMETHEUS_PORT", :integer, nil)
 live_dashboard_port = env!("ELECTRIC_LIVE_DASHBOARD_PORT", :integer, nil)
 
-call_home_telemetry_url =
-  env!(
-    "ELECTRIC_TELEMETRY_URL",
-    &Electric.Config.parse_telemetry_url!/1,
-    nil
-  )
-
 shape_hibernate_after =
   env!("ELECTRIC_SHAPE_HIBERNATE_AFTER", &Electric.Config.parse_human_readable_time!/1, nil)
 
@@ -232,8 +225,6 @@ config :electric,
   long_poll_timeout: env!("ELECTRIC_LONG_POLL_TIMEOUT", :integer, nil),
   # Used in telemetry
   instance_id: instance_id,
-  call_home_telemetry?: env!("ELECTRIC_USAGE_REPORTING", :boolean, config_env() == :prod),
-  telemetry_url: call_home_telemetry_url,
   system_metrics_poll_interval: system_metrics_poll_interval,
   stack_telemetry_init_delay: stack_telemetry_init_delay,
   otel_export_period: otel_export_period,
@@ -265,6 +256,25 @@ config :electric,
   prometheus_port: prometheus_port,
   live_dashboard_port: live_dashboard_port,
   db_pool_size: env!("ELECTRIC_DB_POOL_SIZE", :integer, nil),
+  db_tcp_keepalive_idle:
+    env!(
+      "ELECTRIC_DATABASE_TCP_KEEPALIVE_IDLE",
+      &Electric.Config.parse_human_readable_time!/1,
+      nil
+    ),
+  db_tcp_keepalive_interval:
+    env!(
+      "ELECTRIC_DATABASE_TCP_KEEPALIVE_INTERVAL",
+      &Electric.Config.parse_human_readable_time!/1,
+      nil
+    ),
+  db_tcp_keepalive_count: env!("ELECTRIC_DATABASE_TCP_KEEPALIVE_COUNT", :integer, nil),
+  db_tcp_user_timeout:
+    env!(
+      "ELECTRIC_DATABASE_TCP_USER_TIMEOUT",
+      &Electric.Config.parse_human_readable_time!/1,
+      nil
+    ),
   replication_stream_id: replication_stream_id,
   replication_slot_temporary?: env!("CLEANUP_REPLICATION_SLOTS_ON_SHUTDOWN", :boolean, nil),
   replication_slot_temporary_random_name?:
@@ -276,8 +286,6 @@ config :electric,
   service_port: env!("ELECTRIC_PORT", :integer, nil),
   subquery_buffer_max_transactions:
     env!("ELECTRIC_SUBQUERY_BUFFER_MAX_TRANSACTIONS", :integer, nil),
-  subquery_deferred_event_memory_limit_bytes:
-    env!("ELECTRIC_SUBQUERY_DEFERRED_EVENT_MEMORY_LIMIT_BYTES", :integer, nil),
   shape_hibernate_after: shape_hibernate_after,
   shape_enable_suspend?: shape_enable_suspend?,
   shape_suspend_after: shape_suspend_after,
@@ -300,25 +308,19 @@ config :electric,
   process_spawn_opts:
     env!("ELECTRIC_PROCESS_SPAWN_OPTS", &Electric.Config.parse_spawn_opts!/1, %{}),
   consumer_gc_heap_threshold: env!("ELECTRIC_CONSUMER_GC_HEAP_THRESHOLD", :integer, nil),
-  materializer_replay_memory_limit_bytes:
-    env!("ELECTRIC_MATERIALIZER_REPLAY_MEMORY_LIMIT_BYTES", :integer, nil),
-  materializer_replay_max_pending:
-    env!("ELECTRIC_MATERIALIZER_REPLAY_MAX_PENDING", :integer, nil),
-  materializer_replay_idle_timeout_ms:
-    env!("ELECTRIC_MATERIALIZER_REPLAY_IDLE_TIMEOUT_MS", :integer, nil),
-  materializer_live_max_subscribers:
-    env!("ELECTRIC_MATERIALIZER_LIVE_MAX_SUBSCRIBERS", :integer, nil),
-  materializer_live_backlog_memory_limit_bytes:
-    env!("ELECTRIC_MATERIALIZER_LIVE_BACKLOG_MEMORY_LIMIT_BYTES", :integer, nil),
-  materializer_causal_call_timeout_ms:
-    env!("ELECTRIC_MATERIALIZER_CAUSAL_CALL_TIMEOUT_MS", :integer, nil),
-  causal_drain_max_concurrency: env!("ELECTRIC_CAUSAL_DRAIN_MAX_CONCURRENCY", :integer, nil),
-  causal_drain_timeout_ms: env!("ELECTRIC_CAUSAL_DRAIN_TIMEOUT_MS", :integer, nil),
   http_api_num_acceptors: env!("ELECTRIC_TWEAKS_HTTP_API_NUM_ACCEPTORS", :integer, 100),
   conn_max_requests: env!("ELECTRIC_TWEAKS_CONN_MAX_REQUESTS", :integer, nil),
   handler_fullsweep_after: env!("ELECTRIC_TWEAKS_HANDLER_FULLSWEEP_AFTER", :integer, nil),
+  http2_max_reset_stream_rate:
+    env!(
+      "ELECTRIC_TWEAKS_HTTP2_MAX_RESET_STREAM_RATE",
+      &Electric.Config.parse_http2_max_reset_stream_rate!/1,
+      nil
+    ),
   tcp_send_timeout:
     env!("ELECTRIC_TCP_SEND_TIMEOUT", &Electric.Config.parse_human_readable_time!/1, nil),
+  tcp_read_timeout:
+    env!("ELECTRIC_TCP_READ_TIMEOUT", &Electric.Config.parse_human_readable_time!/1, nil),
   feature_flags: env!("ELECTRIC_FEATURE_FLAGS", &Electric.Config.parse_feature_flags/1, nil),
   manual_table_publishing?: env!("ELECTRIC_MANUAL_TABLE_PUBLISHING", :boolean, nil),
   publication_refresh_period:

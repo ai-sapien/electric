@@ -51,12 +51,6 @@ defmodule ElectricTelemetry.StackTelemetry do
     metrics = metrics(opts)
 
     [
-      Reporters.CallHomeReporter.child_spec(
-        opts,
-        stack_id: stack_id,
-        name: :"stack_call_home_telemetry_#{stack_id}",
-        metrics: Reporters.CallHomeReporter.stack_metrics(stack_id)
-      ),
       Reporters.Otel.child_spec(opts,
         name: :"stack_otel_telemetry_#{stack_id}",
         metrics: metrics
@@ -126,7 +120,7 @@ defmodule ElectricTelemetry.StackTelemetry do
       sum("electric.subqueries.subset_result.count"),
       sum("electric.subqueries.move_in_triggered.count"),
       last_value("electric.postgres.info_looked_up.pg_version"),
-      distribution("electric.shape_db.pool.checkout.queue_time_μs", unit: :microsecond),
+      distribution("electric.shape_db.pool.checkout.queue_time_us", unit: :microsecond),
       last_value("electric.connection.consumers_ready.duration",
         unit: {:native, :millisecond}
       ),

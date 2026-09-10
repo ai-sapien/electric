@@ -952,6 +952,221 @@ async fn e2e_recycled_first_segment_acked_records_survive_crash() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Recovery-hardening: a stage failure must leave NO trace — the 500'd bytes
+/// must not be resurrected by later successful appends, neither live nor
+/// across a crash/recovery. (Uses the shard's test-only write-failure
+/// injection, which surfaces exactly like a production stage error.)
+#[tokio::test]
+async fn e2e_stage_failure_rolls_back_data_write() {
+    let _guard = DurabilityGuard::wal();
+    let dir = tmp("stage-rollback");
+    let h = Harness::boot(&dir, Some(1), 1).unwrap();
+    create_stream(&h.store, "rb", OCTET).await;
+
+    let mut expected = Vec::new();
+    append_acked(&h.store, "rb", OCTET, b"first|").await;
+    expected.extend_from_slice(b"first|");
+
+    // Inject: the next WAL stage write fails -> the append must 500 and the
+    // data-file write must be rolled back.
+    h.walset.shards()[0].fail_next_write();
+    let resp = handlers::handle(
+        Arc::clone(&h.store),
+        post_req("rb", OCTET, b"LOST-must-not-resurrect|"),
+    )
+    .await;
+    assert_eq!(resp.status, 500, "injected stage failure must 500");
+
+    // A later append succeeds; the failed bytes must NOT appear before it.
+    append_acked(&h.store, "rb", OCTET, b"second|").await;
+    expected.extend_from_slice(b"second|");
+
+    let live = stream_file_bytes(&h.store, "rb");
+    assert_eq!(live, expected, "500'd bytes must not persist in the live file");
+
+    h.crash();
+    let h2 = Harness::boot(&dir, None, 1).unwrap();
+    let got = stream_file_bytes(&h2.store, "rb");
+    assert_eq!(got, expected, "500'd bytes must not resurrect across recovery");
+    h2.crash();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Recovery-hardening: an unparsable sidecar must QUARANTINE the stream (skip
+/// + keep the data file + park the sidecar as .meta.corrupt), never delete the
+/// data file — a torn sidecar next to real data is a torn write, not garbage.
+#[tokio::test]
+async fn e2e_corrupt_sidecar_quarantines_instead_of_deleting() {
+    let _guard = DurabilityGuard::wal();
+    let dir = tmp("sidecar-quarantine");
+    let h = Harness::boot(&dir, Some(1), 1).unwrap();
+    create_stream(&h.store, "q", OCTET).await;
+    append_acked(&h.store, "q", OCTET, b"precious|").await;
+    let data_path = h.store.get("q").unwrap().file_path.clone();
+    let meta_path = std::path::PathBuf::from(format!("{}.meta", data_path.display()));
+    h.crash();
+
+    // Tear the sidecar (simulates a crash-torn rename target).
+    std::fs::write(&meta_path, b"{ this is not json").unwrap();
+
+    let h2 = Harness::boot(&dir, None, 1).unwrap();
+    assert!(h2.store.get("q").is_none(), "stream is skipped this boot");
+    assert!(data_path.exists(), "data file must NOT be deleted");
+    assert!(
+        meta_path.with_extension("meta.corrupt").exists(),
+        "sidecar parked as .meta.corrupt for repair"
+    );
+    h2.crash();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Recovery-hardening: on an initialized store, a stream lane whose dir is
+/// empty and unmarked (= its device mount is missing) must REFUSE to boot —
+/// continuing would drop the lane's streams and let the WAL reset destroy
+/// their acked records.
+#[tokio::test]
+async fn e2e_missing_lane_mount_refuses_boot() {
+    let _guard = DurabilityGuard::wal();
+    crate::store::set_stream_lanes(3);
+    let dir = tmp("lane-mount-guard");
+    {
+        let h = Harness::boot(&dir, Some(1), 1).unwrap();
+        create_stream(&h.store, "lm", OCTET).await;
+        append_acked(&h.store, "lm", OCTET, b"x|").await;
+        h.crash();
+    }
+    // Simulate a missing mount: replace lane 1's dir with a fresh empty dir.
+    let lane1 = dir.join("streams").join("1");
+    std::fs::remove_dir_all(&lane1).unwrap();
+    std::fs::create_dir_all(&lane1).unwrap();
+
+    let err = Store::new_with_tier(dir.clone(), TierConfig::default())
+        .err()
+        .expect("boot must refuse when a lane mount is missing");
+    assert!(
+        err.to_string().contains("mount"),
+        "error should name the missing mount: {err}"
+    );
+    crate::store::set_stream_lanes(1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--stream-lanes N`: stream data files hash across `streams/<0..N>/` subdirs
+/// (one per device in the intended deployment — the ~1M-stream writeback-wall
+/// fix). Crash recovery must find every file in its lane dir, and the
+/// checkpoint's per-lane syncfs must preserve durability-before-recycle exactly
+/// as the single-lane layout does. Guarded by DurabilityGuard (serialized) since
+/// stream-lanes is process-global state; reset to 1 before releasing the guard.
+#[tokio::test]
+async fn e2e_stream_lanes_recover_acked_records() {
+    let _guard = DurabilityGuard::wal();
+    crate::store::set_stream_lanes(3);
+    const SEG: u64 = 4096;
+    let dir = tmp("stream-lanes");
+
+    let h = Harness::boot_with_segment_size(&dir, Some(1), 1, SEG).unwrap();
+    // Enough streams that the FNV lane hash populates more than one lane.
+    let names: Vec<String> = (0..12).map(|i| format!("lane-s{i}")).collect();
+    for n in &names {
+        create_stream(&h.store, n, OCTET).await;
+    }
+    let mut expected: std::collections::HashMap<String, Vec<u8>> = Default::default();
+    for round in 0..40usize {
+        for n in &names {
+            let rec = format!("{n}-r{round:03}|").into_bytes();
+            append_acked(&h.store, n, OCTET, &rec).await;
+            expected.entry(n.clone()).or_default().extend_from_slice(&rec);
+        }
+    }
+    // Checkpoint (per-lane syncfs + recycle), then more acked appends on top.
+    h.walset.shards()[0].checkpoint().await.unwrap();
+    for n in &names {
+        let rec = format!("{n}-post|").into_bytes();
+        append_acked(&h.store, n, OCTET, &rec).await;
+        expected.entry(n.clone()).or_default().extend_from_slice(&rec);
+    }
+
+    h.crash();
+
+    let h2 = Harness::boot_with_segment_size(&dir, None, 1, SEG).unwrap();
+    // Layout sanity: files actually spread across lane subdirs.
+    let lanes_used = (0..3)
+        .filter(|l| {
+            std::fs::read_dir(dir.join("streams").join(l.to_string()))
+                .map(|d| d.flatten().next().is_some())
+                .unwrap_or(false)
+        })
+        .count();
+    assert!(lanes_used >= 2, "expected streams spread over lanes, got {lanes_used}");
+    for n in &names {
+        let got = stream_file_bytes(&h2.store, n);
+        assert_eq!(
+            &got,
+            expected.get(n).unwrap(),
+            "stream {n} recovers byte-identical across lanes"
+        );
+    }
+    h2.crash();
+    // Layout-mismatch guard: reopening this 3-lane dir with a different lane
+    // count must be REFUSED (persisted `.lanes` marker) — a silent mismatch
+    // would make every existing stream invisible.
+    crate::store::set_stream_lanes(2);
+    let err = Store::new_with_tier(dir.clone(), TierConfig::default())
+        .err()
+        .expect("opening a 3-lane layout with --stream-lanes 2 must fail");
+    assert!(
+        err.to_string().contains("stream-lanes"),
+        "mismatch error should name the knob: {err}"
+    );
+    crate::store::set_stream_lanes(1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Cardinality-cliff #1: with `--wal-checkpoint-syncfs on`, the checkpoint makes
+/// touched per-stream files durable via ONE `syncfs()` barrier instead of the
+/// per-stream `fdatasync` loop. This must preserve the durability-before-recycle
+/// guarantee: after a checkpoint recycles the WAL, acked records (both those below
+/// the checkpoint floor, made durable by `syncfs`, and those appended after) must
+/// still recover byte-identically. On Linux this exercises the real `syncfs` path;
+/// on other targets the code falls back to the per-stream loop (still correct).
+#[tokio::test]
+async fn e2e_checkpoint_syncfs_recovers_acked_records() {
+    let _guard = DurabilityGuard::wal();
+    const SEG: u64 = 4096;
+    let dir = tmp("syncfs-ckpt");
+
+    let h = Harness::boot_with_segment_size(&dir, Some(1), 1, SEG).unwrap();
+    create_stream(&h.store, "s", OCTET).await;
+
+    let mut expected = Vec::new();
+    // Enough records + small segments to force at least one roll, so the checkpoint
+    // actually recycles a fully-below-floor segment (relying on the syncfs'd file).
+    for i in 0..400usize {
+        let rec = format!("syncfs-{i:04}|").into_bytes();
+        append_acked(&h.store, "s", OCTET, &rec).await;
+        expected.extend_from_slice(&rec);
+    }
+    // Force the checkpoint → syncfs barrier → recycle.
+    h.walset.shards()[0].checkpoint().await.unwrap();
+    // More acked appends after the checkpoint (live segment).
+    for i in 400..500usize {
+        let rec = format!("syncfs-{i:04}|").into_bytes();
+        append_acked(&h.store, "s", OCTET, &rec).await;
+        expected.extend_from_slice(&rec);
+    }
+
+    h.crash();
+
+    let h2 = Harness::boot_with_segment_size(&dir, None, 1, SEG).unwrap();
+    let got = stream_file_bytes(&h2.store, "s");
+    assert_eq!(
+        got, expected,
+        "syncfs-checkpoint acked records recover byte-identical (durability-before-recycle held)"
+    );
+    h2.crash();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ===========================================================================
 // (7c) WAL-QUIET stream: torn unacked tail truncated via the sidecar proof
 // ===========================================================================

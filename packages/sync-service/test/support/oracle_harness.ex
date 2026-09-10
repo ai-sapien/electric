@@ -56,7 +56,10 @@ defmodule Support.OracleHarness do
   # ----------------------------------------------------------------------------
 
   def default_opts_from_env do
-    [oracle_pool_size: env_int("ORACLE_POOL_SIZE") || @default_oracle_pool_size]
+    [
+      oracle_pool_size: env_int("ORACLE_POOL_SIZE") || @default_oracle_pool_size,
+      restart_type: env_string("RESTART_TYPE") || "graceful"
+    ]
   end
 
   @doc """
@@ -73,6 +76,12 @@ defmodule Support.OracleHarness do
     - :timeout_ms - timeout for waiting on shapes (default: 10_000)
     - :restart_server_every - restart the StackSupervisor every N batches to
       exercise restore-from-disk (default: 0, disabled)
+    - :restart_type - how the server restart is performed: "graceful" (default),
+      "brutal" (crash + recover), or "rolling" (rolling deploy). See
+      `restart_stack/2`. Env: RESTART_TYPE.
+    - :preserve_client_state_on_restart - keep polling clients and their handles
+      through graceful or brutal restarts (default: false). Rolling restarts
+      change the endpoint and require new clients.
     - :restart_client_every - throw away and recreate the shape clients every
       M batches to exercise fresh-poll consistency (default: 0, disabled)
   """
@@ -82,6 +91,7 @@ defmodule Support.OracleHarness do
     timeout_ms = opts[:timeout_ms] || env_int("CHECK_TIMEOUT") || @default_timeout_ms
     restart_server_every = opts[:restart_server_every] || 0
     restart_client_every = opts[:restart_client_every] || 0
+    restart_type = opts[:restart_type] || "graceful"
 
     log_test_config(shapes, batches)
 
@@ -117,11 +127,18 @@ defmodule Support.OracleHarness do
 
         cond do
           restart_server? ->
-            # restart_server tears down the old checkers (they're polling the
-            # server about to go down) and recreates them after the stack is
-            # back up. If a client restart is also due this batch, it's
-            # subsumed by the recreate that follows the server restart.
-            restart_server(ctx, pids, shapes, oracle_pool, timeout_ms, batch_idx)
+            # Server restart normally recreates checkers; recovery compatibility
+            # tests explicitly retain them to exercise the client protocol.
+            restart_server(
+              ctx,
+              pids,
+              shapes,
+              oracle_pool,
+              timeout_ms,
+              batch_idx,
+              restart_type,
+              Keyword.get(opts, :preserve_client_state_on_restart, false)
+            )
 
           restart_client? ->
             new_pids = recreate_checkers(ctx, pids, shapes, oracle_pool, timeout_ms, batch_idx)
@@ -169,88 +186,55 @@ defmodule Support.OracleHarness do
     |> Stream.run()
   end
 
-  # Restarts the Electric stack (server-side restore-from-file test) and
-  # reconnects the clients. Old checkers are stopped because their polls are
-  # against the server that is about to go down.
-  defp restart_server(ctx, pids, shapes, oracle_pool, timeout_ms, batch_idx) do
-    log("Restarting server after batch_#{batch_idx}")
+  # Restart the stack, optionally retaining clients on the same endpoint.
+  defp restart_server(
+         ctx,
+         pids,
+         shapes,
+         oracle_pool,
+         timeout_ms,
+         batch_idx,
+         restart_type,
+         preserve_clients?
+       ) do
+    if preserve_clients? and restart_type == "rolling" do
+      raise ArgumentError, "preserving clients requires a restart on the same endpoint"
+    end
 
-    Enum.each(pids, &GenServer.stop/1)
+    log("Restarting server (#{restart_type}) after batch_#{batch_idx}")
 
-    new_ctx = Map.merge(ctx, Support.ComponentSetup.restart_complete_stack(ctx))
+    if not preserve_clients?, do: Enum.each(pids, &GenServer.stop/1)
 
-    assert_stack_active_after_restart!(new_ctx, timeout_ms, batch_idx)
-    new_pids = recreate_checkers(new_ctx, [], shapes, oracle_pool, timeout_ms, batch_idx)
-    assert_stack_active_after_restart!(new_ctx, timeout_ms, batch_idx)
+    new_ctx = Map.merge(ctx, restart_stack(restart_type, ctx))
+
+    new_pids =
+      if preserve_clients?,
+        do: pids,
+        else: recreate_checkers(new_ctx, [], shapes, oracle_pool, timeout_ms, batch_idx)
 
     {new_pids, new_ctx}
   end
 
-  defp assert_stack_active_after_restart!(ctx, timeout_ms, batch_idx) do
-    case Electric.StatusMonitor.wait_until_active(ctx.stack_id, timeout: timeout_ms) do
-      :ok ->
-        :ok
+  # Restarts the Electric stack according to RESTART_TYPE, returning a ctx-merge
+  # map. Each variant is implemented in `Support.ComponentSetup`:
+  #   - "graceful" - clean stop + restore from disk (default)
+  #   - "brutal"   - kill -9 style crash, then recover the same stack_id
+  #   - "rolling"  - rolling deploy: a new stack takes over the replication slot
+  #                  before the old one is stopped
+  defp restart_stack("graceful", ctx), do: Support.ComponentSetup.restart_complete_stack(ctx)
 
-      error ->
-        pending = pending_causal_consumers(ctx.stack_id)
+  defp restart_stack("brutal", ctx),
+    do: Support.ComponentSetup.brutally_restart_complete_stack(ctx)
 
-        raise "stack did not become active after batch_#{batch_idx}: #{inspect(error)}\n" <>
-                "pending causal consumers: #{inspect(pending, pretty: true, limit: :infinity)}"
-    end
-  end
+  defp restart_stack("rolling", ctx),
+    do: Support.ComponentSetup.rolling_restart_complete_stack(ctx)
 
-  defp pending_causal_consumers(stack_id) do
-    stack_id
-    |> Electric.Shapes.ConsumerRegistry.consumer_snapshot()
-    |> Task.async_stream(
-      fn {shape_handle, pid} ->
-        try do
-          state = :sys.get_state(pid, 1_000)
-
-          case state.causal_drain_waiters do
-            [] ->
-              nil
-
-            waiters ->
-              %{
-                shape_handle: shape_handle,
-                pid: inspect(pid),
-                waiter_targets: Enum.map(waiters, &elem(&1, 1)),
-                pending_initialization?: not is_nil(state.pending_initialization),
-                pending_dependency_subscription?:
-                  not is_nil(state.pending_dependency_subscription),
-                pending_materializer_replay_count: state.pending_materializer_replay_count,
-                pending_materializer_replay_queue: :queue.len(state.pending_materializer_replays),
-                deferred_materializer_move_count: state.deferred_materializer_move_count,
-                deferred_replication_event_count: state.deferred_replication_event_count,
-                pending_txn_xid: state.pending_txn && state.pending_txn.xid,
-                move_transaction_open?: state.move_transaction_open?,
-                pending_move_causal_origin: state.pending_move_causal_origin,
-                root_delivery_tx_offset: state.root_delivery_tx_offset,
-                last_observed_global_lsn: state.last_observed_global_lsn,
-                last_seen_global_lsn: state.last_seen_global_lsn,
-                pending_global_last_seen_lsn: state.pending_global_last_seen_lsn,
-                active_downstream_causal_token?: not is_nil(state.active_downstream_causal_token),
-                completed_downstream_causal_token?:
-                  not is_nil(state.completed_downstream_causal_token)
-              }
-          end
-        catch
-          :exit, reason ->
-            %{shape_handle: shape_handle, pid: inspect(pid), state_error: inspect(reason)}
-        end
-      end,
-      ordered: false,
-      max_concurrency: 32,
-      timeout: 1_500,
-      on_timeout: :kill_task
-    )
-    |> Enum.flat_map(fn
-      {:ok, nil} -> []
-      {:ok, diagnostic} -> [diagnostic]
-      {:exit, reason} -> [%{diagnostic_task_exit: inspect(reason)}]
-    end)
-  end
+  defp restart_stack(other, _ctx),
+    do:
+      raise(
+        ArgumentError,
+        "unknown RESTART_TYPE=#{inspect(other)} (expected \"graceful\", \"brutal\" or \"rolling\")"
+      )
 
   # Throws away the existing checkers and creates fresh ones (client-side
   # resync test). The new checkers do an initial snapshot poll and assert
@@ -370,6 +354,18 @@ defmodule Support.OracleHarness do
           {int, ""} -> int
           _ -> raise "Invalid integer for #{name}=#{inspect(value)}"
         end
+    end
+  end
+
+  @doc """
+  Reads an environment variable as a string.
+  Returns nil if unset or empty.
+  """
+  def env_string(name) do
+    case System.get_env(name) do
+      nil -> nil
+      "" -> nil
+      value -> value
     end
   end
 

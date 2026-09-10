@@ -1,37 +1,13 @@
 defmodule Electric.ShapeCache.Storage do
-  @moduledoc """
-  Behaviour and dispatch layer for shape-log storage adapters.
-
-  Implementations may support ordinary shapes without implementing the optional
-  replay callbacks. Shapes with subquery dependencies additionally require an
-  exact offset-preserving log stream and atomic dependency-move transactions, so
-  adapters serving those shapes must implement `get_log_stream_with_offsets/3`,
-  `begin_move_transaction!/1`, and `commit_move_transaction!/3`.
-
-  Those callbacks remain optional at the behaviour level so existing custom
-  adapters stay source-compatible for ordinary shapes. `ShapeCache` validates
-  the stricter subquery contract before creating a subquery shape and returns a
-  precise error listing any missing callbacks. `get_log_replay_safe_cursor/1`
-  is also optional; its dispatch fallback conservatively treats the adapter's
-  latest offset as the earliest safe replay cursor.
-  """
+  @moduledoc false
   import Electric.Replication.LogOffset, only: [is_log_offset_lt: 2]
 
   alias Electric.Shapes.Shape
   alias Electric.Shapes.Querying
   alias Electric.Replication.LogOffset
 
-  @subquery_required_callbacks [
-    get_log_stream_with_offsets: 3,
-    fetch_root_delivery_tx_offset: 1,
-    begin_move_transaction!: 1,
-    commit_move_transaction!: 3
-  ]
-
   defmodule Error do
     defexception [:message]
-
-    @type t() :: %__MODULE__{message: String.t()}
   end
 
   @type shape_handle :: Electric.shape_handle()
@@ -42,12 +18,6 @@ defmodule Electric.ShapeCache.Storage do
           filter_txns?: boolean()
         }
   @type offset :: LogOffset.t()
-  @typedoc """
-  Per-dependency "moves-applied-up-to" source LSN positions for an outer
-  subquery consumer, keyed by the dependency's shape handle.
-  """
-  @type move_positions :: %{shape_handle() => LogOffset.t()}
-  @type root_delivery_tx_offset :: non_neg_integer() | nil
 
   @type compiled_opts :: term()
   @type shape_opts :: term()
@@ -61,7 +31,6 @@ defmodule Electric.ShapeCache.Storage do
           {LogOffset.t(), key :: String.t(), operation_type :: operation_type(),
            Querying.json_iodata()}
   @type log :: Enumerable.t(Querying.json_iodata())
-  @type offset_log :: Enumerable.t({LogOffset.t() | nil, Querying.json_iodata()})
 
   @typedoc """
   A move-in snapshot row, represented as a 3-element list `[key, tags, json]`:
@@ -107,59 +76,6 @@ defmodule Electric.ShapeCache.Storage do
   @callback fetch_pg_snapshot(shape_opts()) :: {:ok, pg_snapshot() | nil} | {:error, term()}
 
   @callback set_pg_snapshot(pg_snapshot(), shape_opts()) :: :ok
-
-  @doc """
-  Persist the per-dependency moves-applied-up-to positions for an outer
-  subquery consumer.
-  """
-  @callback set_move_positions!(move_positions(), shape_opts()) :: :ok
-
-  @doc """
-  Fetch the per-dependency moves-applied-up-to positions for an outer subquery
-  consumer. Returns `{:ok, %{}}` when none have been persisted yet.
-  """
-  @callback fetch_move_positions(shape_opts()) :: {:ok, move_positions()} | {:error, term()}
-
-  @doc """
-  Fetch the highest PostgreSQL transaction offset whose root-table effects
-  (including a negative routing decision) are durably reflected by this
-  shape's dependency view.
-
-  `nil` means the storage predates this replay-safety metadata. Restored
-  subquery shapes must invalidate that state instead of replaying root changes
-  against a newer dependency view.
-  """
-  @callback fetch_root_delivery_tx_offset(shape_opts()) ::
-              {:ok, root_delivery_tx_offset()} | {:error, term()}
-
-  @doc """
-  Return the earliest exclusive log cursor from which replay is safe.
-
-  Cursors before this value must be invalidated rather than replayed. This can
-  happen when storage predates replay metadata or when compaction has removed
-  history needed to reconstruct generated moves.
-  """
-  @callback get_log_replay_safe_cursor(shape_opts()) :: LogOffset.t()
-
-  @doc """
-  Begin a dependency-move transaction on the writer.
-
-  Storage implementations that support this capability defer publishing both
-  the appended log boundary and dependency positions until
-  `commit_move_transaction!/3` succeeds.
-  """
-  @callback begin_move_transaction!(writer_state()) :: writer_state() | no_return()
-
-  @doc """
-  Atomically publish a dependency-move transaction's log boundary and source
-  positions.
-  """
-  @callback commit_move_transaction!(
-              move_positions(),
-              non_neg_integer(),
-              writer_state()
-            ) ::
-              writer_state() | no_return()
 
   @doc "Check if snapshot for a given shape handle already exists"
   @callback snapshot_started?(shape_opts()) :: boolean()
@@ -254,25 +170,6 @@ defmodule Electric.ShapeCache.Storage do
   @doc "Get stream of the log for a shape since a given offset"
   @callback get_log_stream(offset :: LogOffset.t(), max_offset :: LogOffset.t(), shape_opts()) ::
               log()
-
-  @doc """
-  Get a stream of the log together with the authoritative offsets assigned by
-  storage.
-
-  Main-log entries are returned as `{offset, item}`. Initial snapshot entries
-  have no main-log offset and are returned as `{nil, item}`.
-  """
-  @callback get_log_stream_with_offsets(
-              offset :: LogOffset.t(),
-              max_offset :: LogOffset.t(),
-              shape_opts()
-            ) :: offset_log()
-
-  @optional_callbacks get_log_replay_safe_cursor: 1,
-                      get_log_stream_with_offsets: 3,
-                      begin_move_transaction!: 1,
-                      commit_move_transaction!: 3,
-                      fetch_root_delivery_tx_offset: 1
 
   @doc """
   Get the last exclusive offset of the chunk starting from the given offset.
@@ -424,114 +321,6 @@ defmodule Electric.ShapeCache.Storage do
   end
 
   @impl __MODULE__
-  def set_move_positions!(move_positions, {mod, shape_opts}) do
-    mod.set_move_positions!(move_positions, shape_opts)
-  end
-
-  @impl __MODULE__
-  def fetch_move_positions({mod, shape_opts}) do
-    mod.fetch_move_positions(shape_opts)
-  end
-
-  @impl __MODULE__
-  def fetch_root_delivery_tx_offset({mod, shape_opts}) do
-    if Code.ensure_loaded?(mod) and
-         function_exported?(mod, :fetch_root_delivery_tx_offset, 1) do
-      mod.fetch_root_delivery_tx_offset(shape_opts)
-    else
-      {:ok, nil}
-    end
-  end
-
-  @impl __MODULE__
-  def get_log_replay_safe_cursor({mod, shape_opts}) do
-    if Code.ensure_loaded?(mod) and function_exported?(mod, :get_log_replay_safe_cursor, 1) do
-      mod.get_log_replay_safe_cursor(shape_opts)
-    else
-      case mod.fetch_latest_offset(shape_opts) do
-        {:ok, %LogOffset{} = cursor} ->
-          cursor
-
-        {:error, reason} ->
-          raise Error,
-            message:
-              "Storage adapter #{inspect(mod)} cannot determine a conservative replay-safe cursor: " <>
-                inspect(reason)
-      end
-    end
-  end
-
-  @doc "Return whether a storage writer supports atomic dependency-move transactions."
-  def supports_move_transactions?({mod, _writer_state}) do
-    Code.ensure_loaded?(mod) and
-      function_exported?(mod, :begin_move_transaction!, 1) and
-      function_exported?(mod, :commit_move_transaction!, 3)
-  end
-
-  @doc "Return whether a storage reader supports exact, offset-preserving history reads."
-  def supports_offset_preserving_log_stream?({mod, _shape_opts}) do
-    Code.ensure_loaded?(mod) and function_exported?(mod, :get_log_stream_with_offsets, 3)
-  end
-
-  @doc """
-  Validate the storage capabilities required by a shape.
-
-  Ordinary shapes retain compatibility with storage adapters that predate the
-  subquery replay contract. A shape with dependencies is rejected before cache
-  creation unless its adapter implements every callback needed for exact replay
-  and atomic dependency-move persistence.
-  """
-  @spec validate_shape_capabilities(Shape.t(), storage() | shape_storage()) ::
-          :ok | {:error, Error.t()}
-  def validate_shape_capabilities(%Shape{shape_dependencies: []}, _storage), do: :ok
-
-  def validate_shape_capabilities(%Shape{}, {mod, _opts}) do
-    loaded? = Code.ensure_loaded?(mod)
-
-    missing_callbacks =
-      @subquery_required_callbacks
-      |> Enum.reject(fn {name, arity} -> loaded? and function_exported?(mod, name, arity) end)
-      |> Enum.sort_by(fn {name, arity} -> {Atom.to_string(name), arity} end)
-
-    case missing_callbacks do
-      [] ->
-        :ok
-
-      missing_callbacks ->
-        callbacks = Enum.map_join(missing_callbacks, ", ", &format_callback/1)
-
-        {:error,
-         %Error{
-           message:
-             "Storage adapter #{inspect(mod)} cannot serve subquery shapes; " <>
-               "missing required callbacks: #{callbacks}"
-         }}
-    end
-  end
-
-  defp format_callback({name, arity}), do: "#{name}/#{arity}"
-
-  @impl __MODULE__
-  def begin_move_transaction!({mod, writer_state}) do
-    if supports_move_transactions?({mod, writer_state}) do
-      {mod, mod.begin_move_transaction!(writer_state)}
-    else
-      raise Error,
-        message: "Storage adapter #{inspect(mod)} does not support dependency-move transactions"
-    end
-  end
-
-  @impl __MODULE__
-  def commit_move_transaction!(move_positions, root_delivery_tx_offset, {mod, writer_state}) do
-    if supports_move_transactions?({mod, writer_state}) do
-      {mod, mod.commit_move_transaction!(move_positions, root_delivery_tx_offset, writer_state)}
-    else
-      raise Error,
-        message: "Storage adapter #{inspect(mod)} does not support dependency-move transactions"
-    end
-  end
-
-  @impl __MODULE__
   def snapshot_started?({mod, shape_opts}) do
     mod.snapshot_started?(shape_opts)
   end
@@ -617,31 +406,6 @@ defmodule Electric.ShapeCache.Storage do
   end
 
   def get_log_stream(offset, max_offset, _storage) when is_log_offset_lt(max_offset, offset) do
-    []
-  end
-
-  @doc """
-  Get a shape log stream with the authoritative storage offset for each item.
-
-  The lower bound is exclusive and the upper bound is inclusive, matching
-  `get_log_stream/3`. Snapshot entries are paired with `nil` because they do
-  not have main-log offsets.
-  """
-  @impl __MODULE__
-  def get_log_stream_with_offsets(offset, max_offset \\ @last_log_offset, storage)
-
-  def get_log_stream_with_offsets(offset, max_offset, {mod, shape_opts})
-      when max_offset == @last_log_offset or not is_log_offset_lt(max_offset, offset) do
-    if Code.ensure_loaded?(mod) and function_exported?(mod, :get_log_stream_with_offsets, 3) do
-      mod.get_log_stream_with_offsets(offset, max_offset, shape_opts)
-    else
-      raise Error,
-        message: "Storage adapter #{inspect(mod)} does not support offset-preserving log streams"
-    end
-  end
-
-  def get_log_stream_with_offsets(offset, max_offset, _storage)
-      when is_log_offset_lt(max_offset, offset) do
     []
   end
 

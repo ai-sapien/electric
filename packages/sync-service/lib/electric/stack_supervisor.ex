@@ -102,6 +102,18 @@ defmodule Electric.StackSupervisor do
                    doc:
                      "will be passed on to the Postgrex connection pool. See `t:Postgrex.start_option()`, apart from the connection options."
                  ],
+                 tcp_opts: [
+                   type: :keyword_list,
+                   default: [],
+                   doc:
+                     "TCP-level liveness settings applied to every database connection socket. Any option left unset keeps the OS default.",
+                   keys: [
+                     keepalive_idle: [type: {:or, [:pos_integer, nil]}, default: nil],
+                     keepalive_interval: [type: {:or, [:pos_integer, nil]}, default: nil],
+                     keepalive_count: [type: {:or, [:pos_integer, nil]}, default: nil],
+                     user_timeout: [type: {:or, [:pos_integer, nil]}, default: nil]
+                   ]
+                 ],
                  storage: [type: :mod_arg, required: true],
                  storage_dir: [type: :string, required: true],
                  chunk_bytes_threshold: [
@@ -157,52 +169,14 @@ defmodule Electric.StackSupervisor do
                        type: {:or, [:non_neg_integer, nil]},
                        default: nil
                      ],
+                     http2_max_reset_stream_rate: [
+                       type: {:or, [{:tuple, [:pos_integer, :pos_integer]}, {:in, [:disabled]}]},
+                       default: Electric.Config.default(:http2_max_reset_stream_rate)
+                     ],
                      process_spawn_opts: [type: :map, default: %{}],
                      consumer_gc_heap_threshold: [
                        type: {:or, [:non_neg_integer, nil]},
                        default: Electric.Config.default(:consumer_gc_heap_threshold)
-                     ],
-                     materializer_replay_memory_limit_bytes: [
-                       type: :pos_integer,
-                       default: Electric.Config.default(:materializer_replay_memory_limit_bytes)
-                     ],
-                     materializer_replay_max_pending: [
-                       type: :pos_integer,
-                       default: Electric.Config.default(:materializer_replay_max_pending)
-                     ],
-                     materializer_replay_idle_timeout_ms: [
-                       type: :pos_integer,
-                       default: Electric.Config.default(:materializer_replay_idle_timeout_ms)
-                     ],
-                     materializer_live_max_subscribers: [
-                       type: :pos_integer,
-                       default: Electric.Config.default(:materializer_live_max_subscribers)
-                     ],
-                     materializer_live_backlog_memory_limit_bytes: [
-                       type: :pos_integer,
-                       default:
-                         Electric.Config.default(:materializer_live_backlog_memory_limit_bytes)
-                     ],
-                     materializer_causal_call_timeout_ms: [
-                       type: :pos_integer,
-                       default: Electric.Config.default(:materializer_causal_call_timeout_ms)
-                     ],
-                     causal_drain_max_concurrency: [
-                       type: :pos_integer,
-                       default: Electric.Config.default(:causal_drain_max_concurrency)
-                     ],
-                     causal_drain_timeout_ms: [
-                       type: :pos_integer,
-                       default: Electric.Config.default(:causal_drain_timeout_ms)
-                     ],
-                     subquery_buffer_max_transactions: [
-                       type: :pos_integer,
-                       default: Electric.Config.default(:subquery_buffer_max_transactions)
-                     ],
-                     subquery_deferred_event_memory_limit_bytes: [
-                       type: :pos_integer,
-                       default:
-                         Electric.Config.default(:subquery_deferred_event_memory_limit_bytes)
                      ],
                      consumer_partitions: [type: {:or, [:pos_integer, nil]}, default: nil]
                    ]
@@ -410,36 +384,6 @@ defmodule Electric.StackSupervisor do
     process_spawn_opts = Keyword.fetch!(config.tweaks, :process_spawn_opts)
     consumer_gc_heap_threshold = Keyword.fetch!(config.tweaks, :consumer_gc_heap_threshold)
 
-    materializer_replay_memory_limit_bytes =
-      Keyword.fetch!(config.tweaks, :materializer_replay_memory_limit_bytes)
-
-    materializer_replay_max_pending =
-      Keyword.fetch!(config.tweaks, :materializer_replay_max_pending)
-
-    materializer_replay_idle_timeout_ms =
-      Keyword.fetch!(config.tweaks, :materializer_replay_idle_timeout_ms)
-
-    materializer_live_max_subscribers =
-      Keyword.fetch!(config.tweaks, :materializer_live_max_subscribers)
-
-    materializer_live_backlog_memory_limit_bytes =
-      Keyword.fetch!(config.tweaks, :materializer_live_backlog_memory_limit_bytes)
-
-    materializer_causal_call_timeout_ms =
-      Keyword.fetch!(config.tweaks, :materializer_causal_call_timeout_ms)
-
-    causal_drain_max_concurrency =
-      Keyword.fetch!(config.tweaks, :causal_drain_max_concurrency)
-
-    causal_drain_timeout_ms =
-      Keyword.fetch!(config.tweaks, :causal_drain_timeout_ms)
-
-    subquery_buffer_max_transactions =
-      Keyword.fetch!(config.tweaks, :subquery_buffer_max_transactions)
-
-    subquery_deferred_event_memory_limit_bytes =
-      Keyword.fetch!(config.tweaks, :subquery_deferred_event_memory_limit_bytes)
-
     shape_cache_opts = [
       stack_id: stack_id
     ]
@@ -455,6 +399,7 @@ defmodule Electric.StackSupervisor do
           handle_event: {Electric.Replication.ShapeLogCollector, :handle_event_async, [stack_id]}
         ] ++ config.replication_opts,
       pool_opts: [types: PgInterop.Postgrex.Types] ++ config.pool_opts,
+      tcp_opts: config.tcp_opts,
       timeline_opts: [
         stack_id: stack_id,
         persistent_kv: config.persistent_kv
@@ -491,20 +436,8 @@ defmodule Electric.StackSupervisor do
            flush_stall_grace_period: flush_stall_grace_period,
            process_spawn_opts: process_spawn_opts,
            consumer_gc_heap_threshold: consumer_gc_heap_threshold,
-           materializer_replay_memory_limit_bytes: materializer_replay_memory_limit_bytes,
-           materializer_replay_max_pending: materializer_replay_max_pending,
-           materializer_replay_idle_timeout_ms: materializer_replay_idle_timeout_ms,
-           materializer_live_max_subscribers: materializer_live_max_subscribers,
-           materializer_live_backlog_memory_limit_bytes:
-             materializer_live_backlog_memory_limit_bytes,
-           materializer_causal_call_timeout_ms: materializer_causal_call_timeout_ms,
-           causal_drain_max_concurrency: causal_drain_max_concurrency,
-           causal_drain_timeout_ms: causal_drain_timeout_ms,
-           subquery_buffer_max_transactions: subquery_buffer_max_transactions,
-           subquery_deferred_event_memory_limit_bytes: subquery_deferred_event_memory_limit_bytes,
            feature_flags: Map.get(config, :feature_flags, [])
          ]},
-        {Electric.Shapes.Consumer.Materializer.ReplayCoordinator, stack_id: stack_id},
         {Electric.AsyncDeleter,
          stack_id: stack_id,
          storage_dir: config.storage_dir,

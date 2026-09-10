@@ -13,7 +13,6 @@ defmodule Electric.Shapes.Consumer.EventHandlerBuilder do
   def build(%State{shape: %Shape{shape_dependencies_handles: dep_handles}} = state, action)
       when dep_handles != [] do
     {:ok, dnf_plan} = DnfPlan.compile(state.shape)
-    dependency_move_policy = dependency_move_policy(state.stack_id, state.shape)
 
     {views, dep_handle_to_ref, dep_index_to_ref} =
       dep_handles
@@ -22,18 +21,7 @@ defmodule Electric.Shapes.Consumer.EventHandlerBuilder do
                                          {views, handle_mapping, index_mapping} ->
         materializer_opts = %{stack_id: state.stack_id, shape_handle: handle}
         :ok = Materializer.wait_until_ready(materializer_opts)
-
-        # Seed the dependency view from the value captured at subscribe time
-        # (as-of this consumer's persisted moves-position), so that any moves
-        # the materializer replays are not eliminated as redundant against a
-        # view that already reflects them. Falls back to the materializer's
-        # current link values if no seed was captured (non-restart paths).
-        view =
-          case Map.fetch(state.dep_seed_views, handle) do
-            {:ok, seed_view} -> seed_view
-            :error -> Materializer.get_link_values(materializer_opts)
-          end
-
+        view = Materializer.get_link_values(materializer_opts)
         ref = ["$sublink", Integer.to_string(index)]
 
         {Map.put(views, ref, view), Map.put(handle_mapping, handle, {index, ref}),
@@ -55,8 +43,7 @@ defmodule Electric.Shapes.Consumer.EventHandlerBuilder do
         dnf_plan: dnf_plan,
         ref_resolver:
           Electric.Shapes.Consumer.Subqueries.RefResolver.new(dep_handle_to_ref, dep_index_to_ref),
-        buffer_max_transactions: buffer_max_transactions,
-        dependency_move_policy: dependency_move_policy
+        buffer_max_transactions: buffer_max_transactions
       },
       views: views
     }
@@ -73,15 +60,5 @@ defmodule Electric.Shapes.Consumer.EventHandlerBuilder do
     }
 
     {:ok, handler, [%SetupEffects.SubscribeShape{action: action}]}
-  end
-
-  defp dependency_move_policy(stack_id, _shape) do
-    feature_flags = Electric.StackConfig.lookup(stack_id, :feature_flags, [])
-
-    if "tagged_subqueries" not in feature_flags do
-      :invalidate_on_dependency_move
-    else
-      :stream_dependency_moves
-    end
   end
 end

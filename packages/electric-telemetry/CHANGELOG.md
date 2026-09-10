@@ -1,5 +1,23 @@
 # @core/electric-telemetry
 
+## 0.4.0
+
+### Minor Changes
+
+- 1a50fff: **Breaking change**: renamed several telemetry metric and span attribute names, replacing their non-ASCII `µs`/`μs` microsecond suffix with the plain-ASCII `us`. Some metrics backends (e.g. Mimir/Prometheus) reject metric names containing non-ASCII characters, which previously caused ingestion of the affected metrics to fail. Any dashboards, alerts, or queries referencing the old attribute names (e.g. `shape_db.pool.checkout.queue_time_μs`) need to be updated to the new ASCII names (e.g. `shape_db.pool.checkout.queue_time_us`).
+
+## 0.3.5
+
+### Patch Changes
+
+- 5c5ba9d: Remove the call-home reporter that sent anonymous usage data to checkpoint.electric-sql.com. Electric no longer phones home; the `ELECTRIC_USAGE_REPORTING` and `ELECTRIC_TELEMETRY_URL` environment variables are gone, along with the `call_home_telemetry?` and `telemetry_url` configuration options for embedded use.
+
+## 0.3.4
+
+### Patch Changes
+
+- ca04983: Prevent a dead or stalled shape consumer from pinning the replication slot's `confirmed_flush_lsn` indefinitely, which caused unbounded WAL retention. The collector now monitors the writer behind every pending flush entry — a crashed writer unpins its entry immediately, and a shape making no flush progress past a grace period is challenged and invalidated if it doesn't respond.
+
 ## 0.3.3
 
 ### Patch Changes

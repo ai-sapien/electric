@@ -4,7 +4,6 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
 
   alias Electric.LsnTracker
   alias Electric.Postgres.Lsn
-  alias Electric.Postgres.ReplicationClient
   alias Electric.Replication.PersistentReplicationState
   alias Electric.Replication.ShapeLogCollector
   alias Electric.Replication.Changes.Relation
@@ -23,7 +22,8 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
       patch_calls: 3,
       expect_calls: 2,
       register_as_replication_client: 1,
-      complete_txn_fragment: 3
+      complete_txn_fragment: 3,
+      txn_fragments: 3
     ]
 
   import Support.ComponentSetup
@@ -46,26 +46,9 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
 
   @shape Shape.new!("test_table", inspector: @inspector)
   @shape_handle "the-shape-handle"
-  @failed_lazy_shape_handle "failed-lazy-shape-handle"
-  @healthy_lazy_shape_handle "healthy-lazy-shape-handle"
-
-  @subquery_inspector Support.StubInspector.new(
-                        tables: [{1234, {"public", "test_table"}}, {5678, {"public", "parent"}}],
-                        columns: [%{name: "id", type: "int8", type_id: {20, 1}, pk_position: 0}]
-                      )
-  @subquery_shape Shape.new!("test_table",
-                    inspector: @subquery_inspector,
-                    where: "id IN (SELECT id FROM public.parent)"
-                  )
-  @subquery_shape_handle "subquery-shape-handle"
 
   def setup_log_collector(ctx) do
     %{stack_id: stack_id} = ctx
-
-    if initial_lsn = Map.get(ctx, :initial_lsn) do
-      LsnTracker.set_last_processed_lsn(stack_id, Lsn.from_integer(initial_lsn))
-    end
-
     # Start a test Registry
     registry_name = Module.concat(__MODULE__, Registry)
     start_link_supervised!({Registry, keys: :duplicate, name: registry_name})
@@ -243,60 +226,11 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
       assert xids == [xmin]
     end
 
-    @tag restore_shapes: [{@subquery_shape_handle, @subquery_shape}],
-         inspector: @subquery_inspector
-    test "restored subquery shape routes via fallback before consumer seeds index", ctx do
-      alias Electric.Shapes.Filter.Indexes.SubqueryIndex
-
-      # After restore, the subquery shape should be in fallback because
-      # no consumer has seeded the SubqueryIndex yet.
-      index = SubqueryIndex.for_stack(ctx.stack_id)
-      assert index != nil
-      assert SubqueryIndex.fallback?(index, @subquery_shape_handle)
-
-      parent = self()
-
-      consumer =
-        start_link_supervised!(
-          {Support.TransactionConsumer,
-           [
-             id: 1,
-             stack_id: ctx.stack_id,
-             parent: parent,
-             shape: @subquery_shape,
-             shape_handle: @subquery_shape_handle,
-             stack_id: ctx.stack_id,
-             action: :restore
-           ]}
-        )
-
-      :ok =
-        Electric.Shapes.ConsumerRegistry.register_consumer(
-          consumer,
-          @subquery_shape_handle,
-          ctx.stack_id
-        )
-
-      xmin = 100
-      lsn = Lsn.from_string("0/10")
-      last_log_offset = LogOffset.new(lsn, 0)
-
-      # Any root-table change should route to the shape via fallback,
-      # even if the record wouldn't match the subquery membership.
-      txn =
-        complete_txn_fragment(xmin, lsn, [
-          %Changes.NewRecord{
-            relation: {"public", "test_table"},
-            record: %{"id" => "999"},
-            log_offset: last_log_offset
-          }
-        ])
-
-      assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
-
-      xids = Support.TransactionConsumer.assert_consume([{1, consumer}], [txn])
-      assert xids == [xmin]
-    end
+    # Subquery shapes are pruned (not restored) at the start of the collector's
+    # restore via `ShapeStatus.prune_subquery_shapes/1`. Its effect — the subquery
+    # hierarchy absent from both `ShapeCache.list_shapes/1` and `active_shapes/1`
+    # after a real restart, while plain shapes are retained — is covered by the
+    # "after restart" tests in `shape_cache_test.exs`.
 
     @tag restore_shapes: [{@shape_handle, @shape}, {@shape_handle <> "-2", @shape}],
          inspector: @inspector
@@ -417,78 +351,6 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
     end
 
     @describetag restore_shapes: [{@shape_handle, @shape}], inspector: @inspector
-
-    @tag restore_shapes: [
-           {@failed_lazy_shape_handle, @shape},
-           {@healthy_lazy_shape_handle, @shape}
-         ]
-    test "lazy activation failure does not crash the collector or block healthy flushes", ctx do
-      collector_pid = ShapeLogCollector.name(ctx.stack_id) |> GenServer.whereis()
-      assert is_pid(collector_pid)
-
-      test_pid = self()
-      stack_id = ctx.stack_id
-
-      Repatch.patch(
-        Electric.ShapeCache,
-        :start_consumer_for_handle,
-        [force: true, mode: :shared],
-        fn handle, ^stack_id, _opts ->
-          send(test_pid, {:lazy_consumer_start, handle})
-          {:error, :restore_failed}
-        end
-      )
-
-      healthy_consumer =
-        start_link_supervised!(
-          {Support.TransactionConsumer,
-           id: :healthy_lazy,
-           stack_id: ctx.stack_id,
-           parent: self(),
-           shape: @shape,
-           shape_handle: @healthy_lazy_shape_handle,
-           action: :restore},
-          id: {:consumer, :healthy_lazy}
-        )
-
-      register_as_replication_client(ctx.stack_id)
-
-      lsn = Lsn.from_integer(42)
-      log_offset = LogOffset.new(lsn, 0)
-
-      txn =
-        complete_txn_fragment(100, lsn, [
-          %Changes.NewRecord{
-            relation: {"public", "test_table"},
-            record: %{"id" => "2"},
-            log_offset: log_offset
-          }
-        ])
-
-      assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
-
-      assert_receive {:lazy_consumer_start, @failed_lazy_shape_handle}
-      refute_receive {:lazy_consumer_start, @healthy_lazy_shape_handle}
-
-      assert [100] ==
-               Support.TransactionConsumer.assert_consume(
-                 [{:healthy_lazy, healthy_consumer}],
-                 [txn]
-               )
-
-      assert ^collector_pid = GenServer.whereis(ShapeLogCollector.name(ctx.stack_id))
-      assert Process.alive?(collector_pid)
-
-      ShapeLogCollector.notify_flushed(
-        ctx.stack_id,
-        @healthy_lazy_shape_handle,
-        log_offset
-      )
-
-      expected_lsn = Lsn.to_integer(lsn)
-      assert_receive {:flush_boundary_updated, ^expected_lsn}
-    end
-
     test "consumers are started when receiving a transaction that matches their filter", ctx do
       xmin = 100
       lsn = Lsn.from_string("0/10")
@@ -897,9 +759,11 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
       assert_receive {:flush_boundary_updated, 55}, 50
     end
 
-    @tag initial_lsn: 50
     test "correctly broadcasts flush when transaction has already been processed before", ctx do
       register_as_replication_client(ctx.stack_id)
+
+      LsnTracker.set_last_processed_lsn(ctx.stack_id, Lsn.from_integer(50))
+      assert :ok = ShapeLogCollector.mark_as_ready(ctx.stack_id)
 
       lsn = Lsn.from_integer(20)
       log_offset = LogOffset.new(lsn, 0)
@@ -1221,60 +1085,6 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
       relation = %Relation{id: 1234, table: "test_table", schema: "public", columns: []}
 
       assert {:error, :not_ready} = ShapeLogCollector.handle_event(relation, ctx.stack_id)
-    end
-
-    test "starting processing wakes an event that arrived before the transition without opening external readiness",
-         ctx do
-      Registry.register(
-        Electric.ProcessRegistry.registry_name(ctx.stack_id),
-        {ReplicationClient, nil},
-        nil
-      )
-
-      test_pid = self()
-
-      Repatch.patch(StatusMonitor, :mark_shape_log_collector_ready, [mode: :shared], fn _, _ ->
-        send(test_pid, :external_readiness_opened)
-        :ok
-      end)
-
-      Repatch.allow(self(), GenServer.whereis(ShapeLogCollector.name(ctx.stack_id)))
-
-      txn = complete_txn_fragment(100, Lsn.from_integer(1), [])
-      assert {:error, :not_ready} = ShapeLogCollector.handle_event(txn, ctx.stack_id)
-
-      assert :ok = ShapeLogCollector.start_processing(ctx.stack_id)
-
-      assert_receive {ReplicationClient, :shape_log_collector_processing_started, collector_pid}
-      assert collector_pid == GenServer.whereis(ShapeLogCollector.name(ctx.stack_id))
-      refute_receive :external_readiness_opened
-
-      # Processing readiness is level-triggered. Re-announcing it is
-      # intentional so a receiver that restarted or missed a prior delivery
-      # can repair its local state without opening external health.
-      assert :ok = ShapeLogCollector.start_processing(ctx.stack_id)
-      assert_receive {ReplicationClient, :shape_log_collector_processing_started, ^collector_pid}
-      refute_receive :external_readiness_opened
-
-      assert :ok = ShapeLogCollector.mark_as_ready(ctx.stack_id)
-      assert_receive {ReplicationClient, :shape_log_collector_processing_started, ^collector_pid}
-      assert_receive :external_readiness_opened
-    end
-
-    test "marking externally ready does not replace the processing frontier", ctx do
-      initial_lsn = Lsn.from_integer(10)
-      LsnTracker.set_last_processed_lsn(ctx.stack_id, initial_lsn)
-
-      assert :ok = ShapeLogCollector.start_processing(ctx.stack_id)
-
-      collector_pid = GenServer.whereis(ShapeLogCollector.name(ctx.stack_id))
-      initial_offset = :sys.get_state(collector_pid).last_processed_offset
-
-      LsnTracker.set_last_processed_lsn(ctx.stack_id, Lsn.from_integer(20))
-      assert :ok = ShapeLogCollector.mark_as_ready(ctx.stack_id)
-
-      assert :sys.get_state(collector_pid).last_processed_offset == initial_offset
-      assert initial_offset == LogOffset.new(initial_lsn, :infinity)
     end
   end
 
@@ -1610,21 +1420,6 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
       assert_receive {:global_last_seen_lsn, ^expected_lsn}
     end
 
-    test "an empty committed marker transaction advances global and flush frontiers", ctx do
-      stack_registry = Electric.StackSupervisor.registry_name(ctx.stack_id)
-      Registry.register(stack_registry, :global_lsn_updates, [])
-      register_as_replication_client(ctx.stack_id)
-
-      lsn = Lsn.from_string("0/20")
-      txn = complete_txn_fragment(101, lsn, [])
-
-      assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
-
-      expected_lsn = Lsn.to_integer(lsn)
-      assert_receive {:global_last_seen_lsn, ^expected_lsn}
-      assert_receive {:flush_boundary_updated, ^expected_lsn}
-    end
-
     test "does not broadcast global LSN for non-commit fragments", ctx do
       stack_registry = Electric.StackSupervisor.registry_name(ctx.stack_id)
       Registry.register(stack_registry, :global_lsn_updates, [])
@@ -1651,6 +1446,176 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
       assert :ok = ShapeLogCollector.handle_event(fragment, ctx.stack_id)
 
       refute_receive {:global_last_seen_lsn, _}
+    end
+  end
+
+  describe "public last processed LSN across transaction fragments" do
+    @shape Shape.new!("test_table", inspector: @inspector)
+    # Only matches the second of the two records used below, so it stays
+    # invisible to the EventRouter until the commit fragment arrives.
+    @late_shape Shape.new!("test_table", where: "id > 1", inspector: @inspector)
+
+    setup [:with_registry, :setup_log_collector]
+
+    setup ctx do
+      parent = self()
+
+      stub_inspector(
+        load_relation_oid: fn {"public", "test_table"}, _ ->
+          {:ok, {1234, {"public", "test_table"}}}
+        end,
+        load_relation_info: fn 1234, _ ->
+          {:ok, %{id: 1234, schema: "public", name: "test_table", parent: nil, children: nil}}
+        end,
+        load_column_info: fn 1234, _ ->
+          {:ok, [%{pk_position: 0, name: "id", is_generated: false}]}
+        end
+      )
+
+      consumers =
+        for id <- 1..2 do
+          consumer =
+            start_link_supervised!(%{
+              id: {:consumer, id},
+              start:
+                {Support.TransactionConsumer, :start_link,
+                 [
+                   [
+                     id: id,
+                     stack_id: ctx.stack_id,
+                     parent: parent,
+                     shape: @shape,
+                     shape_handle: "#{@shape_handle}-#{id}"
+                   ]
+                 ]},
+              restart: :temporary
+            })
+
+          {id, consumer}
+        end
+
+      # Start from a non-zero committed frontier so that "the public LSN has not
+      # moved" is distinguishable from "the public LSN was never populated".
+      prev_lsn = Lsn.from_integer(100)
+      :ok = LsnTracker.set_last_processed_lsn(ctx.stack_id, prev_lsn)
+      :ok = ShapeLogCollector.mark_as_ready(ctx.stack_id)
+
+      %{consumers: consumers, prev_lsn: prev_lsn, txn_lsn: Lsn.from_integer(200)}
+    end
+
+    test "stays at the previous transaction until the commit fragment is processed", ctx do
+      %{stack_id: stack_id, consumers: consumers, prev_lsn: prev_lsn, txn_lsn: txn_lsn} = ctx
+
+      [fragment1, fragment2] =
+        txn_fragments(100, txn_lsn, [
+          %{
+            changes: [new_record(txn_lsn, 0, "1"), new_record(txn_lsn, 2, "2")],
+            has_begin?: true
+          },
+          %{changes: [new_record(txn_lsn, 4, "3")], has_commit?: true}
+        ])
+
+      assert :ok = ShapeLogCollector.handle_event(fragment1, stack_id)
+      Support.TransactionConsumer.assert_consume(consumers, [fragment1])
+
+      # Every fragment inherits the transaction's final LSN, but a non-commit
+      # fragment's changes are not readable yet, so publishing that LSN as the
+      # global proof would let a client see proof T before any data at T.
+      assert LsnTracker.get_last_processed_lsn(stack_id) == prev_lsn
+
+      assert :ok = ShapeLogCollector.handle_event(fragment2, stack_id)
+      Support.TransactionConsumer.assert_consume(consumers, [fragment2])
+
+      assert LsnTracker.get_last_processed_lsn(stack_id) == txn_lsn
+    end
+
+    test "stays put when a shape first appears in the commit fragment", ctx do
+      %{stack_id: stack_id, prev_lsn: prev_lsn, txn_lsn: txn_lsn} = ctx
+
+      late_consumer =
+        start_link_supervised!(
+          {Support.TransactionConsumer,
+           id: :late,
+           stack_id: stack_id,
+           parent: self(),
+           shape: @late_shape,
+           shape_handle: "#{@shape_handle}-late"},
+          id: {:consumer, :late}
+        )
+
+      late_consumers = [{:late, late_consumer}]
+
+      [fragment1, fragment2] =
+        txn_fragments(100, txn_lsn, [
+          %{changes: [new_record(txn_lsn, 0, "1")], has_begin?: true},
+          %{changes: [new_record(txn_lsn, 2, "2")], has_commit?: true}
+        ])
+
+      assert :ok = ShapeLogCollector.handle_event(fragment1, stack_id)
+
+      # The EventRouter cannot know yet that this shape takes part in the
+      # transaction, which is exactly why the proof must not advance.
+      Support.TransactionConsumer.refute_consume(late_consumers)
+      assert LsnTracker.get_last_processed_lsn(stack_id) == prev_lsn
+
+      assert :ok = ShapeLogCollector.handle_event(fragment2, stack_id)
+
+      Support.TransactionConsumer.assert_consume(late_consumers, [%{fragment2 | has_begin?: true}])
+
+      assert LsnTracker.get_last_processed_lsn(stack_id) == txn_lsn
+    end
+
+    test "only advances once every participating consumer has handled the commit", ctx do
+      %{stack_id: stack_id, consumers: consumers, prev_lsn: prev_lsn, txn_lsn: txn_lsn} = ctx
+
+      [fragment1, fragment2] =
+        txn_fragments(100, txn_lsn, [
+          %{changes: [new_record(txn_lsn, 0, "1")], has_begin?: true},
+          %{
+            changes: [
+              new_record(txn_lsn, 2, "block-until-released", %{
+                "handle" => "#{@shape_handle}-2"
+              })
+            ],
+            has_commit?: true
+          }
+        ])
+
+      assert :ok = ShapeLogCollector.handle_event(fragment1, stack_id)
+      Support.TransactionConsumer.assert_consume(consumers, [fragment1])
+
+      task = Task.async(fn -> ShapeLogCollector.handle_event(fragment2, stack_id) end)
+
+      assert_receive {Support.TransactionConsumer, {2, _pid}, {:blocked, from}}, 1000
+
+      # The collector is still inside ConsumerRegistry.publish/2 waiting on this
+      # consumer, so the transaction is not durable for every shape yet.
+      assert LsnTracker.get_last_processed_lsn(stack_id) == prev_lsn
+
+      GenServer.reply(from, :ok)
+
+      assert :ok = Task.await(task)
+      assert LsnTracker.get_last_processed_lsn(stack_id) == txn_lsn
+    end
+
+    test "advances on a transaction that affects no shapes", ctx do
+      %{stack_id: stack_id, consumers: consumers, txn_lsn: txn_lsn} = ctx
+
+      # A transaction filtered out entirely still has to move the proof forward,
+      # otherwise clients would stall behind traffic they don't care about.
+      assert :ok =
+               ShapeLogCollector.handle_event(complete_txn_fragment(100, txn_lsn, []), stack_id)
+
+      Support.TransactionConsumer.refute_consume(consumers)
+      assert LsnTracker.get_last_processed_lsn(stack_id) == txn_lsn
+    end
+
+    defp new_record(lsn, op_index, id, extra \\ %{}) do
+      %Changes.NewRecord{
+        relation: {"public", "test_table"},
+        record: Map.merge(%{"id" => id}, extra),
+        log_offset: LogOffset.new(lsn, op_index)
+      }
     end
   end
 

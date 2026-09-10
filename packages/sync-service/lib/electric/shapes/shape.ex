@@ -106,9 +106,8 @@ defmodule Electric.Shapes.Shape do
   for example).
 
   This representation must contain all the information that identifies
-  user-specified properties of the shape. Storage compaction is included because
-  compacted history cannot safely back a dependency materializer that must replay
-  every logical commit; other internal state is omitted.
+  user-specified properties of the shape. We're omitting storage configuration
+  and other internal state.
   """
   @spec comparable(t()) :: comparable()
   def comparable(%__MODULE__{} = shape) do
@@ -116,11 +115,8 @@ defmodule Electric.Shapes.Shape do
      Comparable.comparable(shape.where), shape.selected_columns,
      shape.explicitly_selected_columns,
      Enum.flat_map(shape.flags, fn {k, v} -> if(v, do: [k], else: []) end) |> Enum.sort(),
-     shape.replica, shape.log_mode, comparable_storage_compaction(shape.storage)}
+     shape.replica, shape.log_mode}
   end
-
-  defp comparable_storage_compaction(nil), do: :disabled
-  defp comparable_storage_compaction(%{compaction: compaction}), do: compaction
 
   defguard has_dependencies(shape) when shape.shape_dependencies != []
 
@@ -299,7 +295,6 @@ defmodule Electric.Shapes.Shape do
   defp validate_where_clause(where, %{inspector: inspector} = opts, refs) do
     with {:ok, where} <- Parser.parse_query(where),
          {:ok, subqueries} <- Parser.extract_subqueries(where),
-         :ok <- check_feature_flag(subqueries, opts),
          {:ok, shape_dependencies, sublink_dependency_indexes} <-
            build_shape_dependencies(subqueries, opts),
          {:ok, dependency_refs} <- build_dependency_refs(shape_dependencies, inspector),
@@ -319,15 +314,6 @@ defmodule Electric.Shapes.Shape do
     else
       {:error, {part, reason}} -> {:error, {part, reason}}
       {:error, reason} -> {:error, {:where, reason}}
-    end
-  end
-
-  defp check_feature_flag(subqueries, opts) do
-    if subqueries != [] and
-         not Enum.member?(opts.feature_flags, "allow_subqueries") do
-      {:error, {:where, "Subqueries are not supported"}}
-    else
-      :ok
     end
   end
 
@@ -351,11 +337,6 @@ defmodule Electric.Shapes.Shape do
              |> Map.put(:select, subquery)
              |> Map.put(:autofill_pk_select?, true)
              |> Map.put(:log_mode, :full)
-             # Dependency materializers reconstruct exact historical views for
-             # stale outer cursors. Compaction may discard logical commit
-             # delimiters, so dependencies always own an uncompacted log even
-             # when the requested outer shape opts into compaction.
-             |> Map.put(:storage, %{compaction: :disabled})
              |> new() do
         comparable_shape = comparable(shape_dependency)
 

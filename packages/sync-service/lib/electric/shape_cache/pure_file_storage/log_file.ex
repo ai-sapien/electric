@@ -174,27 +174,52 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
     )
   end
 
+  # Read the log range lazily in bounded blocks rather than all at once.
+  #
+  # Every emitted json is a sub-binary of the block it was read from, and the
+  # response-streaming pipeline can hold an in-flight element (and everything
+  # it references) for the whole lifetime of a serve — including one stalled
+  # on a slow client. Bounding the read block bounds the memory each stalled
+  # connection can pin.
+  @read_block_bytes 64 * 1024
+
   def stream_jsons(
         %PFS{} = opts,
         log_file_path,
         start_position,
         end_position,
-        exclusive_min_offset,
-        project_item \\ &json_only/2
+        exclusive_min_offset
       ) do
-    # We can read ahead entire chunk into memory since chunk sizes are expected to be ~10MB by default,
-    case safely_open_file!(opts, log_file_path, [:read, :raw]) do
-      {:halt, :data_removed} ->
-        []
+    Stream.resource(
+      fn ->
+        case safely_open_file!(opts, log_file_path, [:read, :raw]) do
+          {:ok, file} -> {file, start_position, ""}
+          {:halt, :data_removed} -> :halt
+        end
+      end,
+      fn
+        :halt ->
+          {:halt, []}
 
-      {:ok, file} ->
-        try do
-          with {:ok, data} <- :file.pread(file, start_position, end_position - start_position) do
-            {jsons, _} =
-              extract_jsons_from_binary(data, exclusive_min_offset, nil, project_item)
-
-            jsons
+        {file, position, binary_rest} when position >= end_position ->
+          if binary_rest == "" do
+            {:halt, {file, position, binary_rest}}
           else
+            # A partial entry at the end of the range means the file is
+            # shorter than the chunk index says it should be.
+            raise "unexpected end of file"
+          end
+
+        {file, position, binary_rest} ->
+          read_size = min(@read_block_bytes, end_position - position)
+
+          case :file.pread(file, position, read_size) do
+            {:ok, data} ->
+              {jsons, rest} =
+                extract_jsons_from_binary(binary_rest <> data, exclusive_min_offset, nil)
+
+              {jsons, {file, position + byte_size(data), rest}}
+
             :eof ->
               raise "unexpected end of file"
 
@@ -202,12 +227,14 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
               raise File.Error,
                 path: log_file_path,
                 reason: reason,
-                action: "pread(#{start_position}, #{end_position - start_position})"
+                action: "pread(#{position}, #{read_size})"
           end
-        after
-          File.close(file)
-        end
-    end
+      end,
+      fn
+        [] -> :ok
+        {file, _position, _rest} -> File.close(file)
+      end
+    )
   end
 
   def stream_jsons_until_offset(
@@ -215,228 +242,50 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
         log_file_path,
         start_position,
         exclusive_min_offset,
-        inclusive_max_offset,
-        project_item \\ &json_only/2,
-        read_fun \\ &:file.read/2
+        inclusive_max_offset
       ) do
-    initializer = fn ->
-      initialize_json_stream(
-        opts,
-        [{log_file_path, start_position, exclusive_min_offset, inclusive_max_offset}],
-        []
-      )
-    end
-
-    stream_jsons_from_segment_initializer(
-      initializer,
-      project_item,
-      read_fun
-    )
-  end
-
-  @doc false
-  def stream_jsons_until_offset_from_open_file(
-        %PFS{} = opts,
-        log_file_path,
-        start_position,
-        exclusive_min_offset,
-        inclusive_max_offset,
-        project_item \\ &json_only/2,
-        read_fun \\ &:file.read/2
-      ) do
-    stream_jsons_until_offset(
-      opts,
-      log_file_path,
-      start_position,
-      exclusive_min_offset,
-      inclusive_max_offset,
-      project_item,
-      read_fun
-    )
-  end
-
-  @doc false
-  def stream_jsons_from_segment_initializer(
-        initializer,
-        project_item \\ &json_only/2,
-        read_fun \\ &:file.read/2
-      )
-      when is_function(initializer, 0) and is_function(project_item, 2) and
-             is_function(read_fun, 2) do
     Stream.resource(
-      initializer,
-      &next_json_stream(&1, project_item, read_fun),
-      &close_json_stream/1
+      fn ->
+        case safely_open_file!(opts, log_file_path, [:read, :raw]) do
+          {:ok, file} ->
+            {:ok, ^start_position} = :file.position(file, start_position)
+            {file, ""}
+
+          {:halt, :data_removed} ->
+            :halt
+        end
+      end,
+      fn
+        :halt ->
+          {:halt, []}
+
+        {file, binary_rest} ->
+          case :file.read(file, 4096) do
+            {:ok, data} ->
+              {jsons, rest} =
+                extract_jsons_from_binary(
+                  binary_rest <> data,
+                  exclusive_min_offset,
+                  inclusive_max_offset
+                )
+
+              {jsons, {file, rest}}
+
+            :eof ->
+              {:halt, {file, binary_rest}}
+          end
+      end,
+      fn
+        [] -> :ok
+        {file, _} -> File.close(file)
+      end
     )
   end
 
-  @doc false
-  def initialize_json_stream(%PFS{} = opts, segment_specs, tail)
-      when is_list(segment_specs) and is_list(tail) do
-    case open_json_segments(opts, segment_specs) do
-      {:ok, opened_segments} ->
-        %{
-          segments:
-            Enum.map(opened_segments, fn {file, path, exclusive_min, inclusive_max} ->
-              {file, path, exclusive_min, inclusive_max, ""}
-            end),
-          files: Enum.map(opened_segments, &elem(&1, 0)),
-          tail: tail
-        }
-
-      :halt ->
-        :halt
-    end
-  end
-
-  defp open_json_segments(opts, segment_specs) do
-    Enum.reduce_while(segment_specs, {:ok, []}, fn spec, {:ok, opened} ->
-      try do
-        case open_json_segment(opts, spec) do
-          {:ok, segment} -> {:cont, {:ok, [segment | opened]}}
-          :halt -> {:halt, {:halt, opened}}
-        end
-      rescue
-        exception -> {:halt, {:raise, exception, __STACKTRACE__, opened}}
-      catch
-        kind, reason -> {:halt, {:throw, kind, reason, __STACKTRACE__, opened}}
-      end
-    end)
-    |> case do
-      {:ok, opened} ->
-        {:ok, Enum.reverse(opened)}
-
-      {:halt, opened} ->
-        close_open_json_segments(opened)
-        :halt
-
-      {:raise, exception, stacktrace, opened} ->
-        close_open_json_segments(opened)
-        reraise exception, stacktrace
-
-      {:throw, kind, reason, stacktrace, opened} ->
-        close_open_json_segments(opened)
-        :erlang.raise(kind, reason, stacktrace)
-    end
-  end
-
-  defp open_json_segment(
-         opts,
-         {path, start_position, %LogOffset{} = exclusive_min, %LogOffset{} = inclusive_max}
-       ) do
-    case safely_open_file!(opts, path, [:read, :raw]) do
-      {:ok, file} ->
-        try do
-          case :file.position(file, start_position) do
-            {:ok, ^start_position} ->
-              {:ok, {file, path, exclusive_min, inclusive_max}}
-
-            {:error, reason} ->
-              raise File.Error,
-                path: path,
-                reason: reason,
-                action: "position(#{start_position})"
-          end
-        rescue
-          exception ->
-            File.close(file)
-            reraise exception, __STACKTRACE__
-        catch
-          kind, reason ->
-            File.close(file)
-            :erlang.raise(kind, reason, __STACKTRACE__)
-        end
-
-      {:halt, :data_removed} ->
-        :halt
-    end
-  end
-
-  defp next_json_stream(:halt, _project_item, _read_fun), do: {:halt, :halt}
-
-  defp next_json_stream(%{segments: [], tail: []} = state, _project_item, _read_fun),
-    do: {:halt, state}
-
-  defp next_json_stream(%{segments: [], tail: tail} = state, _project_item, _read_fun),
-    do: {tail, %{state | tail: []}}
-
-  defp next_json_stream(
-         %{segments: [{_file, _path, _exclusive_min, _inclusive_max, :halt} | rest]} = state,
-         project_item,
-         read_fun
-       ) do
-    next_json_stream(%{state | segments: rest}, project_item, read_fun)
-  end
-
-  defp next_json_stream(
-         %{
-           segments: [
-             {file, path, exclusive_min, inclusive_max, binary_rest} = segment | rest
-           ]
-         } = state,
-         project_item,
-         read_fun
-       ) do
-    case read_fun.(file, 4096) do
-      {:ok, data} ->
-        {jsons, next_rest} =
-          extract_jsons_from_binary(
-            binary_rest <> data,
-            exclusive_min,
-            inclusive_max,
-            project_item
-          )
-
-        next_segments =
-          case next_rest do
-            :halt -> rest
-            binary -> [put_elem(segment, 4, binary) | rest]
-          end
-
-        next_state = %{state | segments: next_segments}
-
-        case jsons do
-          [] -> next_json_stream(next_state, project_item, read_fun)
-          _ -> {jsons, next_state}
-        end
-
-      :eof ->
-        next_json_stream(%{state | segments: rest}, project_item, read_fun)
-
-      {:error, reason} ->
-        raise File.Error, path: path, reason: reason, action: "read(4096)"
-    end
-  end
-
-  defp close_json_stream(:halt), do: :ok
-
-  defp close_json_stream(%{files: files}) do
-    Enum.each(files, &File.close/1)
-  end
-
-  defp close_open_json_segments(opened_segments) do
-    Enum.each(opened_segments, fn {file, _path, _exclusive_min, _inclusive_max} ->
-      File.close(file)
-    end)
-  end
-
-  defp json_only(_offset, json), do: json
-
-  @spec extract_jsons_from_binary(
-          binary(),
-          LogOffset.t(),
-          LogOffset.t() | nil,
-          (LogOffset.t(), String.t() -> term())
-        ) :: {list(), binary() | :halt}
-  defp extract_jsons_from_binary(
-         binary,
-         exclusive_min_offset,
-         inclusive_max_offset,
-         project_item,
-         acc \\ []
-       )
-
-  defp extract_jsons_from_binary(<<>>, _, _, _, acc), do: {Enum.reverse(acc), ""}
+  @spec extract_jsons_from_binary(binary(), LogOffset.t(), LogOffset.t() | nil) ::
+          Enumerable.t(String.t())
+  defp extract_jsons_from_binary(binary, exclusive_min_offset, inclusive_max_offset, acc \\ [])
+  defp extract_jsons_from_binary(<<>>, _, _, acc), do: {Enum.reverse(acc), ""}
 
   defp extract_jsons_from_binary(
          <<tx_offset1::64, op_offset1::64, key_size::32, _::binary-size(key_size), _::8, _flag::8,
@@ -446,53 +295,41 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
            op_offset: op_offset2
          } = log_offset,
          inclusive_max_offset,
-         project_item,
          acc
        )
        when tx_offset1 < tx_offset2 or (tx_offset1 == tx_offset2 and op_offset1 <= op_offset2),
-       do: extract_jsons_from_binary(rest, log_offset, inclusive_max_offset, project_item, acc)
+       do: extract_jsons_from_binary(rest, log_offset, inclusive_max_offset, acc)
 
   defp extract_jsons_from_binary(
          <<tx_offset1::64, op_offset1::64, key_size::32, _::binary-size(key_size), _::8, _flag::8,
            json_size::64, json::binary-size(json_size), _::binary>>,
-         _log_offset,
-         %LogOffset{tx_offset: tx_offset2, op_offset: op_offset2},
-         project_item,
+         log_offset,
+         %LogOffset{tx_offset: tx_offset2, op_offset: op_offset2} = inclusive_max_offset,
          acc
        )
        when tx_offset1 == tx_offset2 and op_offset1 == op_offset2,
-       do: {
-         Enum.reverse([
-           project_item.(LogOffset.new(tx_offset1, op_offset1), json) | acc
-         ]),
-         :halt
-       }
+       do: extract_jsons_from_binary("", log_offset, inclusive_max_offset, [json | acc])
 
   defp extract_jsons_from_binary(
          <<tx_offset1::64, op_offset1::64, key_size::32, _::binary-size(key_size), _::8, _flag::8,
            json_size::64, _json::binary-size(json_size), _::binary>>,
-         _log_offset,
-         %LogOffset{tx_offset: tx_offset2, op_offset: op_offset2},
-         _project_item,
+         log_offset,
+         %LogOffset{tx_offset: tx_offset2, op_offset: op_offset2} = inclusive_max_offset,
          acc
        )
        when tx_offset1 > tx_offset2 or (tx_offset1 == tx_offset2 and op_offset1 > op_offset2),
-       do: {Enum.reverse(acc), :halt}
+       do: extract_jsons_from_binary("", log_offset, inclusive_max_offset, acc)
 
   defp extract_jsons_from_binary(
-         <<tx_offset::64, op_offset::64, key_size::32, _::binary-size(key_size), _::8, _flag::8,
-           json_size::64, json::binary-size(json_size), rest::binary>>,
+         <<_::128, key_size::32, _::binary-size(key_size), _::8, _flag::8, json_size::64,
+           json::binary-size(json_size), rest::binary>>,
          log_offset,
          inclusive_max_offset,
-         project_item,
          acc
        ),
-       do:
-         extract_jsons_from_binary(rest, log_offset, inclusive_max_offset, project_item, [
-           project_item.(LogOffset.new(tx_offset, op_offset), json) | acc
-         ])
+       do: extract_jsons_from_binary(rest, log_offset, inclusive_max_offset, [json | acc])
 
-  defp extract_jsons_from_binary(rest, _, _, _, acc),
+  defp extract_jsons_from_binary(rest, _, _, acc),
     do: {Enum.reverse(acc), rest}
 
   defp get_op_type(:insert), do: ?i

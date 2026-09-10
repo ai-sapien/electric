@@ -10,6 +10,9 @@ on:
       - packages/elixir-client/**
       - packages/sync-service/**
       - scripts/ci/test-sapien-sync-service.sh
+  pull_request:
+    branches:
+      - sapien/shape-startup
   workflow_dispatch:
 
 permissions:
@@ -22,22 +25,22 @@ jobs:
   test:
     name: Test Sapien sync-service changes
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
-      ERL_FLAGS: "+S 4:4"
+      ERL_FLAGS: '+S 4:4'
     steps:
       - uses: actions/checkout@v4
 
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.20.2"
-          otp-version: "29.0.2"
+          elixir-version: '1.20.2'
+          otp-version: '29.0.2'
 
       - name: Start Postgres test services
         working-directory: packages/sync-service/dev
         run: docker compose up --detach --wait postgres postgres2 pgbouncer
 
-      - name: Run focused sync-service tests
+      - name: Run server and client compatibility tests
         run: scripts/ci/test-sapien-sync-service.sh
 
       - name: Stop Postgres test services
@@ -48,6 +51,7 @@ jobs:
   publish:
     name: Publish multi-platform image
     needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -75,11 +79,14 @@ jobs:
         shell: bash
         run: |
           short_sha="${GITHUB_SHA:0:12}"
-          echo "version=1.7.7-sapien.${short_sha}" >> "$GITHUB_OUTPUT"
+          version="$(jq -r .version packages/sync-service/package.json)"
+          echo "version=${version}-sapien.${short_sha}" >> "$GITHUB_OUTPUT"
           {
             echo "tags<<EOF"
             echo "${IMAGE}:sapien-${short_sha}"
-            echo "${IMAGE}:sapien-latest"
+            if [[ "${GITHUB_REF}" == "refs/heads/sapien/shape-startup" ]]; then
+              echo "${IMAGE}:sapien-latest"
+            fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -93,7 +100,6 @@ jobs:
             electric-telemetry=packages/electric-telemetry
           build-args: |
             ELECTRIC_VERSION=${{ steps.image.outputs.version }}
-            SAPIEN_BANDIT_HTTP1_CLOSE_PATCH=true
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: mode=max

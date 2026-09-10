@@ -440,37 +440,27 @@ defmodule Electric.ClientTest do
             assert query_params[k] == v
           end
 
-          conn =
-            bypass_resp(conn, "[]",
-              shape_handle: "my-shape",
-              last_offset: "1234_0",
-              schema: Jason.encode!(%{"id" => %{type: "text"}, "value" => %{type: "text"}})
-            )
-
           send(parent, {:request, query_params})
-          conn
+
+          bypass_resp(conn, "[]",
+            shape_handle: "my-shape",
+            last_offset: "1234_0",
+            schema: Jason.encode!(%{"id" => %{type: "text"}, "value" => %{type: "text"}})
+          )
         end
       )
 
-      {:ok, task_pid} =
-        Task.start(fn ->
-          stream |> Stream.take(1) |> Enum.to_list()
-        end)
+      Task.start_link(fn ->
+        stream |> Stream.take(1) |> Enum.to_list()
+      end)
 
-      task_ref = Process.monitor(task_pid)
-
-      try do
-        receive do
-          {:request, _query} ->
-            :ok
-        after
-          500 ->
-            # the asserts in the bypass handler just trigger a retry loop
-            flunk("did not receive the expected query parameters")
-        end
+      receive do
+        {:request, _query} ->
+          :ok
       after
-        Process.exit(task_pid, :kill)
-        assert_receive {:DOWN, ^task_ref, :process, ^task_pid, _reason}, 1000
+        500 ->
+          # the asserts in the bypass handler just trigger a retry loop
+          flunk("did not receive the expected query parameters")
       end
     end
 

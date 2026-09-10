@@ -51,27 +51,42 @@ defmodule Electric.ConfigTest do
       Electric.Application.api_server()
     end
 
-    @tag skip: System.get_env("SAPIEN_BANDIT_HTTP1_CLOSE_PATCH") != "true"
-    test "api server advertises the configured final HTTP/1 response" do
+    test "api_server/1 maps tcp_read_timeout to a top-level ThousandIsland option" do
+      [{Bandit, bandit_opts}] = Electric.Application.api_server(tcp_read_timeout: 180_000)
+
+      assert bandit_opts[:thousand_island_options][:read_timeout] == 180_000
+
+      [{Bandit, default_opts}] = Electric.Application.api_server([])
+      refute Keyword.has_key?(default_opts[:thousand_island_options], :read_timeout)
+    end
+
+    test "api_server/1 applies conn_max_requests to HTTP/1 connections only" do
+      [{Bandit, bandit_opts}] = Electric.Application.api_server(tweaks: [conn_max_requests: 50])
+
+      assert bandit_opts[:http_1_options][:max_requests] == 50
+      refute Keyword.has_key?(bandit_opts[:http_2_options], :max_requests)
+
+      [{Bandit, default_opts}] = Electric.Application.api_server([])
+      refute Keyword.has_key?(default_opts[:http_1_options], :max_requests)
+      refute Keyword.has_key?(default_opts[:http_2_options], :max_requests)
+    end
+
+    test "api_server/1 disables Bandit's HTTP/2 reset-stream rate limit by default" do
+      [{Bandit, default_opts}] = Electric.Application.api_server([])
+
+      assert Keyword.fetch!(default_opts[:http_2_options], :max_reset_stream_rate) == nil
+    end
+
+    test "api_server/1 applies http2_max_reset_stream_rate when configured" do
       [{Bandit, bandit_opts}] =
-        Electric.Application.api_server(Bandit,
-          service_port: 0,
-          tweaks: [conn_max_requests: 1]
-        )
+        Electric.Application.api_server(tweaks: [http2_max_reset_stream_rate: {500, 10_000}])
 
-      {:ok, server_pid} = start_supervised({Bandit, bandit_opts})
-      {:ok, {_ip, port}} = ThousandIsland.listener_info(server_pid)
-      {:ok, socket} = :gen_tcp.connect(~c"localhost", port, [:binary, active: false])
-      on_exit(fn -> :gen_tcp.close(socket) end)
+      assert bandit_opts[:http_2_options][:max_reset_stream_rate] == {500, 10_000}
 
-      :ok =
-        :gen_tcp.send(
-          socket,
-          "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
-        )
+      [{Bandit, disabled_opts}] =
+        Electric.Application.api_server(tweaks: [http2_max_reset_stream_rate: :disabled])
 
-      response = receive_until_closed(socket)
-      assert response =~ "\r\nconnection: close\r\n"
+      assert Keyword.fetch!(disabled_opts[:http_2_options], :max_reset_stream_rate) == nil
     end
 
     test "configuration/1", ctx do
@@ -216,6 +231,28 @@ defmodule Electric.ConfigTest do
     end
   end
 
+  describe "parse_http2_max_reset_stream_rate/1" do
+    import Electric.Config, only: [parse_http2_max_reset_stream_rate: 1]
+
+    test "parses <count>/<duration>" do
+      assert {:ok, {500, 10_000}} = parse_http2_max_reset_stream_rate("500/10s")
+      assert {:ok, {50, 1_000}} = parse_http2_max_reset_stream_rate("50/1000ms")
+      assert {:ok, {1, 60_000}} = parse_http2_max_reset_stream_rate("1/1m")
+    end
+
+    test "accepts disabled" do
+      assert {:ok, :disabled} = parse_http2_max_reset_stream_rate("disabled")
+      assert {:ok, :disabled} = parse_http2_max_reset_stream_rate("DISABLED")
+    end
+
+    test "rejects invalid input" do
+      for input <- ["", "500", "0/10s", "-5/10s", "abc/10s", "500/abc", "500/0s", "500/10s/1"] do
+        assert {:error, msg} = parse_http2_max_reset_stream_rate(input)
+        assert msg =~ "invalid HTTP/2 reset stream rate"
+      end
+    end
+  end
+
   describe "validations" do
     test "configuring deprecated FileStorage raises" do
       assert_raise RuntimeError, ~r/FileStorage storage is deprecated/, fn ->
@@ -223,13 +260,6 @@ defmodule Electric.ConfigTest do
           storage: {Electric.ShapeCache.FileStorage, storage_dir: "./persistent"}
         )
       end
-    end
-  end
-
-  defp receive_until_closed(socket, buffer \\ "") do
-    case :gen_tcp.recv(socket, 0, 1_000) do
-      {:ok, bytes} -> receive_until_closed(socket, buffer <> bytes)
-      {:error, :closed} -> buffer
     end
   end
 
@@ -246,6 +276,16 @@ defmodule Electric.ConfigTest do
       end)
 
       [initial_config: initial_config]
+    end
+
+    test "configuration/1 is accepted by the StackSupervisor options schema", ctx do
+      config =
+        Electric.Application.configuration(
+          Keyword.take(ctx.initial_config, [:replication_connection_opts])
+        )
+
+      assert {:ok, _} =
+               NimbleOptions.validate(Map.new(config), Electric.StackSupervisor.opts_schema())
     end
 
     test "consumer_gc_heap_threshold opt is threaded into tweaks", ctx do
@@ -269,31 +309,6 @@ defmodule Electric.ConfigTest do
         )
 
       assert Keyword.fetch!(config[:tweaks], :consumer_gc_heap_threshold) == nil
-    end
-
-    test "subquery replay and causal safety overrides are threaded into tweaks", ctx do
-      overrides = [
-        materializer_replay_memory_limit_bytes: 1_001,
-        materializer_replay_max_pending: 102,
-        materializer_replay_idle_timeout_ms: 1_003,
-        materializer_live_max_subscribers: 104,
-        materializer_live_backlog_memory_limit_bytes: 1_005,
-        materializer_causal_call_timeout_ms: 1_006,
-        causal_drain_max_concurrency: 107,
-        causal_drain_timeout_ms: 1_008,
-        subquery_buffer_max_transactions: 109,
-        subquery_deferred_event_memory_limit_bytes: 1_010
-      ]
-
-      config =
-        Electric.Application.configuration(
-          Keyword.merge(
-            Keyword.take(ctx.initial_config, [:replication_connection_opts]),
-            overrides
-          )
-        )
-
-      assert Keyword.take(config[:tweaks], Keyword.keys(overrides)) == overrides
     end
   end
 end

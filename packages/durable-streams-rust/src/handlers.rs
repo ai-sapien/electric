@@ -44,7 +44,7 @@ pub enum DurabilityMode {
     #[default]
     Wal,
     /// No WAL, no fsync: ack on the page-cache write. Durability comes from replication
-    /// (future). Linux-only (binary appends use zero-copy socket→file).
+    /// (future).
     Memory,
 }
 
@@ -585,6 +585,7 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
                 let lock_t0 = crate::telemetry::Timer::start();
                 let mut ap = st.appender.lock().await;
                 crate::telemetry::record_append_lock_wait(lock_t0.elapsed_secs());
+                let pre_written = ap.written;
                 let new_tail = match write_wire(&st, &mut ap, &wire) {
                     Ok(t) => t,
                     Err(_) => return text_response(500, "write failed"),
@@ -599,7 +600,19 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
                 // durability wait runs after the lock is dropped.
                 let staged_lsn = match stage_for_durability(&store, &st, &wire, stream_offset) {
                     Ok(lsn) => lsn,
-                    Err(_) => return text_response(500, "wal stage failed"),
+                    Err(_) => {
+                        // ROLL BACK the data-file write: the bytes were 500'd but
+                        // already sit in the file — left in place they would be
+                        // durably resurrected by the next successful append /
+                        // checkpoint (client told "failed", bytes served anyway).
+                        let _ = ap.file.set_len(pre_written);
+                        ap.written = pre_written;
+                        {
+                            let mut sh = st.shared.write().unwrap();
+                            sh.tail = sh.file_base + pre_written;
+                        }
+                        return text_response(500, "wal stage failed");
+                    }
                 };
                 drop(ap);
                 if let Some(lsn) = staged_lsn {
@@ -735,7 +748,16 @@ async fn wait_durable_lsn(store: &Arc<Store>, st: &Arc<StreamState>, lsn: u64) {
 /// awaited in `wait_durable_lsn`.
 fn write_wire(st: &StreamState, ap: &mut Appender, wire: &Bytes) -> std::io::Result<u64> {
     use std::io::Write;
-    (&*ap.file).write_all(wire)?;
+    if let Err(e) = (&*ap.file).write_all(wire) {
+        // A partial write (ENOSPC mid-slice) leaves garbage bytes in the file
+        // PAST `ap.written` while the logical offsets don't advance — every
+        // later append would land after the garbage (O_APPEND) with a logical
+        // offset that assumes it landed at `ap.written`: silent, permanent
+        // offset desync for all subsequent data. Truncate back to the exact
+        // pre-write length so physical == logical again.
+        let _ = ap.file.set_len(ap.written);
+        return Err(e);
+    }
     ap.written += wire.len() as u64;
     let tail = {
         let mut s = st.shared.write().unwrap();
@@ -896,6 +918,9 @@ async fn handle_append(store: Arc<Store>, req: Req, path: String) -> Resp {
 
 async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp, AppendOutcome, bool) {
     use AppendOutcome::*;
+    // Load-telemetry probe: bumps the in-flight gauge and records service time on
+    // drop (covers every return path). No-op unless `--server-stats` is on.
+    let _probe = crate::srvstats::AppendProbe::start();
     let st = match store.get(&path) {
         Some(s) => s,
         None => return (text_response(404, "stream not found"), Conflict, false),
@@ -950,8 +975,10 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
     // Serialize per stream: producer validation + write + state update under one
     // lock. Time the wait separately — lock contention is a key bottleneck.
     let lock_t0 = crate::telemetry::Timer::start();
+    let srv_lock_t0 = std::time::Instant::now();
     let mut ap = st.appender.lock().await;
     crate::telemetry::record_append_lock_wait(lock_t0.elapsed_secs());
+    crate::srvstats::record_applock_wait(srv_lock_t0.elapsed());
 
     // Closed checks (precedence: closed → seq regression → gap).
     {
@@ -1077,12 +1104,36 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
     // readers only AFTER durability (below), so a live reader never observes
     // bytes a crash could roll back (PROTOCOL.md §4.1).
     let mut new_tail = None;
+    let pre_written = ap.written;
+    // Pre-mutation snapshots for the stage-failure rollback below: a 500'd
+    // append must leave NO trace — neither bytes (resurrected by the next
+    // append/checkpoint) nor producer/seq dedup state (which would swallow the
+    // client's retry as a duplicate: silent loss from the client's view).
+    let (prev_producer, prev_seq_header) = {
+        let sh = st.shared.read().unwrap();
+        (
+            producer
+                .as_ref()
+                .map(|p| (p.id.clone(), sh.producers.get(&p.id).cloned())),
+            sh.last_seq_header.clone(),
+        )
+    };
     if !wire.is_empty() {
         match write_wire(&st, &mut ap, &wire) {
             Ok(t) => new_tail = Some(t),
             Err(_) => ret!(text_response(500, "write failed"), Conflict),
         }
     }
+    // Does this append change state the memory-mode sidecar must persist? Captured
+    // BEFORE `seq_header` is consumed below. Producer/seq updates are idempotency
+    // state; a TTL stream's sliding `last_access` must survive restart (mirrors the
+    // read path, which marks dirty only for TTL streams). A plain append to a non-TTL stream changes
+    // only `durable_tail`/`last_access`. In BOTH modes the durable tail is carried
+    // elsewhere (memory: re-derived from the data-file length on restart; wal: the
+    // checkpoint's per-shard `tails` map), and `last_access` only gates TTL — so a
+    // plain non-TTL append needs no sidecar flush at all (cardinality-cliff #1).
+    let meta_persist_needed =
+        producer.is_some() || seq_header.is_some() || st.config.ttl_seconds.is_some();
     {
         let mut s = st.shared.write().unwrap();
         if let Some(p) = &producer {
@@ -1121,7 +1172,39 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
     let staged_lsn = if !wire.is_empty() {
         match stage_for_durability(&store, &st, &wire, stream_offset) {
             Ok(lsn) => lsn,
-            Err(_) => ret!(text_response(500, "wal stage failed"), Conflict),
+            Err(_) => {
+                // ROLL BACK everything this append changed (still under the
+                // appender lock, so no concurrent appender observed it):
+                // 1) the data-file bytes — otherwise the next successful append
+                //    advances the durable frontier over them and they are served
+                //    (and checkpoint-persisted) despite the 500;
+                // 2) the in-memory tail;
+                // 3) producer/seq/closed state — otherwise the client's RETRY of
+                //    this failed append is deduplicated as "already seen" and
+                //    silently dropped.
+                let _ = ap.file.set_len(pre_written);
+                ap.written = pre_written;
+                {
+                    let mut sh = st.shared.write().unwrap();
+                    sh.tail = sh.file_base + pre_written;
+                    if let Some((id, prev)) = &prev_producer {
+                        match prev {
+                            Some(ps) => {
+                                sh.producers.insert(id.clone(), ps.clone());
+                            }
+                            None => {
+                                sh.producers.remove(id);
+                            }
+                        }
+                    }
+                    sh.last_seq_header = prev_seq_header.clone();
+                    if close_req {
+                        sh.closed = false;
+                        sh.closed_by = None;
+                    }
+                }
+                ret!(text_response(500, "wal stage failed"), Conflict)
+            }
         }
     } else {
         None
@@ -1130,7 +1213,9 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
 
     // Wait for durability off the lock before exposing the bytes.
     if let Some(lsn) = staged_lsn {
+        let dur_t0 = std::time::Instant::now();
         wait_durable_lsn(&store, &st, lsn).await;
+        crate::srvstats::record_durwait(dur_t0.elapsed());
     }
 
     // Durable now (wal) / page-cache written (memory): expose the new bytes to
@@ -1165,11 +1250,35 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
         // saturation) plus a timer task OFF the per-append path. Producer/access
         // updates are already documented as a non-durable, lagging flush; the lag
         // bound moves from the 100 ms debounce to the checkpoint cadence.
-        st.meta_dirty.store(true, std::sync::atomic::Ordering::Release);
-    } else {
-        // No WAL record staged (memory durability): no checkpoint will flush the
-        // sidecar — keep the debounced flush.
-        st.schedule_meta_flush();
+        //
+        // GATED (cardinality-cliff #1): only mark when the append changed state
+        // the sidecar must persist — producer/seq idempotency or a sliding TTL.
+        // A plain append still gets its fdatasync AND its `durable_tail` recorded
+        // in the checkpoint's per-shard `tails` map (register_dirty + the
+        // unconditional `persist_durable_tails`, independent of this flag) — and
+        // that map, not the sidecar, is the authoritative durable-tail proof
+        // recovery reconciles against (see wal/shard.rs step 3a, wal/recovery.rs).
+        // `last_access` only gates TTL. So a plain non-TTL append needs no sidecar
+        // rewrite here — dropping it removes the O(touched) `write_meta_sync` calls
+        // that dominate the checkpoint's meta phase at high stream cardinality.
+        if meta_persist_needed {
+            st.meta_dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
+    } else if meta_persist_needed {
+        // No WAL record staged (memory durability): no checkpoint will flush
+        // the sidecar — queue it for the store-level periodic sweeper. Same
+        // batched treatment the wal branch above gets from the checkpoint: no
+        // per-stream timer task, no per-append sidecar rewrite (#4691).
+        //
+        // Only queued when the append actually changed state the sidecar must
+        // persist — producer/seq idempotency or a sliding TTL. A plain append to
+        // a non-TTL stream changes only `durable_tail`/`last_access`, and
+        // memory-mode recovery reads NEITHER (the tail is re-derived from the
+        // data-file length in `Store::new_with_tier`; `last_access` only gates
+        // TTL expiry, which these streams don't have). Skipping the queue for
+        // that common case removes the per-append sidecar rewrite whose cost
+        // stops amortizing at high stream cardinality.
+        store.mark_meta_dirty(&st);
     }
     if !wire.is_empty() {
         maybe_seal_bg(&store, &st);
@@ -1297,6 +1406,13 @@ fn stream_resolved_body(
         }
         for sl in slices {
             match sl {
+                ResolvedSlice::Missing => {
+                    // Poison slice (unreadable sealed chunk): abort the
+                    // connection — a response missing interior bytes must never
+                    // terminate cleanly.
+                    fail();
+                    return;
+                }
                 ResolvedSlice::Local(seg) => {
                     // Window the (possibly large) local slice so we never hold
                     // more than COLD_LOCAL_WINDOW of it in memory at once.
@@ -1369,6 +1485,12 @@ async fn materialize_resolved(
     out.put_slice(prefix);
     for sl in slices {
         match sl {
+            ResolvedSlice::Missing => {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    "sealed chunk unreadable (poison slice)",
+                ));
+            }
             ResolvedSlice::Local(seg) => {
                 let want = seg.len;
                 let bytes = tokio::task::spawn_blocking(move || {
@@ -1416,7 +1538,7 @@ async fn handle_read(store: Arc<Store>, req: Req, path: String) -> Resp {
     // non-TTL streams to keep their read path lock-free.
     if st.config.ttl_seconds.is_some() {
         st.touch();
-        st.schedule_meta_flush(); // sliding TTL must survive restarts
+        store.mark_meta_dirty(&st); // sliding TTL must survive restarts
     }
     let q = match parse_query(req.query.as_deref()) {
         Ok(q) => q,
@@ -1595,7 +1717,19 @@ async fn handle_long_poll(
                 }
             }
             _ = tokio::time::sleep(deadline.saturating_duration_since(Instant::now())) => {
+                // Deadline hit — but re-check the tail EXACTLY like the
+                // closed-channel arm above. Returning a timeout that advertises
+                // the fresh tail as `Stream-Next-Offset` while NOT delivering
+                // the bytes behind it silently SKIPS data: an append whose
+                // durable-tail publish lands inside the deadline window gets
+                // jumped over (the client adopts the header offset from every
+                // response, including empty 204s) and is never delivered.
+                // Invariant: a long-poll response never advances the client's
+                // offset beyond the bytes it actually delivered.
                 let t = st.tail();
+                if t.bytes > from {
+                    return long_poll_data(&st, from, t, client_cursor, true, cache_hit).await;
+                }
                 return long_poll_timeout(t.bytes, cursor, t.closed);
             }
         }
@@ -2239,6 +2373,184 @@ mod memory_mode_tests {
             "per-stream file must hold the appended bytes"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #4691: a memory-mode append must NOT flush the meta sidecar via a
+    /// per-stream debounced timer (100 ms sleep + spawn_blocking per stream —
+    /// ~5x wal-mode CPU at high stream cardinality). It only marks the stream
+    /// dirty; the store-level periodic sweeper writes the sidecar in batch,
+    /// mirroring wal mode's checkpoint treatment from #4675.
+    #[tokio::test]
+    async fn memory_append_defers_sidecar_to_store_sweep() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("mem-sweep");
+        let store = Arc::new(
+            Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap(),
+        );
+
+        let resp = handle(Arc::clone(&store), put_req("m/s", "application/octet-stream")).await;
+        assert!((200..300).contains(&resp.status), "create: {}", resp.status);
+
+        // Append with a producer so the pending sidecar change is observable.
+        let mut req = post_req("m/s", "application/octet-stream", b"payload");
+        req.headers.push(("producer-id".into(), "p1".into()));
+        req.headers.push(("producer-epoch".into(), "1".into()));
+        req.headers.push(("producer-seq".into(), "0".into()));
+        let resp = handle(Arc::clone(&store), req).await;
+        assert!((200..300).contains(&resp.status), "append: {}", resp.status);
+
+        // Well past the old 100 ms debounce: the sidecar must still be
+        // unwritten — no per-append timer task may exist anymore.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let st = store.get("m/s").unwrap();
+        let meta: crate::store::Meta =
+            serde_json::from_slice(&std::fs::read(crate::store::meta_path(&st.file_path)).unwrap())
+                .unwrap();
+        assert!(
+            !meta.producers.contains_key("p1"),
+            "sidecar was flushed per-append (debounce timer still active)"
+        );
+
+        // The batched store sweep is what persists it.
+        let flushed = tokio::task::spawn_blocking({
+            let store = Arc::clone(&store);
+            move || store.sweep_meta_once()
+        })
+        .await
+        .unwrap();
+        assert_eq!(flushed, 1, "the appended stream is swept");
+        let meta: crate::store::Meta =
+            serde_json::from_slice(&std::fs::read(crate::store::meta_path(&st.file_path)).unwrap())
+                .unwrap();
+        assert!(
+            meta.producers.contains_key("p1"),
+            "sweep must persist the pending producer state"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cardinality-cliff fix (#1): a PLAIN append (no producer/seq, non-TTL
+    /// stream) in memory mode must NOT queue a sidecar flush. The tail is
+    /// recovered from the data-file length and `last_access` only gates TTL, so
+    /// the per-append sidecar rewrite is pure overhead whose cost stops
+    /// amortizing at high stream cardinality. Contrast
+    /// `memory_append_defers_sidecar_to_store_sweep`, which uses a producer
+    /// append and therefore still marks dirty.
+    #[tokio::test]
+    async fn memory_plain_append_skips_sidecar_flush() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("mem-plain-noflush");
+        let store =
+            Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+
+        let resp = handle(Arc::clone(&store), put_req("m/p", "application/octet-stream")).await;
+        assert!((200..300).contains(&resp.status), "create: {}", resp.status);
+        // Drain anything the create queued so we measure only the append's effect.
+        let store2 = Arc::clone(&store);
+        let _ = tokio::task::spawn_blocking(move || store2.sweep_meta_once())
+            .await
+            .unwrap();
+
+        // Plain append: no producer headers, non-TTL stream.
+        let resp = handle(
+            Arc::clone(&store),
+            post_req("m/p", "application/octet-stream", b"payload"),
+        )
+        .await;
+        assert!((200..300).contains(&resp.status), "append: {}", resp.status);
+
+        let flushed = tokio::task::spawn_blocking({
+            let store = Arc::clone(&store);
+            move || store.sweep_meta_once()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            flushed, 0,
+            "a plain non-TTL memory-mode append must not queue a sidecar flush"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Long-poll deadline/data race (conformance flake root cause): a long-poll
+    /// response must NEVER advance `Stream-Next-Offset` past the client's `from`
+    /// without delivering the bytes in between — otherwise an append whose
+    /// durable-tail publish lands inside the deadline window is advertised but
+    /// not sent, and the client skips it forever. This drives many iterations of
+    /// an append racing a long-poll whose deadline is aligned with the append
+    /// (the conformance suite's exact shape, tightened) and asserts the
+    /// invariant on every response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn long_poll_timeout_never_skips_observed_data() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        crate::handlers::set_long_poll_timeout(20);
+        let dir = tmp("lp-race");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+
+        let resp = handle(Arc::clone(&store), put_req("lp/r", "application/octet-stream")).await;
+        assert!((200..300).contains(&resp.status), "create: {}", resp.status);
+
+        let next_offset = |r: &crate::api::Resp| -> u64 {
+            r.headers
+                .iter()
+                .find(|(k, _)| *k == "stream-next-offset")
+                .map(|(_, v)| v.rsplit('_').next().unwrap().parse().unwrap())
+                .unwrap_or(0)
+        };
+        let mut from: u64 = 0;
+        for i in 0..200u32 {
+            // Long-poll from the current offset...
+            let lp = tokio::spawn(handle(
+                Arc::clone(&store),
+                Req {
+                    method: Method::Get,
+                    path: "lp/r".to_string(),
+                    query: Some(format!("live=long-poll&offset={:016}_{:016}", 0, from)),
+                    headers: vec![],
+                    body: Bytes::new(),
+                },
+            ));
+            // ...and race an append onto the deadline (spread over the window).
+            tokio::time::sleep(std::time::Duration::from_millis(15 + (i % 10) as u64))
+                .await;
+            let ar = handle(
+                Arc::clone(&store),
+                post_req("lp/r", "application/octet-stream", b"x"),
+            )
+            .await;
+            assert!((200..300).contains(&ar.status), "append: {}", ar.status);
+            let r = lp.await.unwrap();
+            let next = next_offset(&r);
+            let has_body = !matches!(r.body, crate::api::Body::Empty);
+            assert!(
+                has_body || next <= from,
+                "iteration {i}: empty long-poll response advanced the offset \
+                 {from} -> {next} without delivering data (status {})",
+                r.status
+            );
+            // Catch up for the next round.
+            from = from.max(next);
+            if !has_body && next == from {
+                // ensure we don't fall behind the appends
+                let t_resp = handle(
+                    Arc::clone(&store),
+                    Req {
+                        method: Method::Get,
+                        path: "lp/r".to_string(),
+                        query: Some(format!("offset={:016}_{:016}", 0, from)),
+                        headers: vec![],
+                        body: Bytes::new(),
+                    },
+                )
+                .await;
+                from = from.max(next_offset(&t_resp));
+            }
+        }
+
+        crate::handlers::set_long_poll_timeout(30_000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -75,27 +75,13 @@ defmodule Electric.Shapes.ApiTest do
   defp send_cache_headers?(ctx), do: Access.get(ctx, :send_cache_headers?, true)
   defp api_encoder(ctx), do: Access.get(ctx, :api_encoder, Electric.Shapes.Api.Encoder.Term)
 
-  defp with_shape_activation(_ctx) do
-    test_pid = self()
-
-    patch_shape_cache(
-      start_consumer_for_handle: fn shape_handle, stack_id, _opts ->
-        send(test_pid, {:shape_activated, shape_handle, stack_id})
-        {:ok, self()}
-      end
-    )
-
-    :ok
-  end
-
   setup [
     :with_stack_id_from_test,
     :with_registry,
     :with_persistent_kv,
     :with_pure_file_storage,
     :with_status_monitor,
-    :with_shape_cleaner,
-    :with_shape_activation
+    :with_shape_cleaner
   ]
 
   describe "validate/2" do
@@ -772,7 +758,6 @@ defmodule Electric.Shapes.ApiTest do
       )
 
       test_pid = self()
-      stack_id = ctx.stack_id
       next_offset = LogOffset.increment(@test_offset)
 
       patch_storage(for_shape: fn @test_shape_handle, _opts -> @test_opts end)
@@ -808,7 +793,6 @@ defmodule Electric.Shapes.ApiTest do
         end)
 
       ref = Process.monitor(task.pid)
-      assert_receive {:shape_activated, @test_shape_handle, ^stack_id}, @receive_timeout
       assert_receive :got_log_stream, @receive_timeout
 
       # Simulate new changes arriving
@@ -838,76 +822,6 @@ defmodule Electric.Shapes.ApiTest do
       assert response.up_to_date
       # Ensure registered listener is cleaned up after body is read
       assert [] == Registry.lookup(ctx.registry, @test_shape_handle)
-    end
-
-    test "one SSE notification drains every committed chunk through its final delimiter", ctx do
-      patch_shape_cache(
-        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
-          {@test_shape_handle, @test_offset}
-        end,
-        has_shape?: fn @test_shape_handle, _opts -> true end,
-        await_snapshot_start: fn @test_shape_handle, _ -> :started end
-      )
-
-      test_pid = self()
-      intermediate_offset = LogOffset.increment(@test_offset)
-      final_offset = LogOffset.increment(intermediate_offset)
-
-      patch_storage(for_shape: fn @test_shape_handle, _opts -> @test_opts end)
-
-      expect_storage(
-        get_chunk_end_log_offset: fn @test_offset, _ -> @test_offset end,
-        get_log_stream: fn @test_offset, @test_offset, @test_opts ->
-          send(test_pid, :sse_waiting)
-          []
-        end,
-        get_log_stream: fn @test_offset, ^final_offset, @test_opts ->
-          [
-            Jason.encode!(%{
-              key: "row",
-              value: %{"id" => "1"},
-              headers: %{operation: "insert"},
-              offset: intermediate_offset
-            }),
-            Jason.encode!(%{
-              headers: %{event: "move-out", patterns: [], txids: [], last: true},
-              offset: final_offset
-            })
-          ]
-        end
-      )
-
-      task =
-        Task.async(fn ->
-          assert {:ok, request} =
-                   Api.validate(
-                     ctx.api,
-                     %{
-                       table: "public.users",
-                       offset: "#{@test_offset}",
-                       handle: @test_shape_handle,
-                       live: true,
-                       live_sse: true
-                     }
-                   )
-
-          response = Api.serve_shape_response(request)
-          {response, Enum.take(response.body, 9) |> IO.iodata_to_binary()}
-        end)
-
-      assert_receive :sse_waiting, @receive_timeout
-
-      Registry.dispatch(ctx.registry, @test_shape_handle, fn [{pid, ref}] ->
-        send(pid, {ref, :new_changes, final_offset})
-      end)
-
-      assert {response, sse_body} = Task.await(task)
-      assert response.status == 200
-      assert response.chunked
-      assert sse_body =~ ~S|"key":"row"|
-      assert sse_body =~ ~S|"event":"move-out"|
-      assert sse_body =~ ~S|"last":true|
-      assert sse_body =~ ~S|"control":"up-to-date"|
     end
 
     test "raises if body is read from a different process", ctx do

@@ -984,26 +984,6 @@ defmodule Electric.Shapes.ShapeTest do
   end
 
   describe "subquery dependency construction" do
-    test "forces replay dependencies to keep uncompacted history" do
-      inspector =
-        Support.StubInspector.new(%{
-          "item" => [%{name: "id", pk_position: 0}],
-          "rel" => [%{name: "id", pk_position: 0}]
-        })
-
-      assert {:ok,
-              %Shape{
-                storage: %{compaction: :enabled},
-                shape_dependencies: [%Shape{storage: %{compaction: :disabled}}]
-              }} =
-               Shape.new("item",
-                 inspector: inspector,
-                 feature_flags: ["allow_subqueries"],
-                 storage: %{compaction: :enabled},
-                 where: "id IN (SELECT id FROM rel)"
-               )
-    end
-
     test "does not deduplicate subqueries with different projected columns" do
       inspector =
         Support.StubInspector.new(%{
@@ -1020,7 +1000,6 @@ defmodule Electric.Shapes.ShapeTest do
       assert {:ok, %Shape{where: where, shape_dependencies: dependencies}} =
                Shape.new("item",
                  inspector: inspector,
-                 feature_flags: ["allow_subqueries"],
                  where:
                    "id IN (SELECT a FROM rel WHERE kind = 'k') OR id IN (SELECT b FROM rel WHERE kind = 'k')"
                )
@@ -1303,34 +1282,6 @@ defmodule Electric.Shapes.ShapeTest do
 
       refute Shape.comparable(shape1) == Shape.comparable(shape2)
       refute Shape.comparable(shape1) === Shape.comparable(shape2)
-    end
-
-    test "storage compaction affects equivalence so dependencies cannot reuse compacted history",
-         %{inspector: inspector} do
-      {:ok, compacted} =
-        Shape.new(~S|the_table|,
-          inspector: inspector,
-          storage: %{compaction: :enabled}
-        )
-
-      {:ok, replay_safe} =
-        Shape.new(~S|the_table|,
-          inspector: inspector,
-          storage: %{compaction: :disabled}
-        )
-
-      refute Shape.comparable(compacted) == Shape.comparable(replay_safe)
-    end
-
-    test "legacy nil storage compares as the normalized disabled configuration",
-         %{inspector: inspector} do
-      {:ok, replay_safe} =
-        Shape.new(~S|the_table|,
-          inspector: inspector,
-          storage: %{compaction: :disabled}
-        )
-
-      assert Shape.comparable(%{replay_safe | storage: nil}) == Shape.comparable(replay_safe)
     end
   end
 

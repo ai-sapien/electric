@@ -65,19 +65,10 @@ defmodule Electric.ShapeCache do
           handle_position() | {:error, term()}
   def get_or_create_shape_handle(shape, stack_id, opts \\ []) when is_stack_id(stack_id) do
     # Get or create the shape handle and fire a snapshot if necessary
-    with :ok <- Storage.validate_shape_capabilities(shape, Storage.for_stack(stack_id)),
-         {:ok, handle} <- fetch_handle_by_shape(shape, stack_id),
+    with {:ok, handle} <- fetch_handle_by_shape(shape, stack_id),
          {:ok, offset} <- fetch_latest_offset(stack_id, handle) do
       {handle, offset}
     else
-      {:error, %Storage.Error{} = error} ->
-        Logger.error("Cannot create shape: #{Exception.message(error)}",
-          stack_id: stack_id,
-          root_table: inspect(shape.root_table)
-        )
-
-        {:error, error}
-
       :error ->
         GenServer.call(
           name(stack_id),
@@ -255,7 +246,7 @@ defmodule Electric.ShapeCache do
   end
 
   @spec start_consumer_for_handle(shape_handle(), stack_id(), opts :: Access.t()) ::
-          {:ok, pid()} | {:error, term()}
+          {:ok, pid()} | {:error, :no_shape}
   def start_consumer_for_handle(shape_handle, stack_id, opts \\ [])
       when is_shape_handle(shape_handle) and is_stack_id(stack_id) do
     GenServer.call(
@@ -281,9 +272,7 @@ defmodule Electric.ShapeCache do
       name: opts.name,
       stack_id: stack_id,
       subscription: nil,
-      feature_flags: Electric.StackConfig.lookup(stack_id, :feature_flags, []),
-      restore_catalog_ready?: false,
-      pending_create_requests: :queue.new()
+      feature_flags: Electric.StackConfig.lookup(stack_id, :feature_flags, [])
     }
 
     {:ok, state, {:continue, :wait_for_restore}}
@@ -293,50 +282,17 @@ defmodule Electric.ShapeCache do
   def handle_continue(:wait_for_restore, state) do
     start_time = System.monotonic_time()
 
+    total_recovered = ShapeStatus.count_shapes(state.stack_id)
+
     Electric.Replication.PublicationManager.wait_for_restore(state.stack_id)
 
-    # Snapshot the recovered catalog before making ShapeCache callable again.
-    # Once the restore worker runs concurrently, a brand-new shape may be
-    # inserted by an API request; treating that shape as recovered would start
-    # its consumer twice and register a duplicate collector filter.
-    recovered_shapes = ShapeStatus.list_shapes(state.stack_id)
-    total_recovered = length(recovered_shapes)
+    # Shapes involved in a subquery are dropped rather than restored on restart
+    # (see `ShapeStatus.prune_subquery_shapes/1`, called from ShapeLogCollector's
+    # restore before any routing or consumer state is rebuilt), so there is
+    # nothing to eagerly start here.
 
-    {:ok, _pid} =
-      Task.start_link(fn ->
-        activate_mocked_functions_from_test_process()
-        Process.set_label({:shape_cache_restore, state.stack_id})
-        Logger.metadata(stack_id: state.stack_id)
-        restore_consumers(state, recovered_shapes, total_recovered, start_time)
-      end)
-
-    {:noreply, state}
-  end
-
-  defp restore_consumers(state, recovered_shapes, total_recovered, start_time) do
-    # Start the entire restored dependency graph before opening replication,
-    # but do not await stale dependency replay yet. Replay may need the
-    # collector to redeliver root transactions and publish its post-layer LSN
-    # frontier; awaiting first creates a circular wait after an interrupted
-    # dependency move. Consumers bound and defer replication while their replay
-    # seed is still initializing.
-    initiated_consumers = initiate_subquery_shape_consumers(state, recovered_shapes)
-
-    # Every restored Consumer is now registered, so the collector can safely
-    # redeliver the persistent-slot tail. Deferred replay/root work is ordered
-    # inside each Consumer by source transaction.
-    ShapeLogCollector.start_processing(state.stack_id)
-    GenServer.cast(state.name, :shape_restore_catalog_ready)
-
-    # Preserve fail-closed restore semantics: a Consumer that cannot finish
-    # initialization is purged so clients refetch it instead of serving a stale
-    # persisted shape. This wait happens only after replication can make the
-    # initialization progress it may require.
-    await_initiated_consumers(initiated_consumers, recovered_shapes, state)
-
-    # Processing must start before dependency replay can finish, but external
-    # readiness must remain closed until every restored consumer has either
-    # reached a consistent frontier or been purged.
+    # Let ShapeLogCollector that it can start processing after finishing this function so that
+    # we're subscribed to the producer before it starts forwarding its demand.
     ShapeLogCollector.mark_as_ready(state.stack_id)
 
     duration = System.monotonic_time() - start_time
@@ -350,217 +306,28 @@ defmodule Electric.ShapeCache do
       %{duration: duration, total: total_recovered},
       %{stack_id: state.stack_id}
     )
-  end
 
-  # Shapes whose where clause contains a subquery (`shape_dependencies != []`)
-  # rely on their materializer subscription to be notified of dependency-side
-  # changes. The router only delivers events for a shape when its own
-  # `root_table` changes, so a subquery dependent stays dormant after a
-  # restart until something writes to its own table — movements driven by
-  # the dependency (e.g. parent rows becoming active) never reach its
-  # on-disk view. Restoring it here re-establishes the materializer
-  # subscription so dependency updates flow in.
-  #
-  # Initialization is intentionally two-phase. First start every Consumer and
-  # dependency Materializer without waiting, then (after the collector is
-  # marked ready) await each Consumer below. Starting in dependency order keeps
-  # Materializer subscriptions connected while allowing all levels of a nested
-  # graph to exist before replication resumes.
-  defp initiate_subquery_shape_consumers(state, recovered_shapes) do
-    opts = %{
-      stack_id: state.stack_id,
-      action: :restore,
-      otel_ctx: nil,
-      feature_flags: state.feature_flags
-    }
-
-    recovered_shapes
-    |> Enum.reduce(%{}, fn
-      {handle, %Shape{shape_dependencies: [_ | _]} = shape}, initiated ->
-        if is_nil(Electric.Shapes.ConsumerRegistry.whereis(state.stack_id, handle)) do
-          case initiate_shape_and_dependencies(handle, shape, opts) do
-            {:ok, consumers} -> Map.merge(initiated, consumers)
-            {:error, consumers} -> Map.merge(initiated, consumers)
-          end
-        else
-          initiated
-        end
-
-      {_handle, _shape}, initiated ->
-        initiated
-    end)
-  end
-
-  defp initiate_shape_and_dependencies(shape_handle, shape, opts) do
-    case build_shape_dependencies(
-           shape_handle,
-           shape,
-           true,
-           opts.stack_id,
-           MapSet.new(),
-           []
-         ) do
-      {:ok, _known, dependencies} ->
-        dependencies
-        |> Enum.reverse()
-        |> Enum.reduce_while({:ok, %{}}, fn {handle, shape, start_shape_opts}, {:ok, acc} ->
-          case Electric.Shapes.ConsumerRegistry.whereis(opts.stack_id, handle) do
-            pid when is_pid(pid) ->
-              {:cont, {:ok, Map.put(acc, handle, pid)}}
-
-            nil ->
-              case start_shape(handle, shape, Map.merge(opts, start_shape_opts)) do
-                {:ok, pid} -> {:cont, {:ok, Map.put(acc, handle, pid)}}
-                :error -> {:halt, {:error, handle, acc}}
-              end
-          end
-        end)
-        |> case do
-          {:ok, consumers} ->
-            {:ok, consumers}
-
-          {:error, failed_handle, consumers} ->
-            if failed_handle != shape_handle do
-              Logger.warning(
-                "Failed to initiate restored shape: descendant consumer failed to start",
-                shape_handle: shape_handle,
-                failed_handle: failed_handle
-              )
-
-              clean_shape(shape_handle, opts.stack_id)
-            end
-
-            # Consumers started earlier in the dependency graph still need to
-            # cross the restore frontier (or be purged) before readiness opens.
-            {:error, consumers}
-        end
-
-      {:error, missing_handle} ->
-        Logger.warning("Failed to initiate restored shape: persisted dependency is missing",
-          shape_handle: shape_handle,
-          missing_handle: missing_handle
-        )
-
-        clean_shape(shape_handle, opts.stack_id)
-        {:error, %{}}
-    end
-  end
-
-  defp await_initiated_consumers(initiated_consumers, recovered_shapes, state) do
-    restored_dependents = restored_dependents(recovered_shapes)
-
-    # ShapeStatus returns dependencies before their outers. Remove a failed
-    # restore closure in the opposite order so every dependent is stopped
-    # before the dependency materializer it subscribes to disappears.
-    purge_order = recovered_shapes |> Enum.reverse() |> Enum.map(&elem(&1, 0))
-
-    Enum.reduce(initiated_consumers, MapSet.new(), fn {handle, _pid}, purged_handles ->
-      if MapSet.member?(purged_handles, handle) do
-        purged_handles
-      else
-        result =
-          try do
-            Electric.Shapes.Consumer.await_snapshot_start(state.stack_id, handle)
-          catch
-            :exit, reason -> {:error, reason}
-          end
-
-        case result do
-          :started ->
-            purged_handles
-
-          {:error, reason} ->
-            purge_failed_restored_consumer(
-              handle,
-              reason,
-              restored_dependents,
-              purge_order,
-              purged_handles,
-              state
-            )
-        end
-      end
-    end)
-  end
-
-  defp restored_dependents(recovered_shapes) do
-    Enum.reduce(recovered_shapes, %{}, fn {dependent_handle, shape}, dependents ->
-      Enum.reduce(shape.shape_dependencies_handles, dependents, fn dependency_handle,
-                                                                   dependents ->
-        Map.update(
-          dependents,
-          dependency_handle,
-          MapSet.new([dependent_handle]),
-          &MapSet.put(&1, dependent_handle)
-        )
-      end)
-    end)
-  end
-
-  defp restored_failure_closure(failed_handle, restored_dependents) do
-    restored_failure_closure([failed_handle], restored_dependents, MapSet.new())
-  end
-
-  defp restored_failure_closure([], _restored_dependents, visited), do: visited
-
-  defp restored_failure_closure([handle | remaining], restored_dependents, visited) do
-    if MapSet.member?(visited, handle) do
-      restored_failure_closure(remaining, restored_dependents, visited)
-    else
-      dependent_handles =
-        restored_dependents
-        |> Map.get(handle, MapSet.new())
-        |> MapSet.to_list()
-
-      restored_failure_closure(
-        dependent_handles ++ remaining,
-        restored_dependents,
-        MapSet.put(visited, handle)
-      )
-    end
-  end
-
-  defp purge_failed_restored_consumer(
-         handle,
-         reason,
-         restored_dependents,
-         purge_order,
-         purged_handles,
-         state
-       ) do
-    failure_closure = restored_failure_closure(handle, restored_dependents)
-    newly_purged = MapSet.difference(failure_closure, purged_handles)
-
-    handles = Enum.filter(purge_order, &MapSet.member?(newly_purged, &1))
-
-    Logger.warning(
-      "Eager subquery consumer await failed for #{handle}: #{inspect(reason)}; " <>
-        "purging the failed shape and its restored dependents to force a clean refetch",
-      purged_shape_handles: handles
-    )
-
-    if handles != [] do
-      :ok = ShapeCleaner.remove_shapes(state.stack_id, handles)
-    end
-
-    MapSet.union(purged_handles, failure_closure)
+    {:noreply, state}
   end
 
   @impl GenServer
-  def handle_call(
-        {:create_or_wait_shape_handle, shape, otel_ctx},
-        from,
-        %{restore_catalog_ready?: false} = state
-      ) do
-    # Keep lazy restore calls responsive, but do not let a brand-new shape race
-    # the collector's initial ShapeStatus scan and get registered twice.
-    pending = :queue.in({from, shape, otel_ctx}, state.pending_create_requests)
-    {:noreply, %{state | pending_create_requests: pending}}
-  end
-
   def handle_call({:create_or_wait_shape_handle, shape, otel_ctx}, _from, state) do
-    {reply, state} = create_or_wait_shape_handle(shape, otel_ctx, state)
-    {:reply, reply, state}
+    if not is_nil(otel_ctx), do: OpenTelemetry.set_current_context(otel_ctx)
+
+    case safe_maybe_create_shape(shape, %{
+           stack_id: state.stack_id,
+           otel_ctx: otel_ctx,
+           feature_flags: state.feature_flags
+         }) do
+      {:ok, {shape_handle, latest_offset}} ->
+        Logger.debug("Returning shape id #{shape_handle} for shape #{inspect(shape)}")
+        {:reply, {shape_handle, latest_offset}, state}
+
+      {:error, reason} ->
+        Logger.warning("Failed to create shape for #{inspect(shape)}: #{inspect(reason)}")
+
+        {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call({:has_shape_handle?, shape_handle}, _from, state) do
@@ -575,58 +342,14 @@ defmodule Electric.ShapeCache do
     # from the broadcast.
     if not is_nil(otel_ctx), do: OpenTelemetry.set_current_context(otel_ctx)
 
-    case ShapeStatus.fetch_shape_by_handle(state.stack_id, shape_handle) do
-      {:ok, shape} ->
-        {
-          :reply,
-          restore_shape_and_dependencies(shape_handle, shape, %{
-            stack_id: state.stack_id,
-            action: :restore,
-            otel_ctx: otel_ctx,
-            feature_flags: state.feature_flags
-          }),
-          state
-        }
+    opts = %{
+      stack_id: state.stack_id,
+      otel_ctx: otel_ctx,
+      feature_flags: state.feature_flags
+    }
 
-      :error ->
-        {:reply, {:error, :no_shape}, state}
-    end
-  end
-
-  @impl GenServer
-  def handle_cast(:shape_restore_catalog_ready, state) do
-    state = %{state | restore_catalog_ready?: true}
-
-    state =
-      state.pending_create_requests
-      |> :queue.to_list()
-      |> Enum.reduce(%{state | pending_create_requests: :queue.new()}, fn
-        {from, shape, otel_ctx}, state ->
-          {reply, state} = create_or_wait_shape_handle(shape, otel_ctx, state)
-          GenServer.reply(from, reply)
-          state
-      end)
-
-    {:noreply, state}
-  end
-
-  defp create_or_wait_shape_handle(shape, otel_ctx, state) do
-    if not is_nil(otel_ctx), do: OpenTelemetry.set_current_context(otel_ctx)
-
-    case safe_maybe_create_shape(shape, %{
-           stack_id: state.stack_id,
-           otel_ctx: otel_ctx,
-           feature_flags: state.feature_flags
-         }) do
-      {:ok, {shape_handle, latest_offset}} ->
-        Logger.debug("Returning shape id #{shape_handle} for shape #{inspect(shape)}")
-        {{shape_handle, latest_offset}, state}
-
-      {:error, reason} ->
-        Logger.warning("Failed to create shape for #{inspect(shape)}: #{inspect(reason)}")
-
-        {{:error, reason}, state}
-    end
+    result = try_restoring_shape_and_dependencies(state.stack_id, shape_handle, opts)
+    {:reply, result, state}
   end
 
   defp safe_maybe_create_shape(shape, opts) do
@@ -647,9 +370,13 @@ defmodule Electric.ShapeCache do
     # fetch_handle_by_shape_critical is a slower but guaranteed consistent
     # shape lookup
     with {:ok, shape_handle} <- ShapeStatus.fetch_handle_by_shape_critical(stack_id, shape),
-         {:ok, offset} <- fetch_latest_offset(stack_id, shape_handle) do
+         {:ok, offset} <- fetch_latest_offset(stack_id, shape_handle),
+         :ok <- ensure_inner_consumer_running(shape_handle, opts) do
       {:ok, {shape_handle, offset}}
     else
+      {:error, _reason} = error ->
+        error
+
       :error ->
         with {:ok, shape_handles} <- safe_maybe_create_inner_shapes(shape, opts) do
           shape = %{shape | shape_dependencies_handles: shape_handles}
@@ -672,6 +399,26 @@ defmodule Electric.ShapeCache do
     end
   end
 
+  # An existing inner shape may have no running consumer: a subquery dependency whose parent
+  # was removed survives `ShapeStatus.prune_subquery_shapes/1` on restart as a plain shape,
+  # and consumers for restored shapes only start lazily on transaction routing.
+  defp ensure_inner_consumer_running(
+         shape_handle,
+         %{is_subquery_shape?: true, stack_id: stack_id} = opts
+       ) do
+    consumer_pid = Shapes.ConsumerRegistry.whereis(stack_id, shape_handle)
+
+    if consumer_pid do
+      :ok
+    else
+      with {:ok, _pid} <- try_restoring_shape_and_dependencies(stack_id, shape_handle, opts) do
+        :ok
+      end
+    end
+  end
+
+  defp ensure_inner_consumer_running(_shape_handle, _opts), do: :ok
+
   defp safe_maybe_create_inner_shapes(%Shape{shape_dependencies: []}, _opts) do
     {:ok, []}
   end
@@ -682,52 +429,24 @@ defmodule Electric.ShapeCache do
     with {:ok, handles} <-
            Enum.reduce_while(shape_dependencies, {:ok, []}, fn inner_shape, {:ok, handles} ->
              case safe_maybe_create_shape(inner_shape, inner_opts) do
-               {:ok, {handle, _offset}} ->
-                 case ensure_shape_consumer_started(handle, inner_opts) do
-                   {:ok, _pid} -> {:cont, {:ok, [handle | handles]}}
-                   {:error, _reason} = error -> {:halt, error}
-                 end
-
-               {:error, _reason} = error ->
-                 {:halt, error}
+               {:ok, {handle, _offset}} -> {:cont, {:ok, [handle | handles]}}
+               {:error, _reason} = error -> {:halt, error}
              end
            end) do
       {:ok, Enum.reverse(handles)}
     end
   end
 
-  defp ensure_shape_consumer_started(shape_handle, %{stack_id: stack_id} = opts) do
-    case Electric.Shapes.ConsumerRegistry.whereis(stack_id, shape_handle) do
-      nil ->
-        # Persisted dependencies have metadata but no live consumer after a restart. Restore the
-        # canonical dependency tree before a new outer shape starts materializers that subscribe to it.
-        case ShapeStatus.fetch_shape_by_handle(stack_id, shape_handle) do
-          {:ok, persisted_shape} ->
-            restore_shape_and_dependencies(
-              shape_handle,
-              persisted_shape,
-              Map.put(opts, :action, :restore)
-            )
-
-          :error ->
-            {:error, :no_shape}
-        end
-
-      pid when is_pid(pid) ->
-        {:ok, pid}
-    end
-  end
-
   defp start_shape(shape_handle, shape, %{stack_id: stack_id} = opts) do
     Enum.zip(shape.shape_dependencies_handles, shape.shape_dependencies)
-    |> Enum.with_index(fn {dependency_handle, dependency_shape}, index ->
+    |> Enum.with_index(fn {shape_handle, inner_shape}, index ->
       materialized_type =
         shape.where.used_refs |> Map.fetch!(["$sublink", Integer.to_string(index)])
 
       Shapes.DynamicConsumerSupervisor.start_materializer(stack_id, %{
         stack_id: stack_id,
-        shape_handle: dependency_handle,
-        columns: dependency_shape.explicitly_selected_columns,
+        shape_handle: shape_handle,
+        columns: inner_shape.explicitly_selected_columns,
         materialized_type: materialized_type
       })
     end)
@@ -739,23 +458,11 @@ defmodule Electric.ShapeCache do
       {:ok, consumer_pid} ->
         Shapes.Consumer.initialize_shape(consumer_pid, shape, opts)
 
-        case await_initialization_registration(consumer_pid) do
-          :ok ->
-            # Now that the consumer process for this shape is running, we can finish initializing
-            # the ShapeStatus record by recording a "last_read" timestamp on it.
-            ShapeStatus.update_last_read_time_to_now(stack_id, shape_handle)
+        # Now that the consumer process for this shape is running, we can finish initializing
+        # the ShapeStatus record by recording a "last_read" timestamp on it.
+        ShapeStatus.update_last_read_time_to_now(stack_id, shape_handle)
 
-            {:ok, consumer_pid}
-
-          {:error, reason} ->
-            Logger.error("Shape consumer died before initialization was registered",
-              shape_handle: shape_handle,
-              reason: inspect(reason)
-            )
-
-            clean_shape(shape_handle, stack_id)
-            :error
-        end
+        {:ok, consumer_pid}
 
       {:error, _reason} = error ->
         Logger.error("Failed to start shape: #{inspect(error)}", shape_handle: shape_handle)
@@ -765,156 +472,83 @@ defmodule Electric.ShapeCache do
     end
   end
 
-  # initialize_shape/3 is intentionally an async send so the Consumer can keep
-  # long dependency replay off this caller. This same-sender call is a narrow
-  # registration barrier: the Consumer has installed its shape, storage,
-  # writer, and snapshot state before start_shape returns and a dependent
-  # Materializer can call await_snapshot_start/3. A failed child must be
-  # converted into an ordinary start failure; otherwise the calling ShapeCache
-  # process exits and leaves the persisted ShapeStatus entry behind.
-  defp await_initialization_registration(consumer_pid) do
-    Shapes.Consumer.await_initialization_registered(consumer_pid, @call_timeout)
-  catch
-    :exit, reason -> {:error, reason}
+  defp try_restoring_shape_and_dependencies(stack_id, shape_handle, opts) do
+    case ShapeStatus.fetch_shape_by_handle(stack_id, shape_handle) do
+      {:ok, shape} ->
+        restore_shape_and_dependencies(shape_handle, shape, Map.put(opts, :action, :restore))
+
+      :error ->
+        {:error, :no_shape}
+    end
   end
 
   # start_shape assumes that any dependent shapes already have running consumers
   # so we need to start those. this may be something we can do lazily: i.e.
   # only starting dependent shapes when they receive a write
   defp restore_shape_and_dependencies(shape_handle, shape, opts) do
-    case build_shape_dependencies(
-           shape_handle,
-           shape,
-           true,
-           opts.stack_id,
-           MapSet.new(),
-           []
-         ) do
-      {:ok, _known, dependencies} ->
-        dependencies
-        |> Enum.reverse()
-        |> start_shape_dependencies(shape_handle, opts)
-
-      {:error, missing_handle} ->
-        Logger.warning("Failed to restore shape: persisted dependency is missing",
-          shape_handle: shape_handle,
-          missing_handle: missing_handle
-        )
-
-        clean_shape(shape_handle, opts.stack_id)
-        {:error, "Failed to restore dependency #{missing_handle} for #{shape_handle}"}
-    end
-  end
-
-  defp start_shape_dependencies(dependencies, root_handle, opts) do
-    dependencies
+    [{shape_handle, shape}]
+    |> build_shape_dependencies(true, MapSet.new())
+    |> elem(0)
     |> Enum.reduce_while({:ok, %{}}, fn {handle, shape, start_shape_opts}, {:ok, acc} ->
-      case start_and_await_restored_shape(handle, shape, start_shape_opts, opts) do
-        {:ok, pid} -> {:cont, {:ok, Map.put(acc, handle, pid)}}
-        {:error, ^handle} -> {:halt, {:error, handle}}
+      case Electric.Shapes.ConsumerRegistry.whereis(opts.stack_id, handle) do
+        nil ->
+          case start_shape(handle, shape, Map.merge(opts, start_shape_opts)) do
+            {:ok, pid} ->
+              {:cont, {:ok, Map.put(acc, handle, pid)}}
+
+            :error ->
+              {:halt, {:error, handle}}
+          end
+
+        pid when is_pid(pid) ->
+          {:cont, {:ok, Map.put(acc, handle, pid)}}
       end
     end)
     |> case do
       {:ok, handles} ->
-        {:ok, Map.fetch!(handles, root_handle)}
+        {:ok, Map.fetch!(handles, shape_handle)}
 
       {:error, failed_handle} ->
-        if failed_handle != root_handle do
+        if failed_handle != shape_handle do
           Logger.warning(
             "Failed to start consumer for shape: error starting consumer for inner shape",
-            shape_handle: root_handle,
+            shape_handle: shape_handle,
             failed_handle: failed_handle
           )
 
-          clean_shape(root_handle, opts.stack_id)
+          # If we got an error starting any of the dependent shapes then we
+          # remove the outer shape too
+          clean_shape(shape_handle, opts.stack_id)
         end
 
-        {:error, "Failed to start consumer for #{root_handle}"}
+        {:error, "Failed to start consumer for #{shape_handle}"}
     end
   end
 
-  defp start_and_await_restored_shape(handle, shape, start_shape_opts, opts) do
-    consumer =
-      case Electric.Shapes.ConsumerRegistry.whereis(opts.stack_id, handle) do
-        nil -> start_shape(handle, shape, Map.merge(opts, start_shape_opts))
-        pid when is_pid(pid) -> {:ok, pid}
-      end
-
-    with {:ok, pid} <- consumer,
-         :started <- Shapes.Consumer.await_snapshot_start(opts.stack_id, handle, @call_timeout) do
-      {:ok, pid}
-    else
-      # start_shape already purged the shape via clean_shape on failure.
-      :error ->
-        {:error, handle}
-
-      # The consumer is running but never confirmed snapshot start; an
-      # unconfirmed shape must not survive restore, so purge it and let
-      # the client refetch from scratch.
-      {:error, reason} ->
-        Logger.warning("Failed to initialize restored shape consumer",
-          shape_handle: handle,
-          reason: inspect(reason)
-        )
-
-        clean_shape(handle, opts.stack_id)
-        {:error, handle}
-    end
-  catch
-    :exit, reason ->
-      Logger.warning("Restored shape consumer exited during initialization",
-        shape_handle: handle,
-        reason: inspect(reason)
-      )
-
-      clean_shape(handle, opts.stack_id)
-      {:error, handle}
+  @spec build_shape_dependencies([{shape_handle(), shape_def()}], boolean(), MapSet.t()) ::
+          {[{shape_handle(), shape_def(), map()}], MapSet.t()}
+  defp build_shape_dependencies([], _root?, known) do
+    {[], known}
   end
 
-  @spec build_shape_dependencies(
-          shape_handle(),
-          shape_def(),
-          boolean(),
-          stack_id(),
-          MapSet.t(shape_handle()),
-          [{shape_handle(), shape_def(), map()}]
-        ) ::
-          {:ok, MapSet.t(shape_handle()), [{shape_handle(), shape_def(), map()}]}
-          | {:error, shape_handle()}
-  defp build_shape_dependencies(handle, shape, root?, stack_id, known, acc) do
-    if MapSet.member?(known, handle) do
-      {:ok, known, acc}
-    else
-      known = MapSet.put(known, handle)
+  defp build_shape_dependencies([{handle, shape} | rest], root?, known) do
+    {siblings, known} = build_shape_dependencies(rest, false, MapSet.put(known, handle))
 
-      with {:ok, known, acc} <-
-             Enum.reduce_while(
-               shape.shape_dependencies_handles,
-               {:ok, known, acc},
-               fn dependency_handle, {:ok, known, acc} ->
-                 case ShapeStatus.fetch_shape_by_handle(stack_id, dependency_handle) do
-                   {:ok, dependency_shape} ->
-                     case build_shape_dependencies(
-                            dependency_handle,
-                            dependency_shape,
-                            false,
-                            stack_id,
-                            known,
-                            acc
-                          ) do
-                       {:ok, known, acc} -> {:cont, {:ok, known, acc}}
-                       {:error, _handle} = error -> {:halt, error}
-                     end
+    {descendents, known} =
+      Enum.zip(shape.shape_dependencies_handles, shape.shape_dependencies)
+      |> Enum.reject(fn {handle, _shape} -> MapSet.member?(known, handle) end)
+      |> build_shape_dependencies(false, known)
 
-                   :error ->
-                     {:halt, {:error, dependency_handle}}
-                 end
-               end
-             ) do
-        start_shape_opts = if root?, do: %{}, else: %{is_subquery_shape?: true}
-        {:ok, known, [{handle, shape, start_shape_opts} | acc]}
+    # Any inner shape of a root shape with subqueries must pass the is_subquery_shape? option
+    # to the consumer start function
+    start_shape_opts =
+      if root? do
+        %{}
+      else
+        %{is_subquery_shape?: true}
       end
-    end
+
+    {descendents ++ [{handle, shape, start_shape_opts} | siblings], known}
   end
 
   @spec fetch_latest_offset(stack_id(), shape_handle(), keyword()) ::

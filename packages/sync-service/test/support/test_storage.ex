@@ -102,55 +102,6 @@ defmodule Support.TestStorage do
   end
 
   @impl Electric.ShapeCache.Storage
-  def set_move_positions!(move_positions, {parent, shape_handle, _, storage}) do
-    send(parent, {__MODULE__, :set_move_positions!, shape_handle, move_positions})
-    Storage.set_move_positions!(move_positions, storage)
-  end
-
-  @impl Electric.ShapeCache.Storage
-  def fetch_move_positions({parent, shape_handle, _, storage}) do
-    send(parent, {__MODULE__, :fetch_move_positions, shape_handle})
-    Storage.fetch_move_positions(storage)
-  end
-
-  @impl Electric.ShapeCache.Storage
-  def fetch_root_delivery_tx_offset({parent, shape_handle, _, storage}) do
-    send(parent, {__MODULE__, :fetch_root_delivery_tx_offset, shape_handle})
-    Storage.fetch_root_delivery_tx_offset(storage)
-  end
-
-  @impl Electric.ShapeCache.Storage
-  def get_log_replay_safe_cursor({parent, shape_handle, _, storage}) do
-    send(parent, {__MODULE__, :get_log_replay_safe_cursor, shape_handle})
-    Storage.get_log_replay_safe_cursor(storage)
-  end
-
-  @impl Electric.ShapeCache.Storage
-  def begin_move_transaction!({parent, shape_handle, data, storage}) do
-    send(parent, {__MODULE__, :begin_move_transaction!, shape_handle})
-    storage = Storage.begin_move_transaction!(storage)
-    {parent, shape_handle, data, storage}
-  end
-
-  @impl Electric.ShapeCache.Storage
-  def commit_move_transaction!(
-        move_positions,
-        root_delivery_tx_offset,
-        {parent, shape_handle, data, storage}
-      ) do
-    send(
-      parent,
-      {__MODULE__, :commit_move_transaction!, shape_handle, move_positions,
-       root_delivery_tx_offset}
-    )
-
-    storage =
-      Storage.commit_move_transaction!(move_positions, root_delivery_tx_offset, storage)
-
-    {parent, shape_handle, data, storage}
-  end
-
-  @impl Electric.ShapeCache.Storage
   def snapshot_started?({parent, shape_handle, _, storage}) do
     send(parent, {__MODULE__, :snapshot_started?, shape_handle})
     Storage.snapshot_started?(storage)
@@ -160,19 +111,6 @@ defmodule Support.TestStorage do
   def get_log_stream(offset, max_offset, {parent, shape_handle, _, storage}) do
     send(parent, {__MODULE__, :get_log_stream, shape_handle, offset, max_offset})
     Storage.get_log_stream(offset, max_offset, storage)
-  end
-
-  @impl Electric.ShapeCache.Storage
-  def get_log_stream_with_offsets(offset, max_offset, {parent, shape_handle, _, storage}) do
-    send(parent, {
-      __MODULE__,
-      :get_log_stream_with_offsets,
-      shape_handle,
-      offset,
-      max_offset
-    })
-
-    Storage.get_log_stream_with_offsets(offset, max_offset, storage)
   end
 
   @impl Electric.ShapeCache.Storage

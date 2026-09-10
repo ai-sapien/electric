@@ -42,10 +42,6 @@ defmodule Electric.ShapeCache.ShapeStatusTest do
 
   setup [:with_stack_id_from_test, :with_async_deleter, :with_shape_db]
 
-  test "cache version invalidates metadata written before storage compaction became part of shape identity" do
-    assert ShapeStatus.version() == 11
-  end
-
   test "starts empty", ctx do
     {:ok, state, []} = new_state(ctx)
     assert [] = ShapeStatus.list_shapes(state)
@@ -161,18 +157,6 @@ defmodule Electric.ShapeCache.ShapeStatusTest do
       {:ok, outer_handle} = ShapeStatus.add_shape(state, outer)
 
       assert [{^inner_handle, _}, {^outer_handle, _}] = ShapeStatus.list_shapes(state)
-    end
-
-    test "returns unresolved shapes without recursing indefinitely", ctx do
-      {:ok, state, []} = new_state(ctx)
-
-      orphaned_shape =
-        shape!("orphaned")
-        |> Map.put(:shape_dependencies_handles, ["missing-handle"])
-
-      {:ok, orphaned_handle} = ShapeStatus.add_shape(state, orphaned_shape)
-
-      assert [{^orphaned_handle, ^orphaned_shape}] = ShapeStatus.list_shapes(state)
     end
   end
 

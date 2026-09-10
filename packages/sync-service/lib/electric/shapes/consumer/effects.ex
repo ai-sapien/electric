@@ -7,7 +7,6 @@ defmodule Electric.Shapes.Consumer.Effects do
   alias Electric.Connection.Manager
   alias Electric.Postgres.SnapshotQuery
   alias Electric.Shapes.Filter.Indexes.SubqueryIndex
-  alias Electric.Shapes.Consumer.State
   alias Electric.ShapeCache.Storage
   alias Electric.LogItems
   alias Electric.Replication.LogOffset
@@ -86,48 +85,6 @@ defmodule Electric.Shapes.Consumer.Effects do
           total_size: non_neg_integer(),
           pending_written_offset: LogOffset.t() | nil
         }
-
-  @type global_lsn_subscription_reason() :: :move_in | :causal_barrier
-
-  @doc false
-  @spec acquire_global_lsn_subscription(State.t(), global_lsn_subscription_reason()) :: State.t()
-  def acquire_global_lsn_subscription(%State{} = state, reason)
-      when reason in [:move_in, :causal_barrier] do
-    reasons = state.global_lsn_subscription_reasons
-
-    if MapSet.member?(reasons, reason) do
-      state
-    else
-      if MapSet.size(reasons) == 0 do
-        {:ok, _} = Electric.LsnTracker.subscribe_to_global_lsn_updates(state.stack_id)
-      else
-        # The process is already registered, but the state machine acquiring
-        # this new reason may not have existed when earlier broadcasts were
-        # consumed. Give every new owner the same monotonic catch-up frontier a
-        # fresh Registry subscription would receive.
-        last_lsn = Electric.LsnTracker.get_last_broadcast_lsn(state.stack_id)
-
-        if last_lsn > 0 do
-          send(self(), {:global_last_seen_lsn, last_lsn})
-        end
-      end
-
-      %{state | global_lsn_subscription_reasons: MapSet.put(reasons, reason)}
-    end
-  end
-
-  @doc false
-  @spec release_global_lsn_subscription(State.t(), global_lsn_subscription_reason()) :: State.t()
-  def release_global_lsn_subscription(%State{} = state, reason)
-      when reason in [:move_in, :causal_barrier] do
-    reasons = MapSet.delete(state.global_lsn_subscription_reasons, reason)
-
-    if MapSet.size(reasons) == 0 and MapSet.size(state.global_lsn_subscription_reasons) > 0 do
-      :ok = Electric.LsnTracker.unsubscribe_from_global_lsn_updates(state.stack_id)
-    end
-
-    %{state | global_lsn_subscription_reasons: reasons}
-  end
 
   @spec execute([t()], term(), keyword()) :: execution_result()
   def execute(effects, state, _opts \\ []) when is_list(effects) do
@@ -250,11 +207,14 @@ defmodule Electric.Shapes.Consumer.Effects do
   end
 
   defp execute_effect(%SubscribeGlobalLsn{}, acc) do
-    %{acc | state: acquire_global_lsn_subscription(acc.state, :move_in)}
+    {:ok, _} = Electric.LsnTracker.subscribe_to_global_lsn_updates(acc.state.stack_id)
+
+    acc
   end
 
   defp execute_effect(%UnsubscribeGlobalLsn{}, acc) do
-    %{acc | state: release_global_lsn_subscription(acc.state, :move_in)}
+    :ok = Electric.LsnTracker.unsubscribe_from_global_lsn_updates(acc.state.stack_id)
+    acc
   end
 
   defp execute_effect(%AddToSubqueryIndex{} = effect, acc) do
@@ -316,7 +276,10 @@ defmodule Electric.Shapes.Consumer.Effects do
           {:move_in_snapshot_stats, row_count, row_bytes} -> {row_count, row_bytes}
         end
 
-      {snapshot_name, row_count, row_bytes, lsn}
+      send(
+        consumer_pid,
+        {:query_move_in_complete, snapshot_name, row_count, row_bytes, lsn}
+      )
     end
 
     :telemetry.execute([:electric, :subqueries, :move_in_triggered], %{count: 1}, %{
@@ -343,52 +306,19 @@ defmodule Electric.Shapes.Consumer.Effects do
   end
 
   # Synchronous core of query_move_in_async(). Expects the current OTel context to already be set up by the caller.
-  @doc false
-  def execute_move_in_query(stack_id, shape_handle, shape, consumer_pid, query_fn) do
+  defp execute_move_in_query(stack_id, shape_handle, shape, consumer_pid, query_fn) do
     pool = Manager.pool_name(stack_id, :snapshot)
 
-    case SnapshotQuery.execute_for_shape(pool, shape_handle, shape,
-           stack_id: stack_id,
-           query_reason: "move_in_query",
-           causal_marker?: true,
-           snapshot_info_fn: fn _, pg_snapshot, _lsn ->
-             send(consumer_pid, {:pg_snapshot_known, pg_snapshot})
-           end,
-           query_fn: query_fn
-         ) do
-      {:ok, {snapshot_name, row_count, row_bytes, lsn}} ->
-        send(
-          consumer_pid,
-          {:query_move_in_complete, snapshot_name, row_count, row_bytes, lsn}
-        )
-
-      {:error, reason} ->
-        send_move_in_query_error(consumer_pid, reason, current_stacktrace())
-    end
+    SnapshotQuery.execute_for_shape(pool, shape_handle, shape,
+      stack_id: stack_id,
+      query_reason: "move_in_query",
+      snapshot_info_fn: fn _, pg_snapshot, _lsn ->
+        send(consumer_pid, {:pg_snapshot_known, pg_snapshot})
+      end,
+      query_fn: query_fn
+    )
   rescue
-    error -> send_move_in_query_error(consumer_pid, error, __STACKTRACE__)
-  catch
-    kind, reason ->
-      error =
-        RuntimeError.exception(
-          "move-in snapshot transaction terminated with #{kind}: #{inspect(reason)}"
-        )
-
-      send_move_in_query_error(consumer_pid, error, __STACKTRACE__)
-  end
-
-  defp send_move_in_query_error(consumer_pid, %{__exception__: true} = error, stacktrace) do
-    send(consumer_pid, {:query_move_in_error, error, stacktrace})
-  end
-
-  defp send_move_in_query_error(consumer_pid, reason, stacktrace) do
-    error = RuntimeError.exception("move-in snapshot transaction failed: #{inspect(reason)}")
-    send(consumer_pid, {:query_move_in_error, error, stacktrace})
-  end
-
-  defp current_stacktrace do
-    {:current_stacktrace, stacktrace} = Process.info(self(), :current_stacktrace)
-    stacktrace
+    error -> send(consumer_pid, {:query_move_in_error, error, __STACKTRACE__})
   end
 
   defp consider_flushed(state, log_offset) do

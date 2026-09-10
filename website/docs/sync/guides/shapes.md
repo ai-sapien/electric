@@ -52,7 +52,7 @@ Shapes are defined by:
 A shape contains all of the rows in the table that match the where clause, if provided. If a columns clause is provided, the synced rows will only contain those selected columns.
 
 > [!Warning] Limitations
-> Shapes are currently [single table](#single-table), though you can use [subqueries](#subqueries-preview) to filter based on related data. Shape definitions are [immutable](#immutable).
+> Shapes are currently [single table](#single-table), though you can use [subqueries](#subqueries) to filter based on related data. Shape definitions are [immutable](#immutable).
 
 > [!Warning] Security
 > Production apps should request shapes through your backend API for authorization and security. See the [auth guide](/docs/sync/guides/auth).
@@ -121,9 +121,9 @@ Where clauses have the following constraints:
 
 1. can't use non-deterministic SQL functions like `count()` or `now()`
 
-#### Subqueries (preview)
+#### Subqueries
 
-Electric has preview support for subqueries in where clauses, allowing you to filter rows based on data in other tables. This enables relational filtering patterns such as memberships, sharing rules, parent-child traversal, and exclusions while the feature remains gated behind flags.
+Electric supports subqueries in where clauses, allowing you to filter rows based on data in other tables. This enables relational filtering patterns such as memberships, sharing rules, parent-child traversal, and exclusions.
 
 For example, you can sync only users who belong to a specific organization:
 
@@ -189,11 +189,7 @@ const shape = new Shape(stream)
 
 When a shape uses a subquery, Electric tracks the dependency between tables. If the data in the subquery changes (e.g., a project becomes archived), rows will automatically move in or out of the shape without the row itself being modified.
 
-Electric 1.6 keeps these moves incremental even for compound expressions that use `AND`, `OR`, and `NOT` around subqueries. In older releases those cases could return `409` and force a full resync of the shape.
-
-:::info Preview feature
-Subqueries are currently in preview and are enabled using `ELECTRIC_FEATURE_FLAGS=allow_subqueries,tagged_subqueries`. The flags gate availability rather than a separate syntax or API. See the [configuration docs](/docs/sync/api/config#allow_subqueries) for details.
-:::
+Electric keeps these moves incremental even for compound expressions that use `AND`, `OR`, and `NOT` around subqueries. In older releases those cases could return `409` and force a full resync of the shape.
 
 When constructing a where clause with user input as a filter, it's recommended to use a positional placeholder (`$1`) to avoid
 SQL injection-like situations. For example, if filtering a table on a user id, it's better to use `where=user = $1` with
@@ -514,7 +510,7 @@ We currently optimize the evaluation of the following clauses:
 
 ### Single table
 
-Shapes sync data from a single table. While you can use [subqueries](#subqueries-preview) to filter rows based on data in other tables, the shape only contains rows from the root table—not the related data itself.
+Shapes sync data from a single table. While you can use [subqueries](#subqueries) to filter rows based on data in other tables, the shape only contains rows from the root table—not the related data itself.
 
 For syncing related data across tables, you currently need to use multiple shapes. In the [old version of Electric](https://legacy.electric-sql.com/docs/usage/data-access/shapes), Shapes had an include tree that allowed you to sync nested relations. The new Electric has not yet implemented support for include trees.
 
@@ -548,3 +544,46 @@ This is especially important if you intend to recreate the table afterwards (pos
 Therefore, recreating the table only works if you first delete the shape.
 
 Electric does not yet automatically delete shapes when tables are dropped because Postgres does not stream DDL statements (such as `DROP TABLE`) on the logical replication stream that Electric uses to detect changes. However, we are actively exploring approaches for automated shape deletion in this [GitHub issue](https://github.com/electric-sql/electric/issues/1733).
+
+## Why shape handles get deleted
+
+When a shape handle is deleted, clients receive a `409 Conflict` response or a [`must-refetch`](/docs/sync/api/http#control-messages) control message. This tells the client to discard its local data and re-sync the shape from scratch. Understanding why this happens can help you reduce how often shapes need to be recreated — especially important for large shapes where re-syncing is expensive.
+
+### Replication slot or timeline changes
+
+Electric uses a Postgres [replication slot](https://www.postgresql.org/docs/current/logical-replication-slots.html) to track changes. When the slot needs to be recreated — or when Postgres itself changes identity (e.g. after a Point-in-Time Recovery) — **all shapes are purged** because the existing shape logs may no longer be consistent with the database state.
+
+Common causes:
+
+- **Replication slot invalidated** — if the WAL retained by Electric's replication slot exceeds the [`max_slot_wal_keep_size`](https://www.postgresql.org/docs/current/runtime-config-replication.html#GUC-MAX-SLOT-WAL-KEEP-SIZE) limit in Postgres, the slot is invalidated. Electric must drop and recreate the slot, which triggers a full shape purge. See the [troubleshooting guide](/docs/sync/guides/troubleshooting#wal-growth-mdash-why-is-my-postgres-database-storage-filling-up) for how to monitor and configure WAL retention.
+- **Server restart with a new slot** — if the Electric server restarts and cannot reuse its previous replication slot (e.g. the slot was temporary or was dropped externally), a new slot is created and all shapes are purged.
+- **Postgres timeline change** — restoring from a backup or performing Point-in-Time Recovery changes the Postgres system identifier or timeline, which also triggers a full purge.
+
+> [!Tip] Preserving shapes across restarts
+> Electric persists shape data to disk by default (under [`ELECTRIC_STORAGE_DIR`](/docs/sync/api/config#electric-storage-dir), which defaults to `./persistent`). As long as the storage directory is on persistent volume and the replication slot is preserved, shapes will survive server restarts without needing to re-sync.
+
+### Schema changes
+
+When the schema of a table used by a shape changes — for example, adding, removing, or renaming a column — Electric automatically invalidates all shapes on that table. This is because the shape log was built against the old schema and may be missing data for new columns or contain references to removed ones.
+
+Electric detects schema changes in two ways:
+- **Relation messages** — when Postgres streams a relation message indicating the table structure has changed, Electric immediately invalidates affected shapes.
+- **Periodic reconciliation** — a background process checks every 60 seconds whether cached table metadata still matches the actual database schema, catching changes that may not trigger a relation message (such as adding a default value to an existing column).
+
+### Shape eviction (max shapes limit)
+
+If you've configured [`ELECTRIC_MAX_SHAPES`](/docs/sync/api/config#electric-max-shapes), Electric periodically evicts the least recently used shapes when the limit is exceeded. Clients subscribed to an evicted shape will receive a `409 Conflict` response and will need to start a new subscription.
+
+### Explicit deletion via the API
+
+Shapes can be explicitly deleted using the `DELETE /v1/shape` endpoint. This is useful when you need to force clients to re-sync — for example, after [dropping and recreating a table](#dropping-tables).
+
+### What happens on the client
+
+When a shape is deleted, the Electric client handles it automatically:
+
+1. The server responds with a `409 Conflict` status or sends a `must-refetch` control message.
+2. The client discards its local copy of the shape data.
+3. The client starts a new shape subscription and re-syncs from scratch.
+
+This is handled transparently by the [TypeScript client](/docs/sync/api/clients/typescript) and [TanStack DB](/sync/tanstack-db). No manual intervention is required — but the re-sync may take time for large shapes.

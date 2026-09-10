@@ -1,5 +1,38 @@
 # @electric-sql/client
 
+## 1.5.28
+
+### Patch Changes
+
+- ff9d221: Stop `ExpiredShapesCache.getExpiredHandle` writing the whole cache to
+  `localStorage` on every read. The LRU touch it performs runs while building the
+  URL of every shape request, so in live mode it persisted the entire cache once
+  per poll for as long as the app stayed open. `lastUsed` is now updated in memory
+  only; it is read from memory when `markExpired` picks an eviction candidate, so
+  the sole effect is that eviction order can be staler after a reload.
+
+## 1.5.27
+
+### Patch Changes
+
+- c4c48c0: Preserve data messages when suppressing cached up-to-date notifications during replay.
+- d9d2666: Prevent subscription startup failures from also surfacing as unhandled promise
+  rejections after they are delivered to the subscriber error callback.
+- 7b9e9fe: Fix duplicate download of subset snapshot responses caused by the chunk prefetcher mistaking them for a normal chunk to prefetch.
+
+## 1.5.26
+
+### Patch Changes
+
+- 1983bf1: Fix subset snapshot filtering after PostgreSQL transaction ID wraparound and
+  retire filters once the stream passes each snapshot's database LSN.
+
+## 1.5.25
+
+### Patch Changes
+
+- fb06dd3: Subqueries in shape WHERE clauses are now generally available and always enabled, including incremental move handling for compound `AND`/`OR`/`NOT` expressions. The `allow_subqueries` and `tagged_subqueries` feature flags have been removed — they no longer need to be set via `ELECTRIC_FEATURE_FLAGS`.
+
 ## 1.5.24
 
 ### Patch Changes

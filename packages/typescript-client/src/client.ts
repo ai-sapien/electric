@@ -1554,11 +1554,7 @@ export class ShapeStream<T extends Row<unknown> = Row>
 
     if (hasUpToDateMessage) {
       this.#refreshCatchUpWatchdogActive = false
-      if (transition.suppressBatch) {
-        return
-      }
-
-      if (this.#currentFetchUrl) {
+      if (!transition.suppressUpToDate && this.#currentFetchUrl) {
         const shapeKey = canonicalShapeKey(this.#currentFetchUrl)
         upToDateTracker.recordUpToDate(
           shapeKey,
@@ -1571,10 +1567,41 @@ export class ShapeStream<T extends Row<unknown> = Row>
     // Filter messages using snapshot tracker
     const messagesToProcess = batch.filter((message) => {
       if (isChangeMessage(message)) {
+        const changeLsn = message.headers.lsn
+        if (typeof changeLsn === `string` && changeLsn) {
+          // A quiet SSE stream may deliver its first later change before the
+          // next up-to-date boundary. Retire snapshots against that change's
+          // WAL position before resolving its wrapped transaction ID.
+          this.#snapshotTracker.lastSeenUpdate(BigInt(changeLsn))
+        }
         return !this.#snapshotTracker.shouldRejectMessage(message)
       }
+
+      if (isUpToDateMessage(message)) {
+        const lastSeenLsn = message.headers.global_last_seen_lsn
+        if (typeof lastSeenLsn === `string` && lastSeenLsn) {
+          // Process this in message order: changes before the up-to-date
+          // boundary still need snapshot deduplication, while later changes do
+          // not once the database has passed the snapshot's LSN.
+          this.#snapshotTracker.lastSeenUpdate(BigInt(lastSeenLsn))
+        }
+
+        // A replayed up-to-date for the previous session's cursor still
+        // carries real WAL progress, which is applied above; only its
+        // delivery to subscribers is skipped.
+        if (transition.suppressUpToDate) return false
+      }
+
       return true // Always process control messages
     })
+
+    // A replay batch that carried nothing but the suppressed up-to-date has
+    // nothing to deliver. Skip the callback rather than publishing an empty
+    // batch: subscribers are promised one or more messages per notification,
+    // and the pre-suppression code never notified for a suppressed replay.
+    // Batches emptied by the snapshot tracker alone are still published as
+    // before.
+    if (messagesToProcess.length === 0 && transition.suppressUpToDate) return
 
     await this.#publish(messagesToProcess, {
       allowReentrantBypass: opts.allowReentrantPublishBypass,
@@ -1825,7 +1852,12 @@ export class ShapeStream<T extends Row<unknown> = Row>
     const subscriptionId = {}
 
     this.#subscribers.set(subscriptionId, [callback, onError])
-    if (!this.#started) this.#start()
+    if (!this.#started) {
+      this.#start().catch(() => {
+        // Errors from #start are handled internally via onError.
+        // This catch prevents unhandled promise rejection in Node/Bun.
+      })
+    }
 
     return () => {
       this.#subscribers.delete(subscriptionId)

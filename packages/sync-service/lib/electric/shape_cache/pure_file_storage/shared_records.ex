@@ -13,7 +13,6 @@ defmodule Electric.ShapeCache.PureFileStorage.SharedRecords do
     :last_persisted_txn_offset,
     :last_persisted_offset,
     :last_seen_txn_offset,
-    :log_replay_history_start,
     :compaction_boundary,
     :latest_name,
     :pg_snapshot,

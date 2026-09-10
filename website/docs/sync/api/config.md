@@ -96,6 +96,56 @@ How many connections Electric opens as a pool for handling shape queries.
 
 </EnvVarConfig>
 
+### ELECTRIC_DATABASE_TCP_KEEPALIVE_IDLE
+
+<EnvVarConfig
+    name="ELECTRIC_DATABASE_TCP_KEEPALIVE_IDLE"
+    optional="true"
+    example="30s">
+
+Enable TCP keepalive on database connections and set how long a connection may sit idle before the kernel starts sending probes.
+
+By default Electric leaves the operating system's settings in place. Setting this lets an idle replication connection detect the loss and reconnect sooner.
+
+See also `ELECTRIC_DATABASE_TCP_USER_TIMEOUT`, which bounds detection while data is actually in flight.
+
+</EnvVarConfig>
+
+### ELECTRIC_DATABASE_TCP_KEEPALIVE_INTERVAL
+
+<EnvVarConfig
+    name="ELECTRIC_DATABASE_TCP_KEEPALIVE_INTERVAL"
+    optional="true"
+    example="10s">
+
+How long to wait between individual TCP keepalive probes. Enables keepalive if set on its own.
+
+</EnvVarConfig>
+
+### ELECTRIC_DATABASE_TCP_KEEPALIVE_COUNT
+
+<EnvVarConfig
+    name="ELECTRIC_DATABASE_TCP_KEEPALIVE_COUNT"
+    optional="true"
+    example="3">
+
+How many unanswered TCP keepalive probes before the connection is dropped. Enables keepalive if set on its own.
+
+</EnvVarConfig>
+
+### ELECTRIC_DATABASE_TCP_USER_TIMEOUT
+
+<EnvVarConfig
+    name="ELECTRIC_DATABASE_TCP_USER_TIMEOUT"
+    optional="true"
+    example="60s">
+
+The maximum time data may remain unacknowledged before the connection is dropped (Linux `TCP_USER_TIMEOUT`).
+
+This complements the keepalive settings above. Keepalive probes only run while a connection is idle, whereas this bounds how long Electric keeps retransmitting a write to a peer that has stopped responding.
+
+</EnvVarConfig>
+
 ### ELECTRIC_DATABASE_CA_CERTIFICATE_FILE
 
 <EnvVarConfig
@@ -285,6 +335,30 @@ This environment variable increases this timeout.
 
 </EnvVarConfig>
 
+### ELECTRIC_TCP_READ_TIMEOUT
+
+<EnvVarConfig
+    name="ELECTRIC_TCP_READ_TIMEOUT"
+    defaultValue="60s"
+    example="180s">
+Socket read timeout, which doubles as the HTTP keep-alive idle timeout: Electric closes a connection that has been waiting this long for its next request. Defaults to 60 seconds.
+
+When Electric runs behind a connection-pooling reverse proxy or load balancer (AWS ALB, nginx, etc.), set this **above** the proxy's idle timeout. If the proxy's timeout is longer, the proxy can reuse a pooled connection at the same moment Electric closes it, and the resulting TCP reset surfaces to clients as an intermittent `502 Bad Gateway`. For example, behind an AWS ALB with the default 60-second idle timeout, set `ELECTRIC_TCP_READ_TIMEOUT=120s`.
+
+</EnvVarConfig>
+
+### ELECTRIC_TWEAKS_HTTP2_MAX_RESET_STREAM_RATE
+
+<EnvVarConfig
+    name="ELECTRIC_TWEAKS_HTTP2_MAX_RESET_STREAM_RATE"
+    defaultValue="disabled"
+    example="500/10s">
+Maximum number of HTTP/2 stream resets (`RST_STREAM` frames) a single client connection may send within a time window, in the form `COUNT/DURATION` (for example `500/10s`), or `disabled`. When a connection exceeds the limit, Electric closes the whole connection and every request still in flight on it is dropped.
+
+This is disabled by default. Behind a reverse proxy that multiplexes many end clients onto a few upstream HTTP/2 connections, ordinary client-side cancellations of live requests are enough to trip the limit and disconnect every other client sharing that connection. Set it only if Electric is directly exposed to untrusted HTTP/2 clients and you want the rate limit as a defence against HTTP/2 Rapid Reset style abuse.
+
+</EnvVarConfig>
+
 ### ELECTRIC_SHAPE_CHUNK_BYTES_THRESHOLD
 
 <EnvVarConfig
@@ -317,11 +391,15 @@ Port that the [HTTP API](/docs/sync/api/http) is exposed on.
     defaultValue="false"
     example="true">
 
-Whether to terminate idle shape consumer processes after `ELECTRIC_SHAPE_HIBERNATE_AFTER` seconds. This saves on memory at the cost of slightly higher CPU usage. When receiving a transaction that contains changes matching a given shape, a consumer process is started to handle the update. If more transactions matching the shape appear within the time defined by `ELECTRIC_SHAPE_HIBERNATE_AFTER` then the consumer will remain active, if not it will be terminated.
+Whether to terminate idle shape consumer processes. This saves on memory at the cost of slightly higher CPU usage.
 
-If set to `false` the consumer processes will [hibernate](https://www.erlang.org/doc/apps/erts/erlang#hibernate/3) instead of terminating, meaning they still occupy some memory but are inactive until passed transaction operations to process.
+A consumer process first [hibernates](https://www.erlang.org/doc/apps/erts/erlang#hibernate/3) after `ELECTRIC_SHAPE_HIBERNATE_AFTER` of inactivity. With this option enabled, a hibernated consumer that stays idle for a further `ELECTRIC_SHAPE_SUSPEND_AFTER` is terminated. When a transaction containing changes matching the shape arrives, the consumer process is started again to handle the update.
 
-If you enable this feature then you should configure `ELECTRIC_SHAPE_HIBERNATE_AFTER` to match the usage patterns of your application to avoid unnecessary process churn.
+Not every consumer process is eligible for termination. Shapes with [subquery](/docs/sync/guides/shapes#subqueries) dependencies and shapes that other shapes depend on through a subquery, can only hibernate; they never get suspended.
+
+If set to `false` the consumer processes only hibernate, meaning they still occupy some memory but are inactive until passed transaction operations to process.
+
+If you enable this feature then you should configure `ELECTRIC_SHAPE_SUSPEND_AFTER` to match the usage patterns of your application to avoid unnecessary process churn.
 
 </EnvVarConfig>
 
@@ -332,7 +410,18 @@ If you enable this feature then you should configure `ELECTRIC_SHAPE_HIBERNATE_A
     defaultValue="30s"
     example="5000ms">
 
-The amount of time a consumer process remains active without receiving transaction operations before either [hibernating](https://www.erlang.org/doc/apps/erts/erlang#hibernate/3) or terminating (if `ELECTRIC_SHAPE_SUSPEND_CONSUMER` is `true`).
+The amount of time a consumer process remains active without receiving transaction operations before [hibernating](https://www.erlang.org/doc/apps/erts/erlang#hibernate/3).
+
+</EnvVarConfig>
+
+### ELECTRIC_SHAPE_SUSPEND_AFTER
+
+<EnvVarConfig
+    name="ELECTRIC_SHAPE_SUSPEND_AFTER"
+    defaultValue="10m"
+    example="30m">
+
+The amount of time a hibernated consumer process remains idle before being terminated. Only applies when `ELECTRIC_SHAPE_SUSPEND_CONSUMER` is `true`. Counted from the moment the consumer hibernates, so an idle consumer is terminated roughly `ELECTRIC_SHAPE_HIBERNATE_AFTER` plus `ELECTRIC_SHAPE_SUSPEND_AFTER` after its last activity.
 
 </EnvVarConfig>
 
@@ -453,47 +542,17 @@ Consumer processes are partitioned across some number of supervisors to improve 
 
 ## Feature Flags
 
-Feature flags enable advanced features and staged rollouts for capabilities that are not yet enabled by default in production.
+Feature flags enable staged rollouts of new capabilities that are not yet enabled by default in production.
 
 ### ELECTRIC_FEATURE_FLAGS
 
 <EnvVarConfig
     name="ELECTRIC_FEATURE_FLAGS"
-    defaultValue=""
-    example="allow_subqueries,tagged_subqueries">
+    defaultValue="">
 
-**Available flags:**
-
-- `allow_subqueries` - Enables preview subquery support in shape WHERE clauses
-- `tagged_subqueries` - Enables preview incremental subquery move handling, including compound boolean expressions with compatible clients
+Comma-separated list of feature flags to enable. There are currently no feature flags available.
 
 </EnvVarConfig>
-
-:::warning Client compatibility
-Electric 1.6's incremental handling for compound subquery expressions changes the client protocol. Upgrade clients before enabling the server rollout. TanStack DB clients need `@tanstack/db >= 0.6.2` and `@tanstack/electric-db-collection >= 0.3.0`.
-:::
-
-### allow_subqueries
-
-Enables support for subqueries in the WHERE clause of [shape](/docs/sync/guides/shapes) definitions. When enabled, you can use queries in the form:
-
-```sql
-WHERE id IN (SELECT user_id FROM memberships WHERE org_id = 'org_123')
-```
-
-This allows creating shapes that filter based on related data in other tables, enabling more complex data synchronization patterns.
-
-**Status:** Preview. Disabled by default in production until enabled with `ELECTRIC_FEATURE_FLAGS`.
-
-### tagged_subqueries
-
-Subqueries create dependency trees between shapes. This flag enables incremental move handling when dependency rows change, including compound `WHERE` expressions that combine subqueries with `AND`, `OR`, and `NOT`.
-
-Before Electric 1.6, complex boolean combinations around subqueries could still invalidate the shape and return a `409` on a move. With this flag enabled and compatible clients, those changes are reconciled in-stream instead.
-
-See [discussion #2931](https://github.com/electric-sql/electric/discussions/2931) for more details about this feature.
-
-**Status:** Preview rollout flag for subquery move handling. Disabled by default in production. Requires `allow_subqueries` to be enabled.
 
 ## Caching
 
@@ -553,6 +612,8 @@ If provided must be one of `MEMORY` or `FAST_FILE`.
     example="/var/example">
 
 Path to root folder for storing data on the filesystem.
+
+This must be persistent storage that survives restarts. See [Optimizing for disk](/docs/sync/guides/deployment#optimizing-for-disk) in the deployment guide for what to run it on.
 
 </EnvVarConfig>
 
@@ -684,20 +745,5 @@ By default, coloring is enabled when Electric's stdout is connected to a termina
     example="true">
 
 Enable [OTP SASL](https://www.erlang.org/doc/apps/sasl/sasl_app.html) reporting at runtime.
-
-</EnvVarConfig>
-
-## Usage reporting
-
-### ELECTRIC_USAGE_REPORTING
-
-These environment variables allow configuration of anonymous usage data reporting back to https://electric-sql.com
-
-<EnvVarConfig
-    name="ELECTRIC_USAGE_REPORTING"
-    defaultValue="true"
-    example="true">
-
-Configure anonymous usage data about the instance being sent to a central checkpoint service. Collected information is anonymised and doesn't contain any information from the replicated data. You can read more about it in our [telemetry docs](../reference/telemetry.md#anonymous-usage-data).
 
 </EnvVarConfig>
