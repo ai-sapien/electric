@@ -42,12 +42,12 @@ defmodule Electric.ShapeCache.ShapeCleaner do
     remove_shapes(stack_id, List.wrap(shape_handle), reason)
   end
 
-  @spec remove_shapes_async(stack_id(), [shape_handle()]) :: :ok
-  def remove_shapes_async(stack_id, shape_handles) do
+  @spec remove_shapes_async(stack_id(), [shape_handle()], term()) :: :ok
+  def remove_shapes_async(stack_id, shape_handles, reason \\ @shutdown_cleanup) do
     CleanupTaskSupervisor.perform_async(stack_id, fn ->
       activate_mocked_functions_from_test_process()
 
-      remove_shapes(stack_id, shape_handles)
+      remove_shapes(stack_id, shape_handles, reason)
     end)
   end
 
