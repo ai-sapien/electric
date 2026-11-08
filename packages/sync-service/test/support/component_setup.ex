@@ -382,6 +382,13 @@ defmodule Support.ComponentSetup do
   end
 
   def with_inspector(ctx) do
+    # Match the production sibling supervisor, which survives inspector restarts.
+    task_supervisor_name = EtsInspector.task_supervisor_name(ctx.stack_id)
+
+    if is_nil(GenServer.whereis(task_supervisor_name)) do
+      start_supervised!({Task.Supervisor, name: task_supervisor_name})
+    end
+
     server =
       start_supervised!(
         {EtsInspector,
@@ -506,6 +513,13 @@ defmodule Support.ComponentSetup do
   def brutally_restart_complete_stack(ctx) do
     sup_id = Map.get(ctx, :stack_supervisor_id, Electric.StackSupervisor)
     pid = ctx.stack_supervisor
+
+    registered =
+      Registry.select(Electric.ProcessRegistry.registry_name(ctx.stack_id), [
+        {{:_, :"$1", :_}, [], [:"$1"]}
+      ])
+
+    monitors = Enum.map(Enum.uniq(registered), &{&1, Process.monitor(&1)})
     ref = Process.monitor(pid)
     Process.exit(pid, :kill)
 
@@ -526,6 +540,20 @@ defmodule Support.ComponentSetup do
     # processes (and their ETS tables) to actually be gone before starting a
     # new stack with the same stack_id, else the new stack races name/table
     # reuse and crashes on boot.
+    # Registry termination can precede its registered processes. Waiting only
+    # for the registry lets an old restarter collide with the replacement stack.
+    deadline = System.monotonic_time(:millisecond) + 5_000
+
+    for {child, monitor} <- monitors do
+      remaining = max(0, deadline - System.monotonic_time(:millisecond))
+
+      receive do
+        {:DOWN, ^monitor, :process, ^child, _reason} -> :ok
+      after
+        remaining -> flunk("stack child #{inspect(child)} survived brutal shutdown")
+      end
+    end
+
     wait_for_stack_processes_down(ctx.stack_id)
 
     stack_supervisor =
