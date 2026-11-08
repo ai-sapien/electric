@@ -1,7 +1,7 @@
 # Sapien upstream alignment
 
-The server is based on upstream `bb397424db0e1c153dc356713fd3dfd40315470c`
-(Electric 1.8.1). The deployment branch remains `sapien/shape-startup` so existing
+The server is based on upstream tag `@core/sync-service@1.8.1`
+(`0f404200402f918a4b1596bc5c8a53479a435349`). The deployment branch remains `sapien/shape-startup` so existing
 GHCR signer and source-ref verification continues to bind images to that branch.
 The merge records the previous deployment ancestry while rebuilding from the
 upstream tree and reapplying the patches below.
@@ -18,11 +18,15 @@ upstream tree and reapplying the patches below.
 - Clamp response cursors to the visible log frontier so a newly published chunk
   boundary cannot skip an insert that storage has not exposed yet.
 - Keep db_connection 2.10.2.
+- Lock Bandit 1.14.1. Electric 1.8.1 locks Bandit 1.12.0, which lacks the
+  `connection: close` on the last HTTP/1 response before `max_requests`
+  (mtrudel/bandit#613, released in 1.12.2) and has HTTP/1 and HTTP/2 advisories
+  fixed by 1.14.x.
 - Build and attest AMD64 and ARM64 images with the actual package version.
 
 Upstream owns replication acknowledgments, storage, materializers and recovery.
-The previous custom replay engine and Bandit patch are retired. Bandit 1.12.0
-includes the HTTP connection lifecycle correction.
+The previous custom replay engine and the vendored Bandit patch are retired;
+the Bandit fix is taken from upstream Bandit (>= 1.12.2) through the lock file.
 
 ## Recovery contract
 
