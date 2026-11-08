@@ -79,6 +79,9 @@ defmodule Support.OracleHarness do
     - :restart_type - how the server restart is performed: "graceful" (default),
       "brutal" (crash + recover), or "rolling" (rolling deploy). See
       `restart_stack/2`. Env: RESTART_TYPE.
+    - :preserve_client_state_on_restart - keep polling clients and their handles
+      through graceful or brutal restarts (default: false). Rolling restarts
+      change the endpoint and require new clients.
     - :restart_client_every - throw away and recreate the shape clients every
       M batches to exercise fresh-poll consistency (default: 0, disabled)
   """
@@ -124,10 +127,8 @@ defmodule Support.OracleHarness do
 
         cond do
           restart_server? ->
-            # restart_server tears down the old checkers (they're polling the
-            # server about to go down) and recreates them after the stack is
-            # back up. If a client restart is also due this batch, it's
-            # subsumed by the recreate that follows the server restart.
+            # Server restart normally recreates checkers; recovery compatibility
+            # tests explicitly retain them to exercise the client protocol.
             restart_server(
               ctx,
               pids,
@@ -135,7 +136,8 @@ defmodule Support.OracleHarness do
               oracle_pool,
               timeout_ms,
               batch_idx,
-              restart_type
+              restart_type,
+              Keyword.get(opts, :preserve_client_state_on_restart, false)
             )
 
           restart_client? ->
@@ -184,17 +186,31 @@ defmodule Support.OracleHarness do
     |> Stream.run()
   end
 
-  # Restarts the Electric stack (server-side restore-from-file test) and
-  # reconnects the clients. Old checkers are stopped because their polls are
-  # against the server that is about to go down.
-  defp restart_server(ctx, pids, shapes, oracle_pool, timeout_ms, batch_idx, restart_type) do
+  # Restart the stack, optionally retaining clients on the same endpoint.
+  defp restart_server(
+         ctx,
+         pids,
+         shapes,
+         oracle_pool,
+         timeout_ms,
+         batch_idx,
+         restart_type,
+         preserve_clients?
+       ) do
+    if preserve_clients? and restart_type == "rolling" do
+      raise ArgumentError, "preserving clients requires a restart on the same endpoint"
+    end
+
     log("Restarting server (#{restart_type}) after batch_#{batch_idx}")
 
-    Enum.each(pids, &GenServer.stop/1)
+    if not preserve_clients?, do: Enum.each(pids, &GenServer.stop/1)
 
     new_ctx = Map.merge(ctx, restart_stack(restart_type, ctx))
 
-    new_pids = recreate_checkers(new_ctx, [], shapes, oracle_pool, timeout_ms, batch_idx)
+    new_pids =
+      if preserve_clients?,
+        do: pids,
+        else: recreate_checkers(new_ctx, [], shapes, oracle_pool, timeout_ms, batch_idx)
 
     {new_pids, new_ctx}
   end

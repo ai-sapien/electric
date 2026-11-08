@@ -187,7 +187,23 @@ defmodule Electric.Plug.RouterTest do
 
       shape_handle = get_resp_shape_handle(conn)
 
-      Process.sleep(500)
+      shape_storage =
+        Electric.ShapeCache.Storage.for_shape(
+          shape_handle,
+          Electric.ShapeCache.Storage.for_stack(opts[:stack_id])
+        )
+
+      assert Support.TestUtils.wait_until(
+               fn ->
+                 Electric.ShapeCache.Storage.get_log_stream(
+                   LogOffset.last_before_real_offsets(),
+                   shape_storage
+                 )
+                 |> Enum.take(10)
+                 |> length() == 10
+               end,
+               5_000
+             )
 
       # Here, we should have exactly 10 chunks with data (and 1 chunk with snapshot control messages)
 
@@ -217,8 +233,19 @@ defmodule Electric.Plug.RouterTest do
       Electric.Shapes.Consumer.whereis(opts[:stack_id], shape_handle)
       |> Electric.ShapeCache.Storage.trigger_compaction(storage, 0)
 
-      # If this test is flaking, then the compaction didn't have time to complete - we don't have a good way to wait for it to complete though.
-      Process.sleep(200)
+      assert Support.TestUtils.wait_until(
+               fn ->
+                 response =
+                   conn("GET", "/v1/shape?table=items&handle=#{shape_handle}&offset=0_inf")
+                   |> Router.call(opts)
+
+                 match?(
+                   [%{"value" => %{"value" => "test value 10"}}, _],
+                   Jason.decode!(response.resp_body)
+                 )
+               end,
+               5_000
+             )
 
       conn =
         conn("GET", "/v1/shape?table=items&handle=#{shape_handle}&offset=0_inf")
@@ -3313,7 +3340,17 @@ defmodule Electric.Plug.RouterTest do
           ],
           do: Postgrex.query!(ctx.db_conn, stmt)
 
-      Process.sleep(120)
+      # Replication and move-in queries complete asynchronously. Wait for the
+      # full response from the original cursor, then assert its exact sequence.
+      assert Support.TestUtils.wait_until(
+               fn ->
+                 case shape_req(req, ctx.opts) do
+                   {_, 200, messages} -> length(messages) >= 8
+                   _ -> false
+                 end
+               end,
+               5_000
+             )
 
       assert {req, 200,
               [
