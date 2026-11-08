@@ -505,6 +505,10 @@ defmodule Electric.Shapes.Api do
       ) ||
         last_offset
 
+    # Storage may publish a chunk boundary before its entries become visible.
+    # Never advance the client beyond the log frontier captured for this request.
+    chunk_end_offset = LogOffset.min(chunk_end_offset, last_offset)
+
     Request.update_response(
       %{request | chunk_end_offset: chunk_end_offset},
       &%{&1 | offset: chunk_end_offset}
