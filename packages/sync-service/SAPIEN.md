@@ -22,7 +22,6 @@ upstream tree and reapplying the patches below.
   `connection: close` on the last HTTP/1 response before `max_requests`
   (mtrudel/bandit#613, released in 1.12.2) and has HTTP/1 and HTTP/2 advisories
   fixed by 1.14.x.
-- Log the formatted error when an initial snapshot fails.
 - Build and attest AMD64 and ARM64 images with the actual package version.
 
 Upstream owns replication acknowledgments, storage, materializers and recovery.
