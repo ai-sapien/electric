@@ -384,7 +384,7 @@ defmodule Electric.Shapes.Querying do
     where =
       case join_sql(" OR ", [impacted_before_sql, unaffected_sql]) do
         nil -> candidate_sql
-        excl -> "(#{candidate_sql}) AND NOT (#{excl})"
+        excl -> "(#{candidate_sql}) AND (#{excl}) IS NOT TRUE"
       end
 
     {where, candidate_params ++ impacted_before_params ++ unaffected_params}

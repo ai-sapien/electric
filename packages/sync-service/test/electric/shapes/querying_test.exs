@@ -935,7 +935,7 @@ defmodule Electric.Shapes.QueryingTest do
         )
 
       assert sql =~ "= ANY ($1::"
-      assert sql =~ "AND NOT"
+      assert sql =~ "IS NOT TRUE"
       assert sql =~ "= ANY ($2::"
       assert sql =~ "= ANY ($3::"
       assert length(params) == 3
@@ -965,7 +965,7 @@ defmodule Electric.Shapes.QueryingTest do
           where.used_refs
         )
 
-      assert sql =~ "AND NOT"
+      assert sql =~ "IS NOT TRUE"
       assert length(params) == 3
       assert Enum.sort(Enum.at(params, 0)) == [10, 100]
       assert Enum.at(params, 1) == [10]
@@ -1010,7 +1010,7 @@ defmodule Electric.Shapes.QueryingTest do
       assert sql =~ "= ANY ($1::"
       assert sql =~ "= ANY ($2::"
       assert sql =~ ~s|"status" = 'open'|
-      assert sql =~ "AND NOT"
+      assert sql =~ "IS NOT TRUE"
       assert length(params) == 3
     end
   end
@@ -1033,7 +1033,8 @@ defmodule Electric.Shapes.QueryingTest do
         )
 
       assert sql =~ ~s|NOT ("x" = ANY ($1::|
-      assert sql =~ ~s|AND NOT (NOT ("x" = ANY ($2::|
+      assert sql =~ ~s|AND (NOT ("x" = ANY ($2::|
+      assert sql =~ "IS NOT TRUE"
       assert params == [[3], [1, 2, 3]]
     end
 
