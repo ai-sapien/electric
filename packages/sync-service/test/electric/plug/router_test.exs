@@ -2724,6 +2724,134 @@ defmodule Electric.Plug.RouterTest do
     end
 
     @tag with_sql: [
+           "CREATE TABLE inner_table (id INT PRIMARY KEY, value INT NOT NULL)",
+           "CREATE TABLE outer_table (id INT PRIMARY KEY, inner_id INT NOT NULL REFERENCES inner_table(id), value INT NOT NULL)",
+           "INSERT INTO inner_table (id, value) VALUES (1, 1), (2, 2)",
+           "INSERT INTO outer_table (id, inner_id, value) VALUES (1, 1, 10), (2, 2, 20)"
+         ]
+    test "a row from a first, handle-less subset snapshot is removed by a later move-out", %{
+      opts: opts,
+      db_conn: db_conn,
+      stack_id: stack_id
+    } do
+      req =
+        make_shape_req("outer_table",
+          log: "changes_only",
+          where: "inner_id in (SELECT id FROM inner_table WHERE value = 1)"
+        )
+
+      # An on-demand client asks for its first subset before it has seen the
+      # shape's handle, so the request carries none.
+      assert {_, 200, %{"data" => [snapshot_row]}} = shape_req(req, opts, subset: %{})
+      assert %{"value" => %{"id" => "1"}, "headers" => %{"tags" => [snapshot_tag]}} = snapshot_row
+
+      assert {req, 200, _} = shape_req(req, opts)
+
+      # The row must carry the tag the shape's own log uses, or no move-out
+      # can ever find it.
+      assert snapshot_tag == value_tag(stack_id, req.handle, "v:1")
+
+      task = live_shape_req(req, opts)
+
+      Postgrex.query!(db_conn, "UPDATE inner_table SET value = 3 WHERE id = 1", [])
+
+      assert {_req, 200, [move_out, up_to_date_ctl()]} = Task.await(task)
+
+      assert %{"headers" => %{"event" => "move-out", "patterns" => patterns}} = move_out
+      assert [%{"value" => ^snapshot_tag}] = patterns
+    end
+
+    @tag with_sql: [
+           "CREATE TABLE inner_table (id INT PRIMARY KEY, value INT NOT NULL)",
+           "CREATE TABLE outer_table (id INT PRIMARY KEY, inner_id INT NOT NULL REFERENCES inner_table(id), value INT NOT NULL)",
+           "INSERT INTO inner_table (id, value) VALUES (1, 1), (2, 2)",
+           "INSERT INTO outer_table (id, inner_id, value) VALUES (1, 1, 10), (2, 2, 20)"
+         ]
+    test "a subset sent with a handle at offset=now tags rows with the resolved shape handle", %{
+      opts: opts,
+      stack_id: stack_id
+    } do
+      req =
+        make_shape_req("outer_table",
+          log: "changes_only",
+          where: "inner_id in (SELECT id FROM inner_table WHERE value = 1)"
+        )
+
+      assert {req, 200, _} = shape_req(req, opts)
+
+      # Params drop the handle when offset is -1 or now, so this request
+      # reaches the subset query without the handle the client sent.
+      assert {_, 200, %{"data" => [snapshot_row]}} =
+               shape_req(req, opts, subset: %{}, offset: "now")
+
+      assert %{"value" => %{"id" => "1"}, "headers" => %{"tags" => [snapshot_tag]}} = snapshot_row
+      assert snapshot_tag == value_tag(stack_id, req.handle, "v:1")
+    end
+
+    @tag with_sql: [
+           "CREATE TABLE inner_table (id INT PRIMARY KEY, value INT NOT NULL)",
+           "CREATE TABLE outer_table (id INT PRIMARY KEY, inner_id INT NOT NULL REFERENCES inner_table(id), value INT NOT NULL)",
+           "INSERT INTO inner_table (id, value) VALUES (1, 1), (2, 2)",
+           "INSERT INTO outer_table (id, inner_id, value) VALUES (1, 1, 10), (2, 2, 20)"
+         ]
+    test "a POST subset sent with no handle tags rows with the resolved shape handle", %{
+      opts: opts,
+      stack_id: stack_id
+    } do
+      where = "inner_id in (SELECT id FROM inner_table WHERE value = 1)"
+
+      query =
+        URI.encode_query(table: "outer_table", offset: "-1", log: "changes_only", where: where)
+
+      conn =
+        conn("POST", "/v1/shape?" <> query, Jason.encode!(%{"where" => "id = 1"}))
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+        |> Router.call(opts)
+
+      assert %{status: 200} = conn
+      assert %{"data" => [snapshot_row]} = Jason.decode!(conn.resp_body)
+      assert %{"value" => %{"id" => "1"}, "headers" => %{"tags" => [snapshot_tag]}} = snapshot_row
+
+      req = make_shape_req("outer_table", log: "changes_only", where: where)
+      assert {req, 200, _} = shape_req(req, opts)
+      assert snapshot_tag == value_tag(stack_id, req.handle, "v:1")
+    end
+
+    @tag with_sql: [
+           "CREATE TABLE inner_table (id INT PRIMARY KEY, value INT NOT NULL)",
+           "CREATE TABLE outer_table (id INT PRIMARY KEY, inner_id INT NOT NULL REFERENCES inner_table(id), value INT NOT NULL)",
+           "INSERT INTO inner_table (id, value) VALUES (1, 1), (2, 2)",
+           "INSERT INTO outer_table (id, inner_id, value) VALUES (1, 1, 10), (2, 2, 20)"
+         ]
+    test "a subset sent at offset=now with the handle of a deleted shape uses the new handle", %{
+      opts: opts,
+      stack_id: stack_id
+    } do
+      req =
+        make_shape_req("outer_table",
+          log: "changes_only",
+          where: "inner_id in (SELECT id FROM inner_table WHERE value = 1)"
+        )
+
+      assert {%{handle: old_handle}, 200, _} = shape_req(req, opts)
+
+      assert %{status: 202} =
+               conn("DELETE", "/v1/shape?" <> URI.encode_query(Map.put(req, :handle, old_handle)))
+               |> Router.call(opts)
+
+      assert {%{handle: new_handle}, 200, _} = shape_req(req, opts)
+      assert new_handle != old_handle
+
+      # The client still holds the old handle; Params drop it at offset=now.
+      # The response names the new handle, so the client moves to it.
+      assert {%{handle: ^new_handle}, 200, %{"data" => [snapshot_row]}} =
+               shape_req(Map.put(req, :handle, old_handle), opts, subset: %{}, offset: "now")
+
+      assert %{"value" => %{"id" => "1"}, "headers" => %{"tags" => [snapshot_tag]}} = snapshot_row
+      assert snapshot_tag == value_tag(stack_id, new_handle, "v:1")
+    end
+
+    @tag with_sql: [
            "CREATE TABLE inner_table (id INT PRIMARY KEY, excluded BOOLEAN NOT NULL DEFAULT FALSE)",
            "CREATE TABLE outer_table (id INT PRIMARY KEY, inner_id INT NOT NULL REFERENCES inner_table(id), value INT NOT NULL)",
            "INSERT INTO inner_table (id, excluded) VALUES (1, false), (2, true)",
