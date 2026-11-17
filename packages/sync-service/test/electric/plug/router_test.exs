@@ -2724,6 +2724,44 @@ defmodule Electric.Plug.RouterTest do
     end
 
     @tag with_sql: [
+           "CREATE TABLE inner_table (id INT PRIMARY KEY, value INT NOT NULL)",
+           "CREATE TABLE outer_table (id INT PRIMARY KEY, inner_id INT NOT NULL REFERENCES inner_table(id), value INT NOT NULL)",
+           "INSERT INTO inner_table (id, value) VALUES (1, 1), (2, 2)",
+           "INSERT INTO outer_table (id, inner_id, value) VALUES (1, 1, 10), (2, 2, 20)"
+         ]
+    test "a row from a first, handle-less subset snapshot is removed by a later move-out", %{
+      opts: opts,
+      db_conn: db_conn,
+      stack_id: stack_id
+    } do
+      req =
+        make_shape_req("outer_table",
+          log: "changes_only",
+          where: "inner_id in (SELECT id FROM inner_table WHERE value = 1)"
+        )
+
+      # An on-demand client asks for its first subset before it has seen the
+      # shape's handle, so the request carries none.
+      assert {_, 200, %{"data" => [snapshot_row]}} = shape_req(req, opts, subset: %{})
+      assert %{"value" => %{"id" => "1"}, "headers" => %{"tags" => [snapshot_tag]}} = snapshot_row
+
+      assert {req, 200, _} = shape_req(req, opts)
+
+      # The row must carry the tag the shape's own log uses, or no move-out
+      # can ever find it.
+      assert snapshot_tag == value_tag(stack_id, req.handle, "v:1")
+
+      task = live_shape_req(req, opts)
+
+      Postgrex.query!(db_conn, "UPDATE inner_table SET value = 3 WHERE id = 1", [])
+
+      assert {_req, 200, [move_out, up_to_date_ctl()]} = Task.await(task)
+
+      assert %{"headers" => %{"event" => "move-out", "patterns" => patterns}} = move_out
+      assert [%{"value" => ^snapshot_tag}] = patterns
+    end
+
+    @tag with_sql: [
            "CREATE TABLE inner_table (id INT PRIMARY KEY, excluded BOOLEAN NOT NULL DEFAULT FALSE)",
            "CREATE TABLE outer_table (id INT PRIMARY KEY, inner_id INT NOT NULL REFERENCES inner_table(id), value INT NOT NULL)",
            "INSERT INTO inner_table (id, excluded) VALUES (1, false), (2, true)",
