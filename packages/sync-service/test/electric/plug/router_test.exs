@@ -2762,6 +2762,33 @@ defmodule Electric.Plug.RouterTest do
     end
 
     @tag with_sql: [
+           "CREATE TABLE inner_table (id INT PRIMARY KEY, value INT NOT NULL)",
+           "CREATE TABLE outer_table (id INT PRIMARY KEY, inner_id INT NOT NULL REFERENCES inner_table(id), value INT NOT NULL)",
+           "INSERT INTO inner_table (id, value) VALUES (1, 1), (2, 2)",
+           "INSERT INTO outer_table (id, inner_id, value) VALUES (1, 1, 10), (2, 2, 20)"
+         ]
+    test "a subset sent with a handle at offset=now tags rows with the shape's handle", %{
+      opts: opts,
+      stack_id: stack_id
+    } do
+      req =
+        make_shape_req("outer_table",
+          log: "changes_only",
+          where: "inner_id in (SELECT id FROM inner_table WHERE value = 1)"
+        )
+
+      assert {req, 200, _} = shape_req(req, opts)
+
+      # Params drop the handle when offset is -1 or now, so this request
+      # reaches the subset query without the handle the client sent.
+      assert {_, 200, %{"data" => [snapshot_row]}} =
+               shape_req(req, opts, subset: %{}, offset: "now")
+
+      assert %{"value" => %{"id" => "1"}, "headers" => %{"tags" => [snapshot_tag]}} = snapshot_row
+      assert snapshot_tag == value_tag(stack_id, req.handle, "v:1")
+    end
+
+    @tag with_sql: [
            "CREATE TABLE inner_table (id INT PRIMARY KEY, excluded BOOLEAN NOT NULL DEFAULT FALSE)",
            "CREATE TABLE outer_table (id INT PRIMARY KEY, inner_id INT NOT NULL REFERENCES inner_table(id), value INT NOT NULL)",
            "INSERT INTO inner_table (id, excluded) VALUES (1, false), (2, true)",
