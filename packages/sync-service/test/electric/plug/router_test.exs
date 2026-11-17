@@ -2843,7 +2843,8 @@ defmodule Electric.Plug.RouterTest do
       assert new_handle != old_handle
 
       # The client still holds the old handle; Params drop it at offset=now.
-      assert {_, 200, %{"data" => [snapshot_row]}} =
+      # The response names the new handle, so the client moves to it.
+      assert {%{handle: ^new_handle}, 200, %{"data" => [snapshot_row]}} =
                shape_req(Map.put(req, :handle, old_handle), opts, subset: %{}, offset: "now")
 
       assert %{"value" => %{"id" => "1"}, "headers" => %{"tags" => [snapshot_tag]}} = snapshot_row
