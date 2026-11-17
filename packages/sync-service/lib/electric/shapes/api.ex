@@ -578,9 +578,13 @@ defmodule Electric.Shapes.Api do
   end
 
   defp do_serve_subset_response(%Request{} = request) do
+    # Tag rows with the shape's resolved handle, never the client's: a client
+    # sends no handle on its first request, and rows tagged without the real
+    # handle never match a move-out.
     %{
       response: response,
-      params: %{subset: subset, shape_definition: shape_definition, handle: handle}
+      handle: handle,
+      params: %{subset: subset, shape_definition: shape_definition}
     } = request
 
     case Shapes.query_subset(handle, shape_definition, subset, request.api) do
