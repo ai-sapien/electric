@@ -2789,6 +2789,68 @@ defmodule Electric.Plug.RouterTest do
     end
 
     @tag with_sql: [
+           "CREATE TABLE inner_table (id INT PRIMARY KEY, value INT NOT NULL)",
+           "CREATE TABLE outer_table (id INT PRIMARY KEY, inner_id INT NOT NULL REFERENCES inner_table(id), value INT NOT NULL)",
+           "INSERT INTO inner_table (id, value) VALUES (1, 1), (2, 2)",
+           "INSERT INTO outer_table (id, inner_id, value) VALUES (1, 1, 10), (2, 2, 20)"
+         ]
+    test "a POST subset sent with no handle tags rows with the resolved shape handle", %{
+      opts: opts,
+      stack_id: stack_id
+    } do
+      where = "inner_id in (SELECT id FROM inner_table WHERE value = 1)"
+
+      query =
+        URI.encode_query(table: "outer_table", offset: "-1", log: "changes_only", where: where)
+
+      conn =
+        conn("POST", "/v1/shape?" <> query, Jason.encode!(%{"where" => "id = 1"}))
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+        |> Router.call(opts)
+
+      assert %{status: 200} = conn
+      assert %{"data" => [snapshot_row]} = Jason.decode!(conn.resp_body)
+      assert %{"value" => %{"id" => "1"}, "headers" => %{"tags" => [snapshot_tag]}} = snapshot_row
+
+      req = make_shape_req("outer_table", log: "changes_only", where: where)
+      assert {req, 200, _} = shape_req(req, opts)
+      assert snapshot_tag == value_tag(stack_id, req.handle, "v:1")
+    end
+
+    @tag with_sql: [
+           "CREATE TABLE inner_table (id INT PRIMARY KEY, value INT NOT NULL)",
+           "CREATE TABLE outer_table (id INT PRIMARY KEY, inner_id INT NOT NULL REFERENCES inner_table(id), value INT NOT NULL)",
+           "INSERT INTO inner_table (id, value) VALUES (1, 1), (2, 2)",
+           "INSERT INTO outer_table (id, inner_id, value) VALUES (1, 1, 10), (2, 2, 20)"
+         ]
+    test "a subset sent at offset=now with the handle of a deleted shape uses the new handle", %{
+      opts: opts,
+      stack_id: stack_id
+    } do
+      req =
+        make_shape_req("outer_table",
+          log: "changes_only",
+          where: "inner_id in (SELECT id FROM inner_table WHERE value = 1)"
+        )
+
+      assert {%{handle: old_handle}, 200, _} = shape_req(req, opts)
+
+      assert %{status: 202} =
+               conn("DELETE", "/v1/shape?" <> URI.encode_query(Map.put(req, :handle, old_handle)))
+               |> Router.call(opts)
+
+      assert {%{handle: new_handle}, 200, _} = shape_req(req, opts)
+      assert new_handle != old_handle
+
+      # The client still holds the old handle; Params drop it at offset=now.
+      assert {_, 200, %{"data" => [snapshot_row]}} =
+               shape_req(Map.put(req, :handle, old_handle), opts, subset: %{}, offset: "now")
+
+      assert %{"value" => %{"id" => "1"}, "headers" => %{"tags" => [snapshot_tag]}} = snapshot_row
+      assert snapshot_tag == value_tag(stack_id, new_handle, "v:1")
+    end
+
+    @tag with_sql: [
            "CREATE TABLE inner_table (id INT PRIMARY KEY, excluded BOOLEAN NOT NULL DEFAULT FALSE)",
            "CREATE TABLE outer_table (id INT PRIMARY KEY, inner_id INT NOT NULL REFERENCES inner_table(id), value INT NOT NULL)",
            "INSERT INTO inner_table (id, excluded) VALUES (1, false), (2, true)",
