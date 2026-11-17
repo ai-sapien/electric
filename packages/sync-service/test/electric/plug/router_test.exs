@@ -2767,7 +2767,7 @@ defmodule Electric.Plug.RouterTest do
            "INSERT INTO inner_table (id, value) VALUES (1, 1), (2, 2)",
            "INSERT INTO outer_table (id, inner_id, value) VALUES (1, 1, 10), (2, 2, 20)"
          ]
-    test "a subset sent with a handle at offset=now tags rows with the shape's handle", %{
+    test "a subset sent with a handle at offset=now tags rows with the resolved shape handle", %{
       opts: opts,
       stack_id: stack_id
     } do
